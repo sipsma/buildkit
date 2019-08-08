@@ -11,8 +11,19 @@ env:
     - PLATFORMS="linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/s390x,linux/ppc64le"
     - PREFER_BUILDCTL="1"
 
-script:
-  - make binaries validate-all && PLATFORMS="${PLATFORMS},darwin/amd64,windows/amd64" ./hack/cross
+# script:
+#   - make binaries validate-all && PLATFORMS="${PLATFORMS},darwin/amd64,windows/amd64" ./hack/cross
+
+jobs:
+  include:
+    - stage: build
+      name: "Build base"
+      script: sleep 30
+    - stage: test1
+      name: "Testing1"
+      script: sleep 40
+    - script: sleep 41
+      name: "Testing2"
 
 before_deploy:
   - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
