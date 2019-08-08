@@ -1,4 +1,4 @@
-# syntax = docker/dockerfile:1.0-experimental
+# syntax = docker/dockerfile-upstream:1.1-experimental
 
 ARG RUNC_VERSION=v1.0.0-rc8
 ARG CONTAINERD_VERSION=v1.2.1
@@ -208,7 +208,7 @@ ARG TARGETARCH
 WORKDIR /opt/cni/bin
 RUN curl -Ls https://github.com/containernetworking/plugins/releases/download/$CNI_VERSION/cni-plugins-$TARGETOS-$TARGETARCH-$CNI_VERSION.tgz | tar xzv
 
-FROM buildkit-base AS integration-tests
+FROM buildkit-base AS integration-tests-base
 ENV BUILDKIT_INTEGRATION_ROOTLESS_IDPAIR="1000:1000"
 RUN apt-get install -y --no-install-recommends uidmap sudo vim iptables \ 
   && useradd --create-home --home-dir /home/user --uid 1000 -s /bin/sh user \
@@ -226,6 +226,8 @@ COPY --from=containerd /out/containerd* /usr/bin/
 COPY --from=cni-plugins /opt/cni/bin/bridge /opt/cni/bin/host-local /opt/cni/bin/loopback /opt/cni/bin/
 COPY hack/fixtures/cni.json /etc/buildkit/cni.json
 COPY --from=binaries / /usr/bin/
+
+FROM integration-tests-base AS integration-tests
 COPY . .
 ENV BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS=1 BUILDKIT_CNI_INIT_LOCK_PATH=/run/buildkit_cni_bridge.lock
 

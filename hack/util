@@ -19,3 +19,20 @@ else
     buildmode="docker-buildkit";
   fi
 fi
+
+
+currentref=""
+if [ "$TRAVIS_EVENT_TYPE" == "pull_request" ]; then
+  currentref="git://github.com/moby/buildkit#refs/pull/$TRAVIS_PULL_REQUEST/merge"
+elif [ -n "$TRAVIS_BRANCH" ]; then
+  currentref="git://github.com/moby/buildkit#$TRAVIS_BRANCH"
+fi
+
+
+currentcontext="."
+currentcontextBuildctl="--local context=. --local dockerfile=."
+
+if [ -n "$currentref" ]; then
+  currentcontext="$currentref"
+  currentcontextBuildctl="--opt context=$currentref"
+fi

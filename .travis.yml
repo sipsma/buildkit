@@ -2,7 +2,7 @@ dist: trusty
 sudo: required
 
 install:
-  - docker run --name buildkit --rm -d --privileged -p 1234:1234 $REPO_SLUG_ORIGIN --addr tcp://0.0.0.0:1234
+  - docker run --name buildkit --rm -d --privileged -p 1234:1234 moby/buildkit:master --addr tcp://0.0.0.0:1234 --oci-worker-gc=false
   - sudo docker cp buildkit:/usr/bin/buildctl /usr/bin/
   - export BUILDKIT_HOST=tcp://0.0.0.0:1234
 
@@ -18,11 +18,11 @@ jobs:
   include:
     - stage: build
       name: "Build base"
-      script: sleep 30
+      script: ./hack/login_ci_cache && ./hack/build_ci_first_pass
     - stage: test1
       name: "Testing1"
-      script: sleep 40
-    - script: sleep 41
+      script: docker pull cicache.buildk.it/moby/buildkit/pr$TRAVIS_BUILD_ID
+    - script: docker pull cicache.buildk.it/moby/buildkit/pr$TRAVIS_BUILD_ID
       name: "Testing2"
 
 before_deploy:
