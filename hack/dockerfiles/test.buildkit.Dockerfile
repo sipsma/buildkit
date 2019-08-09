@@ -98,8 +98,9 @@ RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   go build -ldflags "$(cat /tmp/.ldflags) -w -extldflags -static" -tags "osusergo netgo static_build seccomp ${BUILDKITD_TAGS}" -o /usr/bin/buildkitd ./cmd/buildkitd && \
   file /usr/bin/buildkitd | egrep "statically linked|Windows"
 
-FROM scratch AS binaries-linux
+FROM scratch AS binaries-linux-helper
 COPY --from=runc /usr/bin/runc /buildkit-runc
+FROM binaries-linux-helper AS binaries-linux
 COPY --from=buildctl /usr/bin/buildctl /
 COPY --from=buildkitd /usr/bin/buildkitd /
 

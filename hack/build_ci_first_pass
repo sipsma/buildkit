@@ -21,7 +21,6 @@ set -x
 buildctl build $progressFlag --frontend=dockerfile.v0 \
   $currentcontextBuildctl \
   --opt filename=./hack/dockerfiles/test.buildkit.Dockerfile \
-  --opt build-arg:BUILDKITD_TAGS="$BUILDKITD_TAGS" \
   --opt target=binaries \
   --import-cache type=registry,ref=cicache.buildk.it/moby/buildkit/master:binaries \
   --import-cache type=registry,ref=cicache.buildk.it/moby/buildkit/master:integration-tests \
@@ -30,7 +29,18 @@ buildctl build $progressFlag --frontend=dockerfile.v0 \
 buildctl build $progressFlag --frontend=dockerfile.v0 \
   $currentcontextBuildctl \
   --opt filename=./hack/dockerfiles/test.buildkit.Dockerfile \
-  --opt build-arg:BUILDKITD_TAGS="$BUILDKITD_TAGS" \
   --opt target=integration-tests-base \
   --import-cache cicache.buildk.it/moby/buildkit/master:integration-tests \
   $exportCacheFlags $exportFlags:integration-tests
+
+
+if [ -f /tmp/buildkit-ci-cache-repo ] && [ "$TRAVIS_EVENT_TYPE" != "pull_request" ]; then
+	
+buildctl build $progressFlag --frontend=dockerfile.v0 \
+  $currentcontextBuildctl \
+  --opt filename=./hack/dockerfiles/test.buildkit.Dockerfile \
+  --opt target=binaries-linux-helper \
+	--opt platform=$PLATFORMS \
+  --import-cache cicache.buildk.it/moby/buildkit/master:binaries-cross-helper \
+  $exportCacheFlags $exportFlags:binaries-cross-helper
+fi

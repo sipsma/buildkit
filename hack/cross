@@ -4,6 +4,16 @@
 
 : ${PLATFORMS=linux/arm}
 
+importCacheFlags=""
+if [ -n "$cacheref" ]; then
+  importCacheFlags="--import-cache=type=registry,ref=$cacheref:binaries"
+fi
+
 set -ex
 
-buildctl build --progress=plain --frontend=dockerfile.v0 --local context=. --local dockerfile=. --opt filename=./hack/dockerfiles/test.buildkit.Dockerfile --opt platform=$PLATFORMS
+buildctl build --progress=plain --frontend=dockerfile.v0 \
+   $currentcontextBuildctl --opt filename=./hack/dockerfiles/test.buildkit.Dockerfile \
+   --opt platform=$PLATFORMS \
+   --import-cache cicache.buildk.it/moby/buildkit/master:binaries-cross-helper \
+   --import-cache type=registry,ref=cicache.buildk.it/moby/buildkit/master:binaries $importCacheFlags
+  
