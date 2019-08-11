@@ -140,6 +140,10 @@ func (w containerdExecutor) Exec(ctx context.Context, meta executor.Meta, root c
 		}
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
+
+	// rootless hacks
+	opts = append(opts, containerdoci.WithCgroup(""))
+
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
 	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, opts...)
 	if err != nil {

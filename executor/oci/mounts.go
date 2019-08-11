@@ -31,7 +31,7 @@ func GetMounts(ctx context.Context, mountOpts ...MountOpts) ([]specs.Mount, erro
 			Destination: "/dev/pts",
 			Type:        "devpts",
 			Source:      "devpts",
-			Options:     []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"},
+			Options:     []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=0"},
 		},
 		{
 			Destination: "/dev/shm",
@@ -47,9 +47,9 @@ func GetMounts(ctx context.Context, mountOpts ...MountOpts) ([]specs.Mount, erro
 		},
 		{
 			Destination: "/sys",
-			Type:        "sysfs",
-			Source:      "sysfs",
-			Options:     []string{"nosuid", "noexec", "nodev", "ro"},
+			Type:        "none",
+			Source:      "/sys",
+			Options:     []string{"rbind", "nosuid", "noexec", "nodev", "ro"},
 		},
 	}
 	var err error
