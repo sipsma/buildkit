@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/containerd/containerd/content"
 	contentlocal "github.com/containerd/containerd/content/local"
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -233,7 +235,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	eg.Go(func() error {
 		stream, err := c.controlClient().Status(statusContext, &controlapi.StatusRequest{
 			Ref: ref,
-		})
+		}, grpc.MaxCallRecvMsgSize(268435456), grpc.MaxCallSendMsgSize(268435456))
 		if err != nil {
 			return errors.Wrap(err, "failed to get status")
 		}
