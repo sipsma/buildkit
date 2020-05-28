@@ -18,12 +18,12 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/pull"
-	"github.com/moby/buildkit/util/winlayers"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -100,20 +100,20 @@ func (is *imageSource) Resolve(ctx context.Context, id source.Identifier, sm *se
 		platform = *imageIdentifier.Platform
 	}
 
+	resolver := pull.NewResolver(ctx, is.RegistryHosts, sm, is.ImageStore, imageIdentifier.ResolveMode, imageIdentifier.Reference.String())
+
 	pullerUtil := &pull.Puller{
-		Snapshotter:  is.Snapshotter,
 		ContentStore: is.ContentStore,
-		Applier:      is.Applier,
-		Src:          imageIdentifier.Reference,
-		Resolver:     pull.NewResolver(ctx, is.RegistryHosts, sm, is.ImageStore, imageIdentifier.ResolveMode, imageIdentifier.Reference.String()),
+		Resolver:     resolver,
 		Platform:     &platform,
+		Src:          imageIdentifier.Reference,
+		G:            &is.g,
 	}
 	p := &puller{
 		CacheAccessor: is.CacheAccessor,
-		Puller:        pullerUtil,
-		Platform:      platform,
-		id:            imageIdentifier,
 		LeaseManager:  is.LeaseManager,
+		Puller:        pullerUtil,
+		id:            imageIdentifier,
 	}
 	return p, nil
 }
@@ -121,115 +121,120 @@ func (is *imageSource) Resolve(ctx context.Context, id source.Identifier, sm *se
 type puller struct {
 	CacheAccessor cache.Accessor
 	LeaseManager  leases.Manager
-	Platform      specs.Platform
 	id            *source.ImageIdentifier
 	*pull.Puller
 }
 
-func mainManifestKey(ctx context.Context, desc specs.Descriptor, platform specs.Platform) (digest.Digest, error) {
-	dt, err := json.Marshal(struct {
+func mainManifestKey(ctx context.Context, desc specs.Descriptor, platform *specs.Platform) (digest.Digest, error) {
+	keyStruct := struct {
 		Digest  digest.Digest
 		OS      string
 		Arch    string
 		Variant string `json:",omitempty"`
 	}{
-		Digest:  desc.Digest,
-		OS:      platform.OS,
-		Arch:    platform.Architecture,
-		Variant: platform.Variant,
-	})
+		Digest: desc.Digest,
+	}
+	if platform != nil {
+		keyStruct.OS = platform.OS
+		keyStruct.Arch = platform.Architecture
+		keyStruct.Variant = platform.Variant
+	}
+
+	dt, err := json.Marshal(keyStruct)
 	if err != nil {
 		return "", err
 	}
 	return digest.FromBytes(dt), nil
 }
 
-func (p *puller) CacheKey(ctx context.Context, index int) (string, bool, error) {
-	_, desc, err := p.Puller.Resolve(ctx)
+func (p *puller) CacheKey(ctx context.Context, index int) (_ string, _ cacheutil.OptSet, _ bool, err error) {
+	ctx, done, err := leaseutil.WithLease(ctx, p.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
+	defer done(ctx)
+
+	resolveProgressDone := oneOffProgress(ctx, "resolve "+p.Src.String())
+	defer func() {
+		resolveProgressDone(err)
+	}()
+
+	metadata, err := p.PullMetadata(ctx)
+	if err != nil {
+		return "", nil, false, err
+	}
+
+	optSet := cache.AsOptSet(metadata.Remote, progress.CallbacksOf(ctx), metadata.Ref)
+
+	desc := metadata.MainManifestDesc
 	if index == 0 || desc.Digest == "" {
 		k, err := mainManifestKey(ctx, desc, p.Platform)
 		if err != nil {
-			return "", false, err
+			return "", nil, false, err
 		}
-		return k.String(), false, nil
+		return k.String(), optSet, false, nil
 	}
 	ref, err := reference.ParseNormalizedNamed(p.Src.String())
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 	ref, err = reference.WithDigest(ref, desc.Digest)
 	if err != nil {
-		return "", false, nil
+		return "", nil, false, err
 	}
-	_, dt, err := imageutil.Config(ctx, ref.String(), p.Resolver, p.ContentStore, p.LeaseManager, &p.Platform)
+	_, dt, err := imageutil.Config(ctx, ref.String(), p.Resolver, p.ContentStore, p.LeaseManager, p.Platform)
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 
 	k := cacheKeyFromConfig(dt).String()
 	if k == "" {
 		k, err := mainManifestKey(ctx, desc, p.Platform)
 		if err != nil {
-			return "", false, err
+			return "", nil, false, err
 		}
-		return k.String(), true, nil
+		return k.String(), optSet, true, nil
 	}
-	return k, true, nil
+
+	return k, optSet, true, nil
 }
 
 func (p *puller) Snapshot(ctx context.Context) (ir cache.ImmutableRef, err error) {
-	layerNeedsTypeWindows := false
-	if platform := p.Puller.Platform; platform != nil {
-		if platform.OS == "windows" && runtime.GOOS != "windows" {
-			ctx = winlayers.UseWindowsLayerMode(ctx)
-			layerNeedsTypeWindows = true
-		}
-	}
-
-	// workaround for gcr, authentication not supported on blob endpoints
-	pull.EnsureManifestRequested(ctx, p.Puller.Resolver, p.Puller.Src.String())
-
 	ctx, done, err := leaseutil.WithLease(ctx, p.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
 		return nil, err
 	}
 	defer done(ctx)
 
-	pulled, err := p.Puller.Pull(ctx)
+	metadata, err := p.PullMetadata(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if len(pulled.Layers) == 0 {
+
+	if len(metadata.Remote.Descriptors) == 0 {
 		return nil, nil
 	}
 
-	extractDone := oneOffProgress(ctx, "unpacking "+pulled.Ref)
 	var current cache.ImmutableRef
 	defer func() {
 		if err != nil && current != nil {
 			current.Release(context.TODO())
 		}
-		extractDone(err)
 	}()
-	for _, l := range pulled.Layers {
-		ref, err := p.CacheAccessor.GetByBlob(ctx, l, current, cache.WithDescription("pulled from "+pulled.Ref))
+
+	var parent cache.ImmutableRef
+	for _, layerDesc := range metadata.Remote.Descriptors {
+		parent = current
+		current, err = p.CacheAccessor.GetByBlob(ctx, layerDesc, parent)
+		if parent != nil {
+			parent.Release(context.TODO())
+		}
 		if err != nil {
 			return nil, err
 		}
-		if err := ref.Extract(ctx); err != nil {
-			ref.Release(context.TODO())
-			return nil, err
-		}
-		if current != nil {
-			current.Release(context.TODO())
-		}
-		current = ref
 	}
 
-	for _, desc := range pulled.MetadataBlobs {
+	for _, desc := range metadata.Nonlayers {
 		if err := p.LeaseManager.AddResource(ctx, leases.Lease{ID: current.ID()}, leases.Resource{
 			ID:   desc.Digest.String(),
 			Type: "content",
@@ -238,7 +243,7 @@ func (p *puller) Snapshot(ctx context.Context) (ir cache.ImmutableRef, err error
 		}
 	}
 
-	if layerNeedsTypeWindows && current != nil {
+	if current != nil && p.Platform != nil && p.Platform.OS == "windows" && runtime.GOOS != "windows" {
 		if err := markRefLayerTypeWindows(current); err != nil {
 			return nil, err
 		}

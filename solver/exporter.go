@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 
+	"github.com/moby/buildkit/cache"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -91,7 +92,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		e.record = getBestResult(e.records)
 	}
 
-	var remote *Remote
+	var remote *cache.Remote
 	if v := e.record; v != nil && len(e.k.Deps()) > 0 && addRecord {
 		cm := v.cacheManager
 		key := cm.getID(v.key)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/pkg/errors"
 )
 
@@ -15,7 +16,7 @@ type Source interface {
 }
 
 type SourceInstance interface {
-	CacheKey(ctx context.Context, index int) (string, bool, error)
+	CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error)
 	Snapshot(ctx context.Context) (cache.ImmutableRef, error)
 }
 

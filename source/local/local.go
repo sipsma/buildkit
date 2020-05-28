@@ -15,6 +15,7 @@ import (
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -70,13 +71,13 @@ type localSourceHandler struct {
 	*localSource
 }
 
-func (ls *localSourceHandler) CacheKey(ctx context.Context, index int) (string, bool, error) {
+func (ls *localSourceHandler) CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error) {
 	sessionID := ls.src.SessionID
 
 	if sessionID == "" {
 		id := session.FromContext(ctx)
 		if id == "" {
-			return "", false, errors.New("could not access local files without session")
+			return "", nil, false, errors.New("could not access local files without session")
 		}
 		sessionID = id
 	}
@@ -87,9 +88,9 @@ func (ls *localSourceHandler) CacheKey(ctx context.Context, index int) (string, 
 		FollowPaths     []string
 	}{SessionID: sessionID, IncludePatterns: ls.src.IncludePatterns, ExcludePatterns: ls.src.ExcludePatterns, FollowPaths: ls.src.FollowPaths})
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
-	return "session:" + ls.src.Name + ":" + digest.FromBytes(dt).String(), true, nil
+	return "session:" + ls.src.Name + ":" + digest.FromBytes(dt).String(), nil, true, nil
 }
 
 func (ls *localSourceHandler) Snapshot(ctx context.Context) (out cache.ImmutableRef, retErr error) {

@@ -14,16 +14,18 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/rootfs"
-	"github.com/moby/buildkit/cache/blobs"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/push"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -62,7 +64,7 @@ func New(opt Opt) (exporter.Exporter, error) {
 func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
 	i := &imageExporterInstance{
 		imageExporter:    e,
-		layerCompression: blobs.DefaultCompression,
+		layerCompression: compression.Default,
 	}
 
 	for k, v := range opt {
@@ -134,9 +136,9 @@ func (e *imageExporter) Resolve(ctx context.Context, opt map[string]string) (exp
 		case keyLayerCompression:
 			switch v {
 			case "gzip":
-				i.layerCompression = blobs.Gzip
+				i.layerCompression = compression.Gzip
 			case "uncompressed":
-				i.layerCompression = blobs.Uncompressed
+				i.layerCompression = compression.Uncompressed
 			default:
 				return nil, errors.Errorf("unsupported layer compression type: %v", v)
 			}
@@ -160,7 +162,7 @@ type imageExporterInstance struct {
 	ociTypes         bool
 	nameCanonical    bool
 	danglingPrefix   string
-	layerCompression blobs.CompressionType
+	layerCompression compression.Type
 	meta             map[string][]byte
 }
 
@@ -231,13 +233,31 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 				tagDone(nil)
 
 				if e.unpack {
-					if err := e.unpackImage(ctx, img); err != nil {
+					if err := e.unpackImage(ctx, img, src); err != nil {
 						return nil, err
 					}
 				}
 			}
 			if e.push {
-				if err := push.Push(ctx, e.opt.SessionManager, e.opt.ImageWriter.ContentStore(), desc.Digest, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest); err != nil {
+				providers := []content.Provider{e.opt.ImageWriter.ContentStore()}
+				if src.Ref != nil {
+					remote, err := src.Ref.GetRemote(ctx, false)
+					if err != nil {
+						return nil, err
+					}
+					providers = append(providers, remote.Provider)
+				}
+				if len(src.Refs) > 0 {
+					for _, r := range src.Refs {
+						remote, err := r.GetRemote(ctx, false)
+						if err != nil {
+							return nil, err
+						}
+						providers = append(providers, remote.Provider)
+					}
+				}
+
+				if err := push.Push(ctx, e.opt.SessionManager, contentutil.StackedProvider(providers), e.opt.ImageWriter.ContentStore(), desc.Digest, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest); err != nil {
 					return nil, err
 				}
 			}
@@ -249,7 +269,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 	return resp, nil
 }
 
-func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image) (err0 error) {
+func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Image, src exporter.Source) (err0 error) {
 	unpackDone := oneOffProgress(ctx, "unpacking to "+img.Name)
 	defer func() {
 		unpackDone(err0)
@@ -267,7 +287,35 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 		return err
 	}
 
-	layers, err := getLayers(ctx, contentStore, manifest)
+	topLayerRef := src.Ref
+	if len(src.Refs) > 0 {
+		if r, ok := src.Refs[platforms.DefaultString()]; ok {
+			topLayerRef = r
+		} else {
+			return errors.Errorf("no reference for default platform %s", platforms.DefaultString())
+		}
+	}
+
+	remote, err := topLayerRef.GetRemote(ctx, true)
+	if err != nil {
+		return err
+	}
+
+	// ensure the content for each layer exists locally in case any are lazy
+	// TODO(sipsma) it would be cleaner to have an Applier that just used remote.Provider internally
+	eg, egctx := errgroup.WithContext(ctx)
+	for _, desc := range remote.Descriptors {
+		eg.Go(func() error {
+			_, err := contentutil.ReadBlob(egctx, remote.Provider, desc)
+			return err
+		})
+	}
+	err = eg.Wait()
+	if err != nil {
+		return err
+	}
+
+	layers, err := getLayers(ctx, remote.Descriptors, manifest)
 	if err != nil {
 		return err
 	}
@@ -297,21 +345,16 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 	return err
 }
 
-func getLayers(ctx context.Context, contentStore content.Store, manifest ocispec.Manifest) ([]rootfs.Layer, error) {
-	diffIDs, err := images.RootFS(ctx, contentStore, manifest.Config)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to resolve rootfs")
-	}
-
-	if len(diffIDs) != len(manifest.Layers) {
+func getLayers(ctx context.Context, descs []ocispec.Descriptor, manifest ocispec.Manifest) ([]rootfs.Layer, error) {
+	if len(descs) != len(manifest.Layers) {
 		return nil, errors.Errorf("mismatched image rootfs and manifest layers")
 	}
 
-	layers := make([]rootfs.Layer, len(diffIDs))
-	for i := range diffIDs {
+	layers := make([]rootfs.Layer, len(descs))
+	for i, desc := range descs {
 		layers[i].Diff = ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageLayer,
-			Digest:    diffIDs[i],
+			Digest:    digest.Digest(desc.Annotations["containerd.io/uncompressed"]),
 		}
 		layers[i].Blob = manifest.Layers[i]
 	}

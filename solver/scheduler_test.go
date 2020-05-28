@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/identity"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -3705,9 +3706,9 @@ func testExporterOpts(all bool) CacheExportOpt {
 		mode = CacheExportModeMax
 	}
 	return CacheExportOpt{
-		Convert: func(ctx context.Context, res Result) (*Remote, error) {
+		Convert: func(ctx context.Context, res Result) (*cache.Remote, error) {
 			if dr, ok := res.Sys().(*dummyResult); ok {
-				return &Remote{Descriptors: []ocispec.Descriptor{{
+				return &cache.Remote{Descriptors: []ocispec.Descriptor{{
 					Annotations: map[string]string{"value": fmt.Sprintf("%d", dr.intValue)},
 				}}}, nil
 			}
@@ -3766,7 +3767,7 @@ type testExporterRecord struct {
 	linkMap map[digest.Digest]struct{}
 }
 
-func (r *testExporterRecord) AddResult(createdAt time.Time, result *Remote) {
+func (r *testExporterRecord) AddResult(createdAt time.Time, result *cache.Remote) {
 	r.results++
 }
 

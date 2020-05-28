@@ -23,6 +23,7 @@ import (
 	"github.com/moby/buildkit/session/secrets"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -244,7 +245,7 @@ func (gs *gitSourceHandler) getAuthToken(ctx context.Context) error {
 	return nil
 }
 
-func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bool, error) {
+func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error) {
 	remote := gs.src.Remote
 	ref := gs.src.Ref
 	if ref == "" {
@@ -256,14 +257,14 @@ func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bo
 	if isCommitSHA(ref) {
 		ref = gs.shaToCacheKey(ref)
 		gs.cacheKey = ref
-		return ref, true, nil
+		return ref, nil, true, nil
 	}
 
 	gs.getAuthToken(ctx)
 
 	gitDir, unmountGitDir, err := gs.mountRemote(ctx, remote, gs.auth)
 	if err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 	defer unmountGitDir()
 
@@ -271,21 +272,21 @@ func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, bo
 
 	buf, err := gitWithinDir(ctx, gitDir, "", gs.auth, "ls-remote", "origin", ref)
 	if err != nil {
-		return "", false, errors.Wrapf(err, "failed to fetch remote %s", remote)
+		return "", nil, false, errors.Wrapf(err, "failed to fetch remote %s", remote)
 	}
 	out := buf.String()
 	idx := strings.Index(out, "\t")
 	if idx == -1 {
-		return "", false, errors.Errorf("repository does not contain ref %s, output: %q", ref, string(out))
+		return "", nil, false, errors.Errorf("repository does not contain ref %s, output: %q", ref, string(out))
 	}
 
 	sha := string(out[:idx])
 	if !isCommitSHA(sha) {
-		return "", false, errors.Errorf("invalid commit sha %q", sha)
+		return "", nil, false, errors.Errorf("invalid commit sha %q", sha)
 	}
 	sha = gs.shaToCacheKey(sha)
 	gs.cacheKey = sha
-	return sha, true, nil
+	return sha, nil, true, nil
 }
 
 func (gs *gitSourceHandler) Snapshot(ctx context.Context) (out cache.ImmutableRef, retErr error) {
@@ -297,7 +298,7 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context) (out cache.ImmutableRe
 	cacheKey := gs.cacheKey
 	if cacheKey == "" {
 		var err error
-		cacheKey, _, err = gs.CacheKey(ctx, 0)
+		cacheKey, _, _, err = gs.CacheKey(ctx, 0)
 		if err != nil {
 			return nil, err
 		}

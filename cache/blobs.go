@@ -1,16 +1,14 @@
-package blobs
+package cache
 
 import (
 	"context"
 
-	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
-	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/winlayers"
-	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -20,63 +18,47 @@ var g flightcontrol.Group
 
 const containerdUncompressed = "containerd.io/uncompressed"
 
-type DiffPair struct {
-	DiffID  digest.Digest
-	Blobsum digest.Digest
-}
-
 type CompareWithParent interface {
 	CompareWithParent(ctx context.Context, ref string, opts ...diff.Opt) (ocispec.Descriptor, error)
 }
 
 var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
 
-// GetDiffPairs returns the DiffID/Blobsum pairs for a giver reference and saves it.
-// Caller must hold a lease when calling this function.
-func GetDiffPairs(ctx context.Context, contentStore content.Store, differ diff.Comparer, ref cache.ImmutableRef, createBlobs bool, compression CompressionType) ([]DiffPair, error) {
-	if ref == nil {
-		return nil, nil
-	}
-
+// SetBlobChain ensures every ref in a parent chain has an associated blob in the content store. If
+// a blob is missing an createBlobs is true, then the blob will be created, otherwise ErrNoBlobs will
+// be returned. Caller must hold a lease when calling this function.
+func (sr *immutableRef) SetBlobChain(ctx context.Context, createBlobs bool, compressionType compression.Type) error {
 	if _, ok := leases.FromContext(ctx); !ok {
-		return nil, errors.Errorf("missing lease requirement for GetDiffPairs")
+		return errors.Errorf("missing lease requirement for SetBlobChain")
 	}
 
-	if err := ref.Finalize(ctx, true); err != nil {
-		return nil, err
+	if err := sr.Finalize(ctx, true); err != nil {
+		return err
 	}
 
-	if isTypeWindows(ref) {
+	if isTypeWindows(sr) {
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
-	return getDiffPairs(ctx, contentStore, differ, ref, createBlobs, compression)
+	return sr.setBlobChain(ctx, createBlobs, compressionType)
 }
 
-func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.Comparer, ref cache.ImmutableRef, createBlobs bool, compression CompressionType) ([]DiffPair, error) {
-	if ref == nil {
-		return nil, nil
-	}
-
+func (sr *immutableRef) setBlobChain(ctx context.Context, createBlobs bool, compressionType compression.Type) error {
 	baseCtx := ctx
 	eg, ctx := errgroup.WithContext(ctx)
-	var diffPairs []DiffPair
 	var currentDescr ocispec.Descriptor
-	parent := ref.Parent()
-	if parent != nil {
-		defer parent.Release(context.TODO())
+	if sr.parent != nil {
 		eg.Go(func() error {
-			dp, err := getDiffPairs(ctx, contentStore, differ, parent, createBlobs, compression)
+			err := sr.parent.setBlobChain(ctx, createBlobs, compressionType)
 			if err != nil {
 				return err
 			}
-			diffPairs = dp
 			return nil
 		})
 	}
 	eg.Go(func() error {
-		dp, err := g.Do(ctx, ref.ID(), func(ctx context.Context) (interface{}, error) {
-			refInfo := ref.Info()
+		dp, err := g.Do(ctx, sr.ID(), func(ctx context.Context) (interface{}, error) {
+			refInfo := sr.Info()
 			if refInfo.Blob != "" {
 				return nil, nil
 			} else if !createBlobs {
@@ -87,29 +69,27 @@ func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.C
 			var descr ocispec.Descriptor
 			var err error
 
-			switch compression {
-			case Uncompressed:
+			switch compressionType {
+			case compression.Uncompressed:
 				mediaType = ocispec.MediaTypeImageLayer
-			case Gzip:
+			case compression.Gzip:
 				mediaType = ocispec.MediaTypeImageLayerGzip
 			default:
 				return nil, errors.Errorf("unknown layer compression type")
 			}
 
-			if pc, ok := differ.(CompareWithParent); ok {
-				descr, err = pc.CompareWithParent(ctx, ref.ID(), diff.WithMediaType(mediaType))
+			if pc, ok := sr.cm.Differ.(CompareWithParent); ok {
+				descr, err = pc.CompareWithParent(ctx, sr.ID(), diff.WithMediaType(mediaType))
 				if err != nil {
 					return nil, err
 				}
 			}
 			if descr.Digest == "" {
 				// reference needs to be committed
-				parent := ref.Parent()
 				var lower []mount.Mount
 				var release func() error
-				if parent != nil {
-					defer parent.Release(context.TODO())
-					m, err := parent.Mount(ctx, true)
+				if sr.parent != nil {
+					m, err := sr.parent.Mount(ctx, true)
 					if err != nil {
 						return nil, err
 					}
@@ -121,7 +101,7 @@ func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.C
 						defer release()
 					}
 				}
-				m, err := ref.Mount(ctx, true)
+				m, err := sr.Mount(ctx, true)
 				if err != nil {
 					return nil, err
 				}
@@ -132,9 +112,9 @@ func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.C
 				if release != nil {
 					defer release()
 				}
-				descr, err = differ.Compare(ctx, lower, upper,
+				descr, err = sr.cm.Differ.Compare(ctx, lower, upper,
 					diff.WithMediaType(mediaType),
-					diff.WithReference(ref.ID()),
+					diff.WithReference(sr.ID()),
 				)
 				if err != nil {
 					return nil, err
@@ -145,14 +125,14 @@ func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.C
 				descr.Annotations = map[string]string{}
 			}
 
-			info, err := contentStore.Info(ctx, descr.Digest)
+			info, err := sr.cm.ContentStore.Info(ctx, descr.Digest)
 			if err != nil {
 				return nil, err
 			}
 
 			if diffID, ok := info.Labels[containerdUncompressed]; ok {
 				descr.Annotations[containerdUncompressed] = diffID
-			} else if compression == Uncompressed {
+			} else if compressionType == compression.Uncompressed {
 				descr.Annotations[containerdUncompressed] = descr.Digest.String()
 			} else {
 				return nil, errors.Errorf("unknown layer compression type")
@@ -171,23 +151,21 @@ func getDiffPairs(ctx context.Context, contentStore content.Store, differ diff.C
 	})
 	err := eg.Wait()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if currentDescr.Digest != "" {
-		if err := ref.SetBlob(baseCtx, currentDescr); err != nil {
-			return nil, err
+		if err := sr.SetBlob(baseCtx, currentDescr); err != nil {
+			return err
 		}
 	}
-	refInfo := ref.Info()
-	return append(diffPairs, DiffPair{DiffID: refInfo.DiffID, Blobsum: refInfo.Blob}), nil
+	return nil
 }
 
-func isTypeWindows(ref cache.ImmutableRef) bool {
-	if cache.GetLayerType(ref) == "windows" {
+func isTypeWindows(sr *immutableRef) bool {
+	if GetLayerType(sr) == "windows" {
 		return true
 	}
-	if parent := ref.Parent(); parent != nil {
-		defer parent.Release(context.TODO())
+	if parent := sr.parent; parent != nil {
 		return isTypeWindows(parent)
 	}
 	return false

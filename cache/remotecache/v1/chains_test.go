@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/cache"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
@@ -21,7 +21,7 @@ func TestSimpleMarshal(t *testing.T) {
 
 		baz.LinkFrom(foo, 0, "")
 		baz.LinkFrom(bar, 1, "sel0")
-		r0 := &solver.Remote{
+		r0 := &cache.Remote{
 			Descriptors: []ocispec.Descriptor{{
 				Digest: dgst("d0"),
 			}, {

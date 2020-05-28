@@ -62,6 +62,25 @@ func WithMetadata(key string, val interface{}) WriterOption {
 	}
 }
 
+type Callbacks struct {
+	WithWriter    func(context.Context) context.Context
+	StartProgress func()
+	StopProgress  func(error)
+}
+
+var callbackContextKey = contextKeyT("buildkit/util/progressCallback")
+
+func WithCallbacks(ctx context.Context, c Callbacks) context.Context {
+	return context.WithValue(ctx, callbackContextKey, c)
+}
+
+func CallbacksOf(ctx context.Context) Callbacks {
+	if v, ok := ctx.Value(callbackContextKey).(Callbacks); ok {
+		return v
+	}
+	return Callbacks{}
+}
+
 type Writer interface {
 	Write(id string, value interface{}) error
 	Close() error

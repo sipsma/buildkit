@@ -148,6 +148,7 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
+	ctx = j.Context(ctx)
 
 	var exporterResponse map[string]string
 	if e := exp.Exporter; e != nil {
@@ -204,7 +205,7 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 			inp.Refs = m
 		}
 
-		if err := inVertexContext(j.Context(ctx), e.Name(), "", func(ctx context.Context) error {
+		if err := inVertexContext(ctx, e.Name(), "", func(ctx context.Context) error {
 			exporterResponse, err = e.Export(ctx, inp)
 			return err
 		}); err != nil {
@@ -214,7 +215,7 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 
 	var cacheExporterResponse map[string]string
 	if e := exp.CacheExporter; e != nil {
-		if err := inVertexContext(j.Context(ctx), "exporting cache", "", func(ctx context.Context) error {
+		if err := inVertexContext(ctx, "exporting cache", "", func(ctx context.Context) error {
 			prepareDone := oneOffProgress(ctx, "preparing build cache for export")
 			if err := res.EachRef(func(res solver.ResultProxy) error {
 				r, err := res.Result(ctx)
@@ -267,7 +268,7 @@ func inlineCache(ctx context.Context, e remotecache.Exporter, res solver.CachedR
 			return nil, errors.Errorf("invalid reference: %T", res.Sys())
 		}
 
-		remote, err := workerRef.Worker.GetRemote(ctx, workerRef.ImmutableRef, true)
+		remote, err := workerRef.ImmutableRef.GetRemote(ctx, true)
 		if err != nil || remote == nil {
 			return nil, nil
 		}

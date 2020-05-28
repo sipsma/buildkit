@@ -62,7 +62,7 @@ func (s *sourceOp) CacheMap(ctx context.Context, index int) (*solver.CacheMap, b
 	if err != nil {
 		return nil, false, err
 	}
-	k, done, err := src.CacheKey(ctx, index)
+	k, optSet, done, err := src.CacheKey(ctx, index)
 	if err != nil {
 		return nil, false, err
 	}
@@ -75,7 +75,8 @@ func (s *sourceOp) CacheMap(ctx context.Context, index int) (*solver.CacheMap, b
 
 	return &solver.CacheMap{
 		// TODO: add os/arch
-		Digest: dgst,
+		Digest:    dgst,
+		CacheOpts: optSet,
 	}, done, nil
 }
 

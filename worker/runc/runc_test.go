@@ -23,6 +23,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/stretchr/testify/require"
@@ -62,14 +63,17 @@ func newCtx(s string) context.Context {
 	return namespaces.WithNamespace(context.Background(), s)
 }
 
-func newBusyboxSourceSnapshot(ctx context.Context, t *testing.T, w *base.Worker, sm *session.Manager) cache.ImmutableRef {
+func newBusyboxSourceSnapshot(ctx context.Context, t *testing.T, w *base.Worker, sm *session.Manager) (context.Context, cache.ImmutableRef) {
 	img, err := source.NewImageIdentifier("docker.io/library/busybox:latest")
 	require.NoError(t, err)
 	src, err := w.SourceManager.Resolve(ctx, img, sm)
 	require.NoError(t, err)
+	_, opts, _, err := src.CacheKey(ctx, 0)
+	require.NoError(t, err)
+	ctx = cacheutil.WithOptSet(ctx, opts)
 	snap, err := src.Snapshot(ctx)
 	require.NoError(t, err)
-	return snap
+	return ctx, snap
 }
 
 func TestRuncWorker(t *testing.T) {
@@ -84,7 +88,7 @@ func TestRuncWorker(t *testing.T) {
 	ctx := newCtx("buildkit-test")
 	sm, err := session.NewManager()
 	require.NoError(t, err)
-	snap := newBusyboxSourceSnapshot(ctx, t, w, sm)
+	ctx, snap := newBusyboxSourceSnapshot(ctx, t, w, sm)
 
 	mounts, err := snap.Mount(ctx, false)
 	require.NoError(t, err)
@@ -188,7 +192,7 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	ctx := newCtx("buildkit-test")
 	sm, err := session.NewManager()
 	require.NoError(t, err)
-	snap := newBusyboxSourceSnapshot(ctx, t, w, sm)
+	ctx, snap := newBusyboxSourceSnapshot(ctx, t, w, sm)
 	root, err := w.CacheManager.New(ctx, snap)
 	require.NoError(t, err)
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/worker"
@@ -259,7 +260,7 @@ func (cs *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) 
 	return worker.NewWorkerRefResult(ref, cs.w), nil
 }
 
-func (cs *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheResult) (*solver.Remote, error) {
+func (cs *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheResult) (*cache.Remote, error) {
 	if r := cs.byResultID(res.ID); r != nil && r.result != nil {
 		return r.result, nil
 	}
@@ -287,7 +288,7 @@ func (cs *cacheResultStorage) byResultID(resultID string) *itemWithOutgoingLinks
 }
 
 // unique ID per remote. this ID is not stable.
-func remoteID(r *solver.Remote) string {
+func remoteID(r *cache.Remote) string {
 	dgstr := digest.Canonical.Digester()
 	for _, desc := range r.Descriptors {
 		dgstr.Hash().Write([]byte(desc.Digest))

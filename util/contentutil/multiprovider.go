@@ -46,3 +46,19 @@ func (mp *MultiProvider) Add(dgst digest.Digest, p content.Provider) {
 	defer mp.mu.Unlock()
 	mp.sub[dgst] = p
 }
+
+// StackedProvider is a provider that will check a stack of providers for a given descriptor
+type StackedProvider []content.Provider
+
+func (sp StackedProvider) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
+	for _, p := range sp {
+		ra, err := p.ReaderAt(ctx, desc)
+		if err == nil {
+			return ra, nil
+		}
+		if !errors.Is(err, errdefs.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return nil, errors.Wrapf(errdefs.ErrNotFound, "content %v", desc.Digest)
+}

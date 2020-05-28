@@ -5,23 +5,31 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/winlayers"
 	digest "github.com/opencontainers/go-digest"
 	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
 // Ref is a reference to cacheable objects.
@@ -43,6 +51,7 @@ type ImmutableRef interface {
 	Info() RefInfo
 	SetBlob(ctx context.Context, desc ocispec.Descriptor) error
 	Extract(ctx context.Context) error // +progress
+	GetRemote(ctx context.Context, createIfNeeded bool) (*Remote, error)
 }
 
 type RefInfo struct {
@@ -63,6 +72,8 @@ type MutableRef interface {
 type Mountable interface {
 	Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error)
 }
+
+var ErrNoProvider = errors.New("no provider for lazy blob")
 
 type ref interface {
 	updateLastUsed() bool
@@ -93,15 +104,23 @@ type cacheRecord struct {
 }
 
 // hold ref lock before calling
-func (cr *cacheRecord) ref(triggerLastUsed bool) *immutableRef {
-	ref := &immutableRef{cacheRecord: cr, triggerLastUsed: triggerLastUsed}
+func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlerSet) *immutableRef {
+	ref := &immutableRef{
+		cacheRecord:     cr,
+		triggerLastUsed: triggerLastUsed,
+		descHandlers:    descHandlers,
+	}
 	cr.refs[ref] = struct{}{}
 	return ref
 }
 
 // hold ref lock before calling
-func (cr *cacheRecord) mref(triggerLastUsed bool) *mutableRef {
-	ref := &mutableRef{cacheRecord: cr, triggerLastUsed: triggerLastUsed}
+func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlerSet) *mutableRef {
+	ref := &mutableRef{
+		cacheRecord:     cr,
+		triggerLastUsed: triggerLastUsed,
+		descHandlers:    descHandlers,
+	}
 	cr.refs[ref] = struct{}{}
 	return ref
 }
@@ -129,6 +148,17 @@ func (cr *cacheRecord) parentChain() []digest.Digest {
 // hold ref lock before calling
 func (cr *cacheRecord) isDead() bool {
 	return cr.dead || (cr.equalImmutable != nil && cr.equalImmutable.dead) || (cr.equalMutable != nil && cr.equalMutable.dead)
+}
+
+func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
+	if !getBlobOnly(cr.md) {
+		return false, nil
+	}
+	_, err := cr.cm.ContentStore.Info(ctx, digest.Digest(getBlob(cr.md)))
+	if errors.Is(err, errdefs.ErrNotFound) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (cr *cacheRecord) IdentityMapping() *idtools.IdentityMapping {
@@ -186,27 +216,18 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 	return s.(int64), nil
 }
 
-func (cr *cacheRecord) Parent() ImmutableRef {
-	if p := cr.parentRef(true); p != nil { // avoid returning typed nil pointer
-		return p
-	}
-	return nil
-}
-
-func (cr *cacheRecord) parentRef(hidden bool) *immutableRef {
+func (cr *cacheRecord) parentRef(hidden bool, descHandlers DescHandlerSet) *immutableRef {
 	p := cr.parent
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.ref(hidden)
+	return p.ref(hidden, descHandlers)
 }
 
-func (cr *cacheRecord) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
-
+// must be called holding cacheRecord mu
+func (cr *cacheRecord) mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
 	if cr.mutable {
 		m, err := cr.cm.Snapshotter.Mounts(ctx, getSnapshotID(cr.md))
 		if err != nil {
@@ -282,18 +303,27 @@ func (cr *cacheRecord) ID() string {
 type immutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
+	descHandlers    DescHandlerSet
 }
 
 type mutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
+	descHandlers    DescHandlerSet
 }
 
 func (sr *immutableRef) Clone() ImmutableRef {
 	sr.mu.Lock()
-	ref := sr.ref(false)
+	ref := sr.ref(false, sr.descHandlers)
 	sr.mu.Unlock()
 	return ref
+}
+
+func (sr *immutableRef) Parent() ImmutableRef {
+	if p := sr.parentRef(true, sr.descHandlers); p != nil { // avoid returning typed nil pointer
+		return p
+	}
+	return nil
 }
 
 func (sr *immutableRef) Info() RefInfo {
@@ -308,7 +338,182 @@ func (sr *immutableRef) Info() RefInfo {
 	}
 }
 
-func (sr *immutableRef) Extract(ctx context.Context) error {
+func (sr *immutableRef) ociDesc() (ocispec.Descriptor, error) {
+	desc := ocispec.Descriptor{
+		Digest:      digest.Digest(getBlob(sr.md)),
+		Size:        getBlobSize(sr.md),
+		MediaType:   getMediaType(sr.md),
+		Annotations: make(map[string]string),
+	}
+
+	diffID := getDiffID(sr.md)
+	if diffID != "" {
+		desc.Annotations["containerd.io/uncompressed"] = diffID
+	}
+
+	createdAt := GetCreatedAt(sr.md)
+	if !createdAt.IsZero() {
+		if createdAt, err := createdAt.MarshalText(); err != nil {
+			return ocispec.Descriptor{}, err
+		} else {
+			desc.Annotations["buildkit/createdat"] = string(createdAt)
+		}
+	}
+
+	return desc, nil
+}
+
+// order is from parent->child, sr will be at end of slice
+func (sr *immutableRef) parentRefChain() []*immutableRef {
+	var count int
+	for ref := sr; ref != nil; ref = ref.parent {
+		count++
+	}
+	refs := make([]*immutableRef, count)
+	for i, ref := 0, sr; ref != nil; i, ref = i+1, ref.parent {
+		refs[count-1-i] = ref
+	}
+	return refs
+}
+
+func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool) (*Remote, error) {
+	ctx, done, err := leaseutil.WithLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
+	if err != nil {
+		return nil, err
+	}
+	defer done(ctx)
+
+	err = sr.SetBlobChain(ctx, createIfNeeded, compression.Default)
+	if err != nil {
+		return nil, err
+	}
+
+	mprovider := contentutil.NewMultiProvider(nil)
+	remote := &Remote{
+		Provider: mprovider,
+	}
+	descHandler := sr.descHandlers.Get(digest.Digest(getBlob(sr.md)))
+
+	for _, ref := range sr.parentRefChain() {
+		desc, err := ref.ociDesc()
+		if err != nil {
+			return nil, err
+		}
+
+		// NOTE: The media type might be missing for some migrated ones
+		// from before lease based storage. If so, we should detect
+		// the media type from blob data.
+		//
+		// Discussion: https://github.com/moby/buildkit/pull/1277#discussion_r352795429
+		if desc.MediaType == "" {
+			desc.MediaType, err = compression.DetectLayerMediaType(ctx, sr.cm.ContentStore, desc.Digest, false)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if descHandler != nil && descHandler.ImageRef != "" {
+			desc.Annotations["containerd.io/distribution.source.ref"] = descHandler.ImageRef
+		}
+
+		remote.Descriptors = append(remote.Descriptors, desc)
+
+		provider, err := ref.getProvider(ctx, descHandler)
+		if err != nil {
+			return nil, err
+		}
+		mprovider.Add(desc.Digest, provider)
+	}
+	return remote, nil
+}
+
+func (sr *immutableRef) getProvider(ctx context.Context, dh *descHandler) (content.Provider, error) {
+	if isLazy, err := sr.isLazy(ctx); !isLazy {
+		return sr.cm.ContentStore, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	dgst := digest.Digest(getBlob(sr.md))
+	if dh == nil || dh.Provider == nil {
+		return nil, errors.Wrapf(ErrNoProvider, dgst.String())
+	}
+
+	return contentutil.ProviderFunc(func(ctx context.Context, desc ocispec.Descriptor) (_ content.ReaderAt, rerr error) {
+		if dh.StartProgress != nil {
+			if atomic.AddInt64(&dh.count, 1) == 1 {
+				dh.StartProgress()
+			}
+			ctx = dh.WithWriter(ctx)
+			defer func() {
+				if atomic.AddInt64(&dh.count, -1) == 0 {
+					dh.StopProgress(rerr)
+				}
+			}()
+		}
+
+		// For now, just pull down the whole content and then return a ReaderAt from the local content
+		// store. If efficient partial reads are desired in the future, something more like a "tee"
+		// that caches remote partial reads to a local store may need to replace this.
+		err := contentutil.Copy(ctx, sr.cm.ContentStore, &providerWithProgress{
+			provider: dh.Provider,
+			manager:  sr.cm.ContentStore,
+		}, desc)
+		if err != nil {
+			return nil, err
+		}
+
+		if dh.ImageRef != "" {
+			hf, err := docker.AppendDistributionSourceLabel(sr.cm.ContentStore, dh.ImageRef)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = hf(ctx, desc)
+			if err != nil {
+				return nil, err
+			}
+
+			if GetDescription(sr.md) == "" {
+				queueDescription(sr.md, "pulled from "+dh.ImageRef)
+				err := sr.md.Commit()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		return sr.cm.ContentStore.ReaderAt(ctx, desc)
+	}), nil
+}
+
+func (sr *immutableRef) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+	if getBlobOnly(sr.md) {
+		if err := sr.Extract(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.mount(ctx, readonly)
+}
+
+func (sr *immutableRef) Extract(ctx context.Context) (rerr error) {
+	ctx, done, err := leaseutil.WithLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
+	if err != nil {
+		return err
+	}
+	defer done(ctx)
+
+	if GetLayerType(sr) == "windows" {
+		ctx = winlayers.UseWindowsLayerMode(ctx)
+	}
+
+	return sr.extract(ctx, sr.descHandlers.Get(digest.Digest(getBlob(sr.md))))
+}
+
+func (sr *immutableRef) extract(ctx context.Context, dh *descHandler) error {
 	_, err := sr.sizeG.Do(ctx, sr.ID()+"-extract", func(ctx context.Context) (interface{}, error) {
 		snapshotID := getSnapshotID(sr.md)
 		if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
@@ -316,17 +521,51 @@ func (sr *immutableRef) Extract(ctx context.Context) error {
 			return nil, sr.md.Commit()
 		}
 
+		eg, egctx := errgroup.WithContext(ctx)
+
 		parentID := ""
 		if sr.parent != nil {
-			if err := sr.parent.Extract(ctx); err != nil {
-				return nil, err
-			}
-			parentID = getSnapshotID(sr.parent.md)
+			eg.Go(func() error {
+				if err := sr.parent.extract(egctx, dh); err != nil {
+					return err
+				}
+				parentID = getSnapshotID(sr.parent.md)
+				return nil
+			})
 		}
-		info := sr.Info()
-		key := fmt.Sprintf("extract-%s %s", identity.NewID(), info.ChainID)
 
-		err := sr.cm.Snapshotter.Prepare(ctx, key, parentID)
+		desc, err := sr.ociDesc()
+		if err != nil {
+			return nil, err
+		}
+
+		eg.Go(func() error {
+			if isLazy, err := sr.isLazy(egctx); !isLazy {
+				return nil
+			} else if err != nil {
+				return err
+			}
+
+			provider, err := sr.getProvider(ctx, dh)
+			if err != nil {
+				return err
+			}
+			_, err = contentutil.ReadBlob(egctx, provider, desc)
+			return err
+		})
+
+		if err := eg.Wait(); err != nil {
+			return nil, err
+		}
+
+		extractDone := oneOffProgress(ctx, "unpacking "+desc.Digest.String())
+		defer func() {
+			extractDone(err)
+		}()
+
+		key := fmt.Sprintf("extract-%s %s", identity.NewID(), sr.Info().ChainID)
+
+		err = sr.cm.Snapshotter.Prepare(ctx, key, parentID)
 		if err != nil {
 			return nil, err
 		}
@@ -339,10 +578,7 @@ func (sr *immutableRef) Extract(ctx context.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		_, err = sr.cm.Applier.Apply(ctx, ocispec.Descriptor{
-			Digest:    info.Blob,
-			MediaType: info.MediaType,
-		}, mounts)
+		_, err = sr.cm.Applier.Apply(ctx, desc, mounts)
 		if err != nil {
 			unmount()
 			return nil, err
@@ -357,6 +593,7 @@ func (sr *immutableRef) Extract(ctx context.Context) error {
 			}
 		}
 		queueBlobOnly(sr.md, false)
+		setSize(sr.md, sizeUnknown)
 		if err := sr.md.Commit(); err != nil {
 			return nil, err
 		}
@@ -418,6 +655,7 @@ func (sr *immutableRef) SetBlob(ctx context.Context, desc ocispec.Descriptor) er
 	queueChainID(sr.md, chainID.String())
 	queueBlobChainID(sr.md, blobChainID.String())
 	queueMediaType(sr.md, desc.MediaType)
+	queueBlobSize(sr.md, desc.Size)
 	if err := sr.md.Commit(); err != nil {
 		return err
 	}
@@ -555,7 +793,7 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 	rec := &cacheRecord{
 		mu:           sr.mu,
 		cm:           sr.cm,
-		parent:       sr.parentRef(false),
+		parent:       sr.parentRef(false, sr.descHandlers),
 		equalMutable: sr,
 		refs:         make(map[ref]struct{}),
 		md:           md,
@@ -588,13 +826,20 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 		return nil, err
 	}
 
-	ref := rec.ref(true)
+	ref := rec.ref(true, sr.descHandlers)
 	sr.equalImmutable = ref
 	return ref, nil
 }
 
 func (sr *mutableRef) updatesLastUsed() bool {
 	return sr.triggerLastUsed
+}
+
+func (sr *mutableRef) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	return sr.mount(ctx, readonly)
 }
 
 func (sr *mutableRef) Commit(ctx context.Context) (ImmutableRef, error) {
@@ -690,4 +935,20 @@ func readonlyOverlay(opt []string) []string {
 		}
 	}
 	return out
+}
+
+func oneOffProgress(ctx context.Context, id string) func(err error) error {
+	pw, _, _ := progress.FromContext(ctx)
+	now := time.Now()
+	st := progress.Status{
+		Started: &now,
+	}
+	pw.Write(id, st)
+	return func(err error) error {
+		now := time.Now()
+		st.Completed = &now
+		pw.Write(id, st)
+		pw.Close()
+		return err
+	}
 }

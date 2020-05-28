@@ -8,6 +8,7 @@ import (
 
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/diff"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/filters"
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/leases"
@@ -38,6 +39,7 @@ type ManagerOpt struct {
 	PruneRefChecker ExternalRefCheckerFunc
 	GarbageCollect  func(ctx context.Context) (gc.Stats, error)
 	Applier         diff.Applier
+	Differ          diff.Comparer
 }
 
 type Accessor interface {
@@ -48,6 +50,14 @@ type Accessor interface {
 	GetMutable(ctx context.Context, id string) (MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
 	Metadata(string) *metadata.StorageItem
+}
+
+// Remote is a descriptor or a list of stacked descriptors that can be pulled
+// from a content provider
+// TODO: add closer to keep referenced data from getting deleted
+type Remote struct {
+	Descriptors []ocispec.Descriptor
+	Provider    content.Provider
 }
 
 type Controller interface {
@@ -100,10 +110,19 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	chainID := diffID
 	blobChainID := imagespecidentity.ChainID([]digest.Digest{desc.Digest, diffID})
 
+	isLazy := false
 	if desc.Digest != "" {
-		if _, err := cm.ContentStore.Info(ctx, desc.Digest); err != nil {
-			return nil, errors.Wrapf(err, "failed to get blob %s", desc.Digest)
+		if _, err := cm.ContentStore.Info(ctx, desc.Digest); errors.Is(err, errdefs.ErrNotFound) {
+			isLazy = true
+		} else if err != nil {
+			return nil, err
 		}
+	}
+
+	descHandlers := AsDescHandlerSet(ctx)
+	descHandler := descHandlers.Get(desc.Digest)
+	if isLazy && (descHandler == nil || descHandler.Provider == nil) {
+		return nil, errors.Wrapf(ErrNoProvider, "getbyblob %s", desc.Digest)
 	}
 
 	var p *immutableRef
@@ -234,6 +253,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	queueSnapshotID(rec.md, snapshotID)
 	queueBlobOnly(rec.md, blobOnly)
 	queueMediaType(rec.md, desc.MediaType)
+	queueBlobSize(rec.md, desc.Size)
 	queueCommitted(rec.md)
 
 	if err := rec.md.Commit(); err != nil {
@@ -242,7 +262,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 
 	cm.records[id] = rec
 
-	return rec.ref(true), nil
+	return rec.ref(true, descHandlers), nil
 }
 
 // init loads all snapshots from metadata state and tries to load the records
@@ -308,17 +328,30 @@ func (cm *cacheManager) get(ctx context.Context, id string, opts ...RefOption) (
 		}
 	}
 
+	descHandlers := AsDescHandlerSet(ctx)
+	blobDgst := digest.Digest(getBlob(rec.md))
+	descHandler := descHandlers.Get(blobDgst)
+	isLazy, err := rec.isLazy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if isLazy && (descHandler == nil || descHandler.Provider == nil) {
+		// TODO
+		return nil, errors.Errorf("%+v", errors.Wrapf(ErrNoProvider, "get %s", blobDgst))
+		// return nil, errors.Wrapf(ErrNoProvider, "get %s", blobDgst)
+	}
+
 	if rec.mutable {
 		if len(rec.refs) != 0 {
 			return nil, errors.Wrapf(ErrLocked, "%s is locked", id)
 		}
 		if rec.equalImmutable != nil {
-			return rec.equalImmutable.ref(triggerUpdate), nil
+			return rec.equalImmutable.ref(triggerUpdate, descHandlers), nil
 		}
-		return rec.mref(triggerUpdate).commit(ctx)
+		return rec.mref(triggerUpdate, descHandlers).commit(ctx)
 	}
 
-	return rec.ref(triggerUpdate), nil
+	return rec.ref(triggerUpdate, descHandlers), nil
 }
 
 // getRecord returns record for id. Requires manager lock.
@@ -347,7 +380,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 			mu:           &sync.Mutex{},
 			cm:           cm,
 			refs:         make(map[ref]struct{}),
-			parent:       mutable.parentRef(false),
+			parent:       mutable.parentRef(false, nil),
 			md:           md,
 			equalMutable: &mutableRef{cacheRecord: mutable},
 		}
@@ -404,14 +437,21 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 	var parentID string
 	var parentSnapshotID string
 	if s != nil {
-		p, err := cm.Get(ctx, s.ID(), NoUpdateLastUsed)
-		if err != nil {
+		if _, ok := s.(*immutableRef); ok {
+			parent = s.Clone().(*immutableRef)
+		} else {
+			p, err := cm.Get(ctx, s.ID(), NoUpdateLastUsed)
+			if err != nil {
+				return nil, err
+			}
+			parent = p.(*immutableRef)
+		}
+		if err := parent.Finalize(ctx, true); err != nil {
 			return nil, err
 		}
-		if err := p.Finalize(ctx, true); err != nil {
+		if err := parent.Extract(ctx); err != nil {
 			return nil, err
 		}
-		parent = p.(*immutableRef)
 		parentSnapshotID = getSnapshotID(parent.md)
 		parentID = parent.ID()
 	}
@@ -474,8 +514,9 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 
 	cm.records[id] = rec // TODO: save to db
 
-	return rec.mref(true), nil
+	return rec.mref(true, AsDescHandlerSet(ctx)), nil
 }
+
 func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -506,7 +547,7 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, 
 		rec.equalImmutable = nil
 	}
 
-	return rec.mref(true), nil
+	return rec.mref(true, AsDescHandlerSet(ctx)), nil
 }
 
 func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {

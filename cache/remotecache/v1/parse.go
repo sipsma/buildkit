@@ -3,6 +3,7 @@ package cacheimport
 import (
 	"encoding/json"
 
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/contentutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -69,7 +70,7 @@ func parseRecord(cc CacheConfig, idx int, provider DescriptorProvider, t solver.
 	return r, nil
 }
 
-func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, visited map[int]struct{}) (*solver.Remote, error) {
+func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, visited map[int]struct{}) (*cache.Remote, error) {
 	if _, ok := visited[idx]; ok {
 		return nil, errors.Errorf("invalid looping layer")
 	}
@@ -86,7 +87,7 @@ func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, v
 		return nil, nil
 	}
 
-	var r *solver.Remote
+	var r *cache.Remote
 	if l.ParentIndex != -1 {
 		var err error
 		r, err = getRemoteChain(layers, l.ParentIndex, provider, visited)
@@ -102,7 +103,7 @@ func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, v
 		r.Provider = mp
 		return r, nil
 	}
-	return &solver.Remote{
+	return &cache.Remote{
 		Descriptors: []ocispec.Descriptor{descPair.Descriptor},
 		Provider:    descPair.Provider,
 	}, nil

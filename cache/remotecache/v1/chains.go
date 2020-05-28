@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/content"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/solver"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -96,7 +97,7 @@ type item struct {
 	c    *CacheChains
 	dgst digest.Digest
 
-	result     *solver.Remote
+	result     *cache.Remote
 	resultTime time.Time
 
 	links []map[link]struct{}
@@ -107,7 +108,7 @@ type link struct {
 	selector string
 }
 
-func (c *item) AddResult(createdAt time.Time, result *solver.Remote) {
+func (c *item) AddResult(createdAt time.Time, result *cache.Remote) {
 	c.resultTime = createdAt
 	c.result = result
 }
@@ -145,7 +146,7 @@ func (c *item) walkAllResults(fn func(i *item) error) error {
 type nopRecord struct {
 }
 
-func (c *nopRecord) AddResult(createdAt time.Time, result *solver.Remote) {
+func (c *nopRecord) AddResult(createdAt time.Time, result *cache.Remote) {
 }
 
 func (c *nopRecord) LinkFrom(rec solver.CacheExporterRecord, index int, selector string) {

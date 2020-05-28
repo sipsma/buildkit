@@ -3,7 +3,6 @@ package remotecache
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"sync"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/containerd/containerd/images"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
@@ -101,20 +101,7 @@ func readBlob(ctx context.Context, provider content.Provider, desc ocispec.Descr
 	if desc.Size > maxBlobSize {
 		return nil, errors.Errorf("blob %s is too large (%d > %d)", desc.Digest, desc.Size, maxBlobSize)
 	}
-	dt, err := content.ReadBlob(ctx, provider, desc)
-	if err != nil {
-		// NOTE: even if err == EOF, we might have got expected dt here.
-		// For instance, http.Response.Body is known to return non-zero bytes with EOF.
-		if err == io.EOF {
-			if dtDigest := desc.Digest.Algorithm().FromBytes(dt); dtDigest != desc.Digest {
-				err = errors.Wrapf(err, "got EOF, expected %s (%d bytes), got %s (%d bytes)",
-					desc.Digest, desc.Size, dtDigest, len(dt))
-			} else {
-				err = nil
-			}
-		}
-	}
-	return dt, errors.WithStack(err)
+	return contentutil.ReadBlob(ctx, provider, desc)
 }
 
 func (ci *contentCacheImporter) importInlineCache(ctx context.Context, dt []byte, id string, w worker.Worker) (solver.CacheManager, error) {

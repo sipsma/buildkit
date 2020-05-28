@@ -16,6 +16,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // ResolveOpFunc finds an Op implementation for a Vertex
@@ -482,7 +483,8 @@ func (j *Job) Discard() error {
 
 func (j *Job) Context(ctx context.Context) context.Context {
 	ctx = session.NewContext(ctx, j.SessionID)
-	return progress.WithProgress(ctx, j.pw)
+	ctx = progress.WithProgress(ctx, j.pw)
+	return withJobCacheOpts(ctx, j)
 }
 
 func (j *Job) SetValue(key string, v interface{}) {
@@ -561,7 +563,7 @@ func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, err
 	// no cache hit. start evaluating the node
 	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name())
 	notifyStarted(ctx, &s.st.clientVertex, true)
-	res, err := s.Cache().Load(ctx, rec)
+	res, err := s.Cache().Load(withAncestorCacheOpts(ctx, s.st), rec)
 	tracing.FinishWithError(span, err)
 	notifyCompleted(ctx, &s.st.clientVertex, err, true)
 	return res, err
@@ -584,7 +586,7 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, f ResultBased
 		}
 		s.slowMu.Unlock()
 		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
-		key, err := f(ctx, res)
+		key, err := f(withAncestorCacheOpts(ctx, s.st), res)
 		complete := true
 		if err != nil {
 			select {
@@ -632,6 +634,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 		}
 		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
 		ctx = session.NewContext(ctx, s.st.getSessionID())
+		ctx = withAncestorCacheOpts(ctx, s.st)
 		if len(s.st.vtx.Inputs()) == 0 {
 			// no cache hit. start evaluating the node
 			span, ctx := tracing.StartSpan(ctx, "cache request: "+s.st.vtx.Name())
@@ -641,7 +644,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 				notifyCompleted(ctx, &s.st.clientVertex, retErr, false)
 			}()
 		}
-		res, done, err := op.CacheMap(ctx, len(s.cacheRes))
+		res, done, err := op.CacheMap(withProgressCallback(ctx, &s.st.clientVertex, s.st.mpw), len(s.cacheRes))
 		complete := true
 		if err != nil {
 			select {
@@ -688,6 +691,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 
 		ctx = opentracing.ContextWithSpan(progress.WithProgress(ctx, s.st.mpw), s.st.mspan)
 		ctx = session.NewContext(ctx, s.st.getSessionID())
+		ctx = withAncestorCacheOpts(ctx, s.st)
 
 		// no cache hit. start evaluating the node
 		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name())
@@ -697,6 +701,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 			notifyCompleted(ctx, &s.st.clientVertex, retErr, false)
 		}()
 
+		logrus.Debugf("exec vtx %s", s.st.vtx.Name())
 		res, err := op.Exec(ctx, inputs)
 		complete := true
 		if err != nil {
@@ -815,4 +820,18 @@ func notifyCompleted(ctx context.Context, v *client.Vertex, err error, cached bo
 		v.Error = err.Error()
 	}
 	pw.Write(v.Digest.String(), *v)
+}
+
+func withProgressCallback(ctx context.Context, v *client.Vertex, pw progress.Writer) context.Context {
+	return progress.WithCallbacks(ctx, progress.Callbacks{
+		WithWriter: func(innerCtx context.Context) context.Context {
+			return progress.WithProgress(innerCtx, pw)
+		},
+		StartProgress: func() {
+			notifyStarted(ctx, v, false)
+		},
+		StopProgress: func(err error) {
+			notifyCompleted(ctx, v, err, false)
+		},
+	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/moby/buildkit/cache"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
@@ -46,6 +47,6 @@ type CacheInfoLink struct {
 type CacheResultStorage interface {
 	Save(Result, time.Time) (CacheResult, error)
 	Load(ctx context.Context, res CacheResult) (Result, error)
-	LoadRemote(ctx context.Context, res CacheResult) (*Remote, error)
+	LoadRemote(ctx context.Context, res CacheResult) (*cache.Remote, error)
 	Exists(id string) bool
 }

@@ -5,7 +5,7 @@ import (
 	"sort"
 
 	"github.com/containerd/containerd/content"
-	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/cache"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -226,7 +226,7 @@ type marshalState struct {
 	recordsByItem map[*item]int
 }
 
-func marshalRemote(r *solver.Remote, state *marshalState) string {
+func marshalRemote(r *cache.Remote, state *marshalState) string {
 	if len(r.Descriptors) == 0 {
 		return ""
 	}
@@ -236,7 +236,7 @@ func marshalRemote(r *solver.Remote, state *marshalState) string {
 	}
 	var parentID string
 	if len(r.Descriptors) > 1 {
-		r2 := &solver.Remote{
+		r2 := &cache.Remote{
 			Descriptors: r.Descriptors[:len(r.Descriptors)-1],
 			Provider:    r.Provider,
 		}
@@ -309,7 +309,7 @@ func marshalItem(it *item, state *marshalState) error {
 	return nil
 }
 
-func isSubRemote(sub, main solver.Remote) bool {
+func isSubRemote(sub, main cache.Remote) bool {
 	if len(sub.Descriptors) > len(main.Descriptors) {
 		return false
 	}

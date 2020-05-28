@@ -4,10 +4,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/cacheutil"
 	digest "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Vertex is a node in a build graph. It defines an interface for a
@@ -91,7 +91,7 @@ const (
 // CacheExportOpt defines options for exporting build cache
 type CacheExportOpt struct {
 	// Convert can convert a build result to transferable object
-	Convert func(context.Context, Result) (*Remote, error)
+	Convert func(context.Context, Result) (*cache.Remote, error)
 	// Mode defines a cache export algorithm
 	Mode CacheExportMode
 }
@@ -110,16 +110,8 @@ type CacheExporterTarget interface {
 
 // CacheExporterRecord is a single object being exported
 type CacheExporterRecord interface {
-	AddResult(createdAt time.Time, result *Remote)
+	AddResult(createdAt time.Time, result *cache.Remote)
 	LinkFrom(src CacheExporterRecord, index int, selector string)
-}
-
-// Remote is a descriptor or a list of stacked descriptors that can be pulled
-// from a content provider
-// TODO: add closer to keep referenced data from getting deleted
-type Remote struct {
-	Descriptors []ocispec.Descriptor
-	Provider    content.Provider
 }
 
 // CacheLink is a link between two cache records
@@ -171,6 +163,8 @@ type CacheMap struct {
 		// the checksum of file contents from input snapshots.
 		ComputeDigestFunc ResultBasedCacheFunc
 	}
+
+	CacheOpts cacheutil.OptSet
 }
 
 // ExportableCacheKey is a cache key connected with an exporter that can export

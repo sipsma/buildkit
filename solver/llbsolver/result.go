@@ -5,6 +5,7 @@ import (
 	"context"
 	"path"
 
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/contenthash"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/worker"
@@ -64,11 +65,11 @@ func NewContentHashFunc(selectors []Selector) solver.ResultBasedCacheFunc {
 	}
 }
 
-func workerRefConverter(ctx context.Context, res solver.Result) (*solver.Remote, error) {
+func workerRefConverter(ctx context.Context, res solver.Result) (*cache.Remote, error) {
 	ref, ok := res.Sys().(*worker.WorkerRef)
 	if !ok {
 		return nil, errors.Errorf("invalid result: %T", res.Sys())
 	}
 
-	return ref.Worker.GetRemote(ctx, ref.ImmutableRef, true)
+	return ref.ImmutableRef.GetRemote(ctx, true)
 }
