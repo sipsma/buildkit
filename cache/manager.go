@@ -336,9 +336,7 @@ func (cm *cacheManager) get(ctx context.Context, id string, opts ...RefOption) (
 		return nil, err
 	}
 	if isLazy && (descHandler == nil || descHandler.Provider == nil) {
-		// TODO
-		return nil, errors.Errorf("%+v", errors.Wrapf(ErrNoProvider, "get %s", blobDgst))
-		// return nil, errors.Wrapf(ErrNoProvider, "get %s", blobDgst)
+		return nil, errors.Wrapf(ErrNoProvider, "get %s", blobDgst)
 	}
 
 	if rec.mutable {

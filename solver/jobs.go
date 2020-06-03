@@ -16,7 +16,6 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ResolveOpFunc finds an Op implementation for a Vertex
@@ -701,7 +700,6 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 			notifyCompleted(ctx, &s.st.clientVertex, retErr, false)
 		}()
 
-		logrus.Debugf("exec vtx %s", s.st.vtx.Name())
 		res, err := op.Exec(ctx, inputs)
 		complete := true
 		if err != nil {

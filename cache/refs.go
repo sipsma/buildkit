@@ -540,10 +540,10 @@ func (sr *immutableRef) extract(ctx context.Context, dh *descHandler) error {
 		}
 
 		eg.Go(func() error {
-			if isLazy, err := sr.isLazy(egctx); !isLazy {
-				return nil
-			} else if err != nil {
+			if isLazy, err := sr.isLazy(egctx); err != nil {
 				return err
+			} else if !isLazy {
+				return nil
 			}
 
 			provider, err := sr.getProvider(ctx, dh)
