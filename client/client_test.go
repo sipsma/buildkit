@@ -2082,9 +2082,9 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 	}
 
 	// clear all local state out
-	err = c.Prune(context.TODO(), nil, PruneAll)
+	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
 	require.NoError(t, err)
-	checkAllRemoved(t, c, sb)
+	checkAllReleasable(t, c, sb, true)
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
