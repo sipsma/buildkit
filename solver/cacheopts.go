@@ -3,50 +3,44 @@ package solver
 import (
 	"context"
 
-	"github.com/moby/buildkit/util/cacheutil"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
 )
 
+type CacheOpts map[interface{}]interface{}
+
+type CacheOptGetter func(key interface{}) interface{} // TODO this type definition isn't very helpful
+type CacheOptGetterKey struct{}
+
+func CacheOptGetterOf(ctx context.Context) CacheOptGetter {
+	if v := ctx.Value(CacheOptGetterKey{}); v != nil {
+		if getter, ok := v.(CacheOptGetter); ok {
+			return getter
+		}
+	}
+	return nil
+}
+
 func withAncestorCacheOpts(ctx context.Context, start *state) context.Context {
-	return ancestorCacheOpts{
-		Context: ctx,
-		start:   start,
-	}
-}
-
-type ancestorCacheOpts struct {
-	context.Context
-	start *state
-}
-
-func (c ancestorCacheOpts) Value(k interface{}) (v interface{}) {
-	if v = c.Context.Value(k); v != nil {
-		return
-	}
-
-	if _, ok := k.(cacheutil.OptSetKey); !ok {
-		// if this isn't an opt set key, don't spend time
-		// recursing to the whole build graph
-		return nil
-	}
-
-	walkAncestors(c.start, func(st *state) bool {
-		if st.clientVertex.Error != "" {
-			// don't use values from cancelled or otherwise error'd vertexes
+	return context.WithValue(ctx, CacheOptGetterKey{}, CacheOptGetter(func(k interface{}) (v interface{}) {
+		walkAncestors(start, func(st *state) bool {
+			if st.clientVertex.Error != "" {
+				// don't use values from cancelled or otherwise error'd vertexes
+				return false
+			}
+			for _, res := range st.op.cacheRes {
+				if res.Opts == nil {
+					continue
+				}
+				var ok bool
+				if v, ok = res.Opts[k]; ok {
+					return true
+				}
+			}
 			return false
-		}
-		for _, res := range st.op.cacheRes {
-			if res.CacheOpts == nil {
-				continue
-			}
-			if v = res.CacheOpts.Value(k); v != nil {
-				return true
-			}
-		}
-		return false
-	})
-	return
+		})
+		return v
+	}))
 }
 
 func walkAncestors(start *state, f func(*state) bool) {
@@ -82,43 +76,4 @@ func walkAncestors(start *state, f func(*state) bool) {
 			stack[len(stack)-1] = append(stack[len(stack)-1], parent)
 		}
 	}
-}
-
-func withJobCacheOpts(ctx context.Context, j *Job) context.Context {
-	return jobCacheOpts{Context: ctx, job: j}
-}
-
-type jobCacheOpts struct {
-	context.Context
-	job *Job
-}
-
-func (c jobCacheOpts) Value(k interface{}) interface{} {
-	if v := c.Context.Value(k); v != nil {
-		return v
-	}
-
-	var actives []*state
-	c.job.list.mu.RLock()
-	for _, st := range c.job.list.actives {
-		actives = append(actives, st)
-	}
-	c.job.list.mu.RUnlock()
-	for _, st := range actives {
-		if _, ok := st.jobs[c.job]; !ok {
-			continue
-		}
-		if st.op == nil {
-			continue
-		}
-		for _, res := range st.op.cacheRes {
-			if res.CacheOpts == nil {
-				continue
-			}
-			if v := res.CacheOpts.Value(k); v != nil {
-				return v
-			}
-		}
-	}
-	return nil
 }

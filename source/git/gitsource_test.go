@@ -52,7 +52,7 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 
 	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	key1, _, done, err := g.CacheKey(ctx, 0)
@@ -94,7 +94,7 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 	// second fetch returns same dir
 	id = &source.GitIdentifier{Remote: repodir, Ref: "master", KeepGitDir: keepGitDir}
 
-	g, err = gs.Resolve(ctx, id, nil)
+	g, err = gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	key2, _, _, err := g.CacheKey(ctx, 0)
@@ -110,7 +110,7 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool) {
 
 	id = &source.GitIdentifier{Remote: repodir, Ref: "feature", KeepGitDir: keepGitDir}
 
-	g, err = gs.Resolve(ctx, id, nil)
+	g, err = gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	key3, _, _, err := g.CacheKey(ctx, 0)
@@ -175,7 +175,7 @@ func testFetchBySHA(t *testing.T, keepGitDir bool) {
 
 	id := &source.GitIdentifier{Remote: repodir, Ref: sha, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	key1, _, done, err := g.CacheKey(ctx, 0)
@@ -254,10 +254,10 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir}
 	id2 := &source.GitIdentifier{Remote: repodir2, KeepGitDir: keepGitDir}
 
-	g, err := gs.Resolve(ctx, id, nil)
+	g, err := gs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
-	g2, err := gs.Resolve(ctx, id2, nil)
+	g2, err := gs.Resolve(ctx, id2, nil, nil)
 	require.NoError(t, err)
 
 	expLen := 40

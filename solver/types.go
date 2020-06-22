@@ -6,7 +6,6 @@ import (
 
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/moby/buildkit/util/cacheutil"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -164,7 +163,8 @@ type CacheMap struct {
 		ComputeDigestFunc ResultBasedCacheFunc
 	}
 
-	CacheOpts cacheutil.OptSet
+	// TODO doc
+	Opts CacheOpts
 }
 
 // ExportableCacheKey is a cache key connected with an exporter that can export

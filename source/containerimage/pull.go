@@ -17,8 +17,8 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -89,7 +89,7 @@ func (is *imageSource) ResolveImageConfig(ctx context.Context, ref string, opt l
 	return typed.dgst, typed.dt, nil
 }
 
-func (is *imageSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
+func (is *imageSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager, vtx solver.Vertex) (source.SourceInstance, error) {
 	imageIdentifier, ok := id.(*source.ImageIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid image identifier %v", id)
@@ -114,14 +114,18 @@ func (is *imageSource) Resolve(ctx context.Context, id source.Identifier, sm *se
 		LeaseManager:  is.LeaseManager,
 		Puller:        pullerUtil,
 		id:            imageIdentifier,
+		vtx:           vtx,
 	}
 	return p, nil
 }
 
 type puller struct {
-	CacheAccessor cache.Accessor
-	LeaseManager  leases.Manager
-	id            *source.ImageIdentifier
+	CacheAccessor    cache.Accessor
+	LeaseManager     leases.Manager
+	id               *source.ImageIdentifier
+	vtx              solver.Vertex
+	descHandler      *cache.DescHandler
+	releaseTmpLeases func(context.Context) error
 	*pull.Puller
 }
 
@@ -147,12 +151,17 @@ func mainManifestKey(ctx context.Context, desc specs.Descriptor, platform *specs
 	return digest.FromBytes(dt), nil
 }
 
-func (p *puller) CacheKey(ctx context.Context, index int) (_ string, _ cacheutil.OptSet, _ bool, err error) {
-	ctx, done, err := leaseutil.WithLease(ctx, p.LeaseManager, leaseutil.MakeTemporary)
+func (p *puller) CacheKey(ctx context.Context, index int) (_ string, cacheOpts solver.CacheOpts, _ bool, err error) {
+	ctx, done, err := leaseutil.WithLease(ctx, p.LeaseManager, leases.WithExpiration(5*time.Minute), leaseutil.MakeTemporary)
 	if err != nil {
 		return "", nil, false, err
 	}
-	defer done(ctx)
+	p.releaseTmpLeases = done
+	defer func() {
+		if err != nil {
+			p.releaseTmpLeases(ctx)
+		}
+	}()
 
 	resolveProgressDone := oneOffProgress(ctx, "resolve "+p.Src.String())
 	defer func() {
@@ -164,7 +173,22 @@ func (p *puller) CacheKey(ctx context.Context, index int) (_ string, _ cacheutil
 		return "", nil, false, err
 	}
 
-	optSet := cache.AsOptSet(metadata.Remote, progress.CallbacksOf(ctx), metadata.Ref)
+	if len(metadata.Remote.Descriptors) > 0 {
+		topDesc := metadata.Remote.Descriptors[len(metadata.Remote.Descriptors)-1]
+		pw, _, _ := progress.FromContext(ctx)
+		p.descHandler = &cache.DescHandler{
+			Provider:       metadata.Remote.Provider,
+			ImageRef:       metadata.Ref,
+			ProgressWriter: pw,
+		}
+		if p.vtx != nil {
+			p.descHandler.VertexDigest = p.vtx.Digest()
+			p.descHandler.VertexName = p.vtx.Name()
+		}
+		cacheOpts = solver.CacheOpts(map[interface{}]interface{}{
+			cache.DescHandlerKey(topDesc.Digest): p.descHandler,
+		})
+	}
 
 	desc := metadata.MainManifestDesc
 	if index == 0 || desc.Digest == "" {
@@ -172,7 +196,7 @@ func (p *puller) CacheKey(ctx context.Context, index int) (_ string, _ cacheutil
 		if err != nil {
 			return "", nil, false, err
 		}
-		return k.String(), optSet, false, nil
+		return k.String(), cacheOpts, false, nil
 	}
 	ref, err := reference.ParseNormalizedNamed(p.Src.String())
 	if err != nil {
@@ -193,10 +217,10 @@ func (p *puller) CacheKey(ctx context.Context, index int) (_ string, _ cacheutil
 		if err != nil {
 			return "", nil, false, err
 		}
-		return k.String(), optSet, true, nil
+		return k.String(), cacheOpts, true, nil
 	}
 
-	return k, optSet, true, nil
+	return k, cacheOpts, true, nil
 }
 
 func (p *puller) Snapshot(ctx context.Context) (ir cache.ImmutableRef, err error) {
@@ -205,6 +229,7 @@ func (p *puller) Snapshot(ctx context.Context) (ir cache.ImmutableRef, err error
 		return nil, err
 	}
 	defer done(ctx)
+	defer p.releaseTmpLeases(ctx)
 
 	metadata, err := p.PullMetadata(ctx)
 	if err != nil {
@@ -225,7 +250,7 @@ func (p *puller) Snapshot(ctx context.Context) (ir cache.ImmutableRef, err error
 	var parent cache.ImmutableRef
 	for _, layerDesc := range metadata.Remote.Descriptors {
 		parent = current
-		current, err = p.CacheAccessor.GetByBlob(ctx, layerDesc, parent)
+		current, err = p.CacheAccessor.GetByBlob(ctx, layerDesc, parent, p.descHandler)
 		if parent != nil {
 			parent.Release(context.TODO())
 		}

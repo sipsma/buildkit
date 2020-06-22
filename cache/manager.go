@@ -47,7 +47,7 @@ type Accessor interface {
 	Get(ctx context.Context, id string, opts ...RefOption) (ImmutableRef, error)
 
 	New(ctx context.Context, parent ImmutableRef, opts ...RefOption) (MutableRef, error)
-	GetMutable(ctx context.Context, id string) (MutableRef, error) // Rebase?
+	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
 	Metadata(string) *metadata.StorageItem
 }
@@ -102,7 +102,7 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 	return cm, nil
 }
 
-func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent ImmutableRef, opts ...RefOption) (ir ImmutableRef, err error) {
+func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
 	diffID, err := diffIDFromDescriptor(desc)
 	if err != nil {
 		return nil, err
@@ -110,19 +110,13 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	chainID := diffID
 	blobChainID := imagespecidentity.ChainID([]digest.Digest{desc.Digest, diffID})
 
-	isLazy := false
-	if desc.Digest != "" {
+	descHandler := descHandlerOf(opts...)
+	if descHandler == nil || descHandler.Provider == nil {
 		if _, err := cm.ContentStore.Info(ctx, desc.Digest); errors.Is(err, errdefs.ErrNotFound) {
-			isLazy = true
+			return nil, MissingDescHandler(desc.Digest)
 		} else if err != nil {
 			return nil, err
 		}
-	}
-
-	descHandlers := AsDescHandlerSet(ctx)
-	descHandler := descHandlers.Get(desc.Digest)
-	if isLazy && (descHandler == nil || descHandler.Provider == nil) {
-		return nil, errors.Wrapf(ErrNoProvider, "getbyblob %s", desc.Digest)
 	}
 
 	var p *immutableRef
@@ -134,7 +128,8 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 		chainID = imagespecidentity.ChainID([]digest.Digest{pInfo.ChainID, chainID})
 		blobChainID = imagespecidentity.ChainID([]digest.Digest{pInfo.BlobChainID, blobChainID})
-		p2, err := cm.Get(ctx, parent.ID(), NoUpdateLastUsed)
+
+		p2, err := cm.Get(ctx, parent.ID(), NoUpdateLastUsed, descHandler)
 		if err != nil {
 			return nil, err
 		}
@@ -147,7 +142,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 
 	releaseParent := false
 	defer func() {
-		if releaseParent || err != nil && p != nil {
+		if releaseParent || rerr != nil && p != nil {
 			p.Release(context.TODO())
 		}
 	}()
@@ -207,7 +202,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	}
 
 	defer func() {
-		if err != nil {
+		if rerr != nil {
 			if err := cm.ManagerOpt.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
@@ -262,7 +257,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 
 	cm.records[id] = rec
 
-	return rec.ref(true, descHandlers), nil
+	return rec.ref(true, descHandler), nil
 }
 
 // init loads all snapshots from metadata state and tries to load the records
@@ -328,32 +323,33 @@ func (cm *cacheManager) get(ctx context.Context, id string, opts ...RefOption) (
 		}
 	}
 
-	descHandlers := AsDescHandlerSet(ctx)
-	blobDgst := digest.Digest(getBlob(rec.md))
-	descHandler := descHandlers.Get(blobDgst)
-	isLazy, err := rec.isLazy(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if isLazy && (descHandler == nil || descHandler.Provider == nil) {
-		return nil, errors.Wrapf(ErrNoProvider, "get %s", blobDgst)
-	}
+	descHandler := descHandlerOf(opts...)
 
 	if rec.mutable {
 		if len(rec.refs) != 0 {
 			return nil, errors.Wrapf(ErrLocked, "%s is locked", id)
 		}
 		if rec.equalImmutable != nil {
-			return rec.equalImmutable.ref(triggerUpdate, descHandlers), nil
+			return rec.equalImmutable.ref(triggerUpdate, descHandler), nil
 		}
-		return rec.mref(triggerUpdate, descHandlers).commit(ctx)
+		return rec.mref(triggerUpdate, descHandler).commit(ctx)
 	}
 
-	return rec.ref(triggerUpdate, descHandlers), nil
+	return rec.ref(triggerUpdate, descHandler), nil
 }
 
 // getRecord returns record for id. Requires manager lock.
 func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOption) (cr *cacheRecord, retErr error) {
+	defer func() {
+		if retErr == nil {
+			if isLazy, err := cr.isLazy(ctx); err != nil {
+				retErr = err
+			} else if isLazy && descHandlerOf(opts...) == nil {
+				retErr = MissingDescHandler(getBlob(cr.md))
+			}
+		}
+	}()
+
 	if rec, ok := cm.records[id]; ok {
 		if rec.isDead() {
 			return nil, errors.Wrapf(errNotFound, "failed to get dead record %s", id)
@@ -434,11 +430,12 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 	var parent *immutableRef
 	var parentID string
 	var parentSnapshotID string
+	var descHandler *DescHandler
 	if s != nil {
 		if _, ok := s.(*immutableRef); ok {
 			parent = s.Clone().(*immutableRef)
 		} else {
-			p, err := cm.Get(ctx, s.ID(), NoUpdateLastUsed)
+			p, err := cm.Get(ctx, s.ID(), append(opts, NoUpdateLastUsed)...)
 			if err != nil {
 				return nil, err
 			}
@@ -452,6 +449,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 		}
 		parentSnapshotID = getSnapshotID(parent.md)
 		parentID = parent.ID()
+		descHandler = parent.descHandler
 	}
 
 	defer func() {
@@ -512,14 +510,14 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 
 	cm.records[id] = rec // TODO: save to db
 
-	return rec.mref(true, AsDescHandlerSet(ctx)), nil
+	return rec.mref(true, descHandler), nil
 }
 
-func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, error) {
+func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	rec, err := cm.getRecord(ctx, id)
+	rec, err := cm.getRecord(ctx, id, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +543,7 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, 
 		rec.equalImmutable = nil
 	}
 
-	return rec.mref(true, AsDescHandlerSet(ctx)), nil
+	return rec.mref(true, descHandlerOf(opts...)), nil
 }
 
 func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {

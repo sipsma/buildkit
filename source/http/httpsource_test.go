@@ -46,7 +46,7 @@ func TestHTTPSource(t *testing.T) {
 
 	id := &source.HttpIdentifier{URL: server.URL + "/foo"}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err := h.CacheKey(ctx, 0)
@@ -75,7 +75,7 @@ func TestHTTPSource(t *testing.T) {
 	ref = nil
 
 	// repeat, should use the etag
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err = h.CacheKey(ctx, 0)
@@ -111,7 +111,7 @@ func TestHTTPSource(t *testing.T) {
 	// update etag, downloads again
 	server.SetRoute("/foo", resp2)
 
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err = h.CacheKey(ctx, 0)
@@ -160,7 +160,7 @@ func TestHTTPDefaultName(t *testing.T) {
 
 	id := &source.HttpIdentifier{URL: server.URL}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err := h.CacheKey(ctx, 0)
@@ -203,7 +203,7 @@ func TestHTTPInvalidURL(t *testing.T) {
 
 	id := &source.HttpIdentifier{URL: server.URL + "/foo"}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	_, _, _, err = h.CacheKey(ctx, 0)
@@ -233,7 +233,7 @@ func TestHTTPChecksum(t *testing.T) {
 
 	id := &source.HttpIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-different"))}
 
-	h, err := hs.Resolve(ctx, id, nil)
+	h, err := hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err := h.CacheKey(ctx, 0)
@@ -255,7 +255,7 @@ func TestHTTPChecksum(t *testing.T) {
 
 	id = &source.HttpIdentifier{URL: server.URL + "/foo", Checksum: digest.FromBytes([]byte("content-correct"))}
 
-	h, err = hs.Resolve(ctx, id, nil)
+	h, err = hs.Resolve(ctx, id, nil, nil)
 	require.NoError(t, err)
 
 	k, _, _, err = h.CacheKey(ctx, 0)

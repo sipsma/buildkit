@@ -482,8 +482,7 @@ func (j *Job) Discard() error {
 
 func (j *Job) Context(ctx context.Context) context.Context {
 	ctx = session.NewContext(ctx, j.SessionID)
-	ctx = progress.WithProgress(ctx, j.pw)
-	return withJobCacheOpts(ctx, j)
+	return progress.WithProgress(ctx, j.pw)
 }
 
 func (j *Job) SetValue(key string, v interface{}) {
@@ -643,7 +642,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 				notifyCompleted(ctx, &s.st.clientVertex, retErr, false)
 			}()
 		}
-		res, done, err := op.CacheMap(withProgressCallback(ctx, &s.st.clientVertex, s.st.mpw), len(s.cacheRes))
+		res, done, err := op.CacheMap(ctx, len(s.cacheRes))
 		complete := true
 		if err != nil {
 			select {
@@ -818,18 +817,4 @@ func notifyCompleted(ctx context.Context, v *client.Vertex, err error, cached bo
 		v.Error = err.Error()
 	}
 	pw.Write(v.Digest.String(), *v)
-}
-
-func withProgressCallback(ctx context.Context, v *client.Vertex, pw progress.Writer) context.Context {
-	return progress.WithCallbacks(ctx, progress.Callbacks{
-		WithWriter: func(innerCtx context.Context) context.Context {
-			return progress.WithProgress(innerCtx, pw)
-		},
-		StartProgress: func() {
-			notifyStarted(ctx, v, false)
-		},
-		StopProgress: func(err error) {
-			notifyCompleted(ctx, v, err, false)
-		},
-	})
 }

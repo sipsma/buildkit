@@ -16,6 +16,7 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache/metadata"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/compression"
@@ -51,7 +52,7 @@ type ImmutableRef interface {
 	Info() RefInfo
 	SetBlob(ctx context.Context, desc ocispec.Descriptor) error
 	Extract(ctx context.Context) error // +progress
-	GetRemote(ctx context.Context, createIfNeeded bool) (*Remote, error)
+	GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type) (*Remote, error)
 }
 
 type RefInfo struct {
@@ -72,8 +73,6 @@ type MutableRef interface {
 type Mountable interface {
 	Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error)
 }
-
-var ErrNoProvider = errors.New("no provider for lazy blob")
 
 type ref interface {
 	updateLastUsed() bool
@@ -104,22 +103,22 @@ type cacheRecord struct {
 }
 
 // hold ref lock before calling
-func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlerSet) *immutableRef {
+func (cr *cacheRecord) ref(triggerLastUsed bool, descHandler *DescHandler) *immutableRef {
 	ref := &immutableRef{
 		cacheRecord:     cr,
 		triggerLastUsed: triggerLastUsed,
-		descHandlers:    descHandlers,
+		descHandler:     descHandler,
 	}
 	cr.refs[ref] = struct{}{}
 	return ref
 }
 
 // hold ref lock before calling
-func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlerSet) *mutableRef {
+func (cr *cacheRecord) mref(triggerLastUsed bool, descHandler *DescHandler) *mutableRef {
 	ref := &mutableRef{
 		cacheRecord:     cr,
 		triggerLastUsed: triggerLastUsed,
-		descHandlers:    descHandlers,
+		descHandler:     descHandler,
 	}
 	cr.refs[ref] = struct{}{}
 	return ref
@@ -216,14 +215,14 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 	return s.(int64), nil
 }
 
-func (cr *cacheRecord) parentRef(hidden bool, descHandlers DescHandlerSet) *immutableRef {
+func (cr *cacheRecord) parentRef(hidden bool, descHandler *DescHandler) *immutableRef {
 	p := cr.parent
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.ref(hidden, descHandlers)
+	return p.ref(hidden, descHandler)
 }
 
 // must be called holding cacheRecord mu
@@ -303,24 +302,24 @@ func (cr *cacheRecord) ID() string {
 type immutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
-	descHandlers    DescHandlerSet
+	descHandler     *DescHandler
 }
 
 type mutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
-	descHandlers    DescHandlerSet
+	descHandler     *DescHandler
 }
 
 func (sr *immutableRef) Clone() ImmutableRef {
 	sr.mu.Lock()
-	ref := sr.ref(false, sr.descHandlers)
+	ref := sr.ref(false, sr.descHandler)
 	sr.mu.Unlock()
 	return ref
 }
 
 func (sr *immutableRef) Parent() ImmutableRef {
-	if p := sr.parentRef(true, sr.descHandlers); p != nil { // avoid returning typed nil pointer
+	if p := sr.parentRef(true, sr.descHandler); p != nil { // avoid returning typed nil pointer
 		return p
 	}
 	return nil
@@ -370,20 +369,20 @@ func (sr *immutableRef) parentRefChain() []*immutableRef {
 		count++
 	}
 	refs := make([]*immutableRef, count)
-	for i, ref := 0, sr; ref != nil; i, ref = i+1, ref.parent {
-		refs[count-1-i] = ref
+	for i, ref := count-1, sr; ref != nil; i, ref = i-1, ref.parent {
+		refs[i] = ref
 	}
 	return refs
 }
 
-func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool) (*Remote, error) {
+func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type) (*Remote, error) {
 	ctx, done, err := leaseutil.WithLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
 		return nil, err
 	}
 	defer done(ctx)
 
-	err = sr.SetBlobChain(ctx, createIfNeeded, compression.Default)
+	err = sr.SetBlobChain(ctx, createIfNeeded, compressionType)
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +391,6 @@ func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool) (*Re
 	remote := &Remote{
 		Provider: mprovider,
 	}
-	descHandler := sr.descHandlers.Get(digest.Digest(getBlob(sr.md)))
 
 	for _, ref := range sr.parentRefChain() {
 		desc, err := ref.ociDesc()
@@ -412,13 +410,13 @@ func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool) (*Re
 			}
 		}
 
-		if descHandler != nil && descHandler.ImageRef != "" {
-			desc.Annotations["containerd.io/distribution.source.ref"] = descHandler.ImageRef
+		if sr.descHandler != nil && sr.descHandler.ImageRef != "" {
+			desc.Annotations["containerd.io/distribution.source.ref"] = sr.descHandler.ImageRef
 		}
 
 		remote.Descriptors = append(remote.Descriptors, desc)
 
-		provider, err := ref.getProvider(ctx, descHandler)
+		provider, err := ref.getProvider(ctx, sr.descHandler)
 		if err != nil {
 			return nil, err
 		}
@@ -427,27 +425,42 @@ func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool) (*Re
 	return remote, nil
 }
 
-func (sr *immutableRef) getProvider(ctx context.Context, dh *descHandler) (content.Provider, error) {
+func (sr *immutableRef) getProvider(ctx context.Context, dh *DescHandler) (content.Provider, error) {
 	if isLazy, err := sr.isLazy(ctx); !isLazy {
 		return sr.cm.ContentStore, nil
 	} else if err != nil {
 		return nil, err
 	}
 
-	dgst := digest.Digest(getBlob(sr.md))
-	if dh == nil || dh.Provider == nil {
-		return nil, errors.Wrapf(ErrNoProvider, dgst.String())
-	}
-
 	return contentutil.ProviderFunc(func(ctx context.Context, desc ocispec.Descriptor) (_ content.ReaderAt, rerr error) {
-		if dh.StartProgress != nil {
+		// TODO close ProgressWriter when ref gets removed?
+		if dh.ProgressWriter != nil {
+			ctx = progress.WithProgress(ctx, dh.ProgressWriter)
 			if atomic.AddInt64(&dh.count, 1) == 1 {
-				dh.StartProgress()
+				if dh.started == nil {
+					now := time.Now()
+					dh.started = &now
+				}
+				dh.ProgressWriter.Write(dh.VertexDigest.String(), client.Vertex{
+					Digest:  dh.VertexDigest,
+					Name:    dh.VertexName,
+					Started: dh.started,
+				})
 			}
-			ctx = dh.WithWriter(ctx)
 			defer func() {
 				if atomic.AddInt64(&dh.count, -1) == 0 {
-					dh.StopProgress(rerr)
+					now := time.Now()
+					var errStr string
+					if rerr != nil {
+						errStr = rerr.Error()
+					}
+					dh.ProgressWriter.Write(dh.VertexDigest.String(), client.Vertex{
+						Digest:    dh.VertexDigest,
+						Name:      dh.VertexName,
+						Started:   dh.started,
+						Completed: &now,
+						Error:     errStr,
+					})
 				}
 			}()
 		}
@@ -487,6 +500,22 @@ func (sr *immutableRef) getProvider(ctx context.Context, dh *descHandler) (conte
 	}), nil
 }
 
+func oneOffProgress(ctx context.Context, id string) func(err error) error {
+	pw, _, _ := progress.FromContext(ctx)
+	now := time.Now()
+	st := progress.Status{
+		Started: &now,
+	}
+	pw.Write(id, st)
+	return func(err error) error {
+		now := time.Now()
+		st.Completed = &now
+		pw.Write(id, st)
+		pw.Close()
+		return err
+	}
+}
+
 func (sr *immutableRef) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
 	if getBlobOnly(sr.md) {
 		if err := sr.Extract(ctx); err != nil {
@@ -510,11 +539,11 @@ func (sr *immutableRef) Extract(ctx context.Context) (rerr error) {
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
-	return sr.extract(ctx, sr.descHandlers.Get(digest.Digest(getBlob(sr.md))))
+	return sr.extract(ctx, sr.descHandler)
 }
 
-func (sr *immutableRef) extract(ctx context.Context, dh *descHandler) error {
-	_, err := sr.sizeG.Do(ctx, sr.ID()+"-extract", func(ctx context.Context) (interface{}, error) {
+func (sr *immutableRef) extract(ctx context.Context, dh *DescHandler) error {
+	_, err := sr.sizeG.Do(ctx, sr.ID()+"-extract", func(ctx context.Context) (_ interface{}, rerr error) {
 		snapshotID := getSnapshotID(sr.md)
 		if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
 			queueBlobOnly(sr.md, false)
@@ -550,7 +579,7 @@ func (sr *immutableRef) extract(ctx context.Context, dh *descHandler) error {
 			if err != nil {
 				return err
 			}
-			_, err = contentutil.ReadBlob(egctx, provider, desc)
+			err = contentutil.Copy(egctx, contentutil.DiscardIngester(), provider, desc)
 			return err
 		})
 
@@ -558,10 +587,37 @@ func (sr *immutableRef) extract(ctx context.Context, dh *descHandler) error {
 			return nil, err
 		}
 
-		extractDone := oneOffProgress(ctx, "unpacking "+desc.Digest.String())
-		defer func() {
-			extractDone(err)
-		}()
+		if dh != nil && dh.ProgressWriter != nil {
+			started := time.Now()
+			dh.ProgressWriter.Write(dh.VertexDigest.String(), client.Vertex{
+				Digest:  dh.VertexDigest,
+				Name:    dh.VertexName,
+				Started: &started,
+			})
+			dh.ProgressWriter.Write("extracting "+desc.Digest.String(), progress.Status{
+				Action:  "extracting",
+				Started: &started,
+			})
+			defer func() {
+				completed := time.Now()
+				dh.ProgressWriter.Write("extracting "+desc.Digest.String(), progress.Status{
+					Action:    "extracting",
+					Started:   &started,
+					Completed: &completed,
+				})
+				var errStr string
+				if rerr != nil {
+					errStr = rerr.Error()
+				}
+				dh.ProgressWriter.Write(dh.VertexDigest.String(), client.Vertex{
+					Digest:    dh.VertexDigest,
+					Name:      dh.VertexName,
+					Started:   &started,
+					Completed: &completed,
+					Error:     errStr,
+				})
+			}()
+		}
 
 		key := fmt.Sprintf("extract-%s %s", identity.NewID(), sr.Info().ChainID)
 
@@ -793,7 +849,7 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 	rec := &cacheRecord{
 		mu:           sr.mu,
 		cm:           sr.cm,
-		parent:       sr.parentRef(false, sr.descHandlers),
+		parent:       sr.parentRef(false, sr.descHandler),
 		equalMutable: sr,
 		refs:         make(map[ref]struct{}),
 		md:           md,
@@ -826,7 +882,7 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 		return nil, err
 	}
 
-	ref := rec.ref(true, sr.descHandlers)
+	ref := rec.ref(true, sr.descHandler)
 	sr.equalImmutable = ref
 	return ref, nil
 }
@@ -935,20 +991,4 @@ func readonlyOverlay(opt []string) []string {
 		}
 	}
 	return out
-}
-
-func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
-	now := time.Now()
-	st := progress.Status{
-		Started: &now,
-	}
-	pw.Write(id, st)
-	return func(err error) error {
-		now := time.Now()
-		st.Completed = &now
-		pw.Write(id, st)
-		pw.Close()
-		return err
-	}
 }

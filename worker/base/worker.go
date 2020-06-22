@@ -42,7 +42,6 @@ import (
 	"github.com/moby/buildkit/source/http"
 	"github.com/moby/buildkit/source/local"
 	"github.com/moby/buildkit/util/binfmt_misc"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
@@ -223,7 +222,16 @@ func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.Imm
 	if hidden {
 		opts = append(opts, cache.NoUpdateLastUsed)
 	}
-	return w.CacheManager.Get(ctx, id, opts...)
+
+	ref, err := w.CacheManager.Get(ctx, id, opts...)
+	var missingDescHandler cache.MissingDescHandler
+	if errors.As(err, &missingDescHandler) {
+		if descHandler := missingDescHandler.FindIn(solver.CacheOptGetterOf(ctx)); descHandler != nil {
+			opts = append(opts, descHandler)
+			ref, err = w.CacheManager.Get(ctx, id, opts...)
+		}
+	}
+	return ref, err
 }
 
 func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *session.Manager) (solver.Op, error) {
@@ -352,7 +360,11 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 }
 
 func (w *Worker) FromRemote(ctx context.Context, remote *cache.Remote) (ref cache.ImmutableRef, err error) {
-	ctx = cacheutil.WithOptSet(ctx, cache.AsOptSet(remote, progress.CallbacksOf(ctx), ""))
+	pw, _, _ := progress.FromContext(ctx)
+	descHandler := &cache.DescHandler{
+		Provider:       remote.Provider,
+		ProgressWriter: pw,
+	}
 
 	var current cache.ImmutableRef
 	for i, desc := range remote.Descriptors {
@@ -371,7 +383,8 @@ func (w *Worker) FromRemote(ctx context.Context, remote *cache.Remote) (ref cach
 		}
 		ref, err := w.CacheManager.GetByBlob(ctx, desc, current,
 			cache.WithDescription(descr),
-			cache.WithCreationTime(tm))
+			cache.WithCreationTime(tm),
+			descHandler)
 		if current != nil {
 			current.Release(context.TODO())
 		}

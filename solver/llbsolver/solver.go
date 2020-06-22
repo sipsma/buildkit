@@ -16,6 +16,7 @@ import (
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/worker"
@@ -148,7 +149,6 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
-	ctx = j.Context(ctx)
 
 	var exporterResponse map[string]string
 	if e := exp.Exporter; e != nil {
@@ -205,7 +205,7 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 			inp.Refs = m
 		}
 
-		if err := inVertexContext(ctx, e.Name(), "", func(ctx context.Context) error {
+		if err := inVertexContext(j.Context(ctx), e.Name(), "", func(ctx context.Context) error {
 			exporterResponse, err = e.Export(ctx, inp)
 			return err
 		}); err != nil {
@@ -268,7 +268,7 @@ func inlineCache(ctx context.Context, e remotecache.Exporter, res solver.CachedR
 			return nil, errors.Errorf("invalid reference: %T", res.Sys())
 		}
 
-		remote, err := workerRef.ImmutableRef.GetRemote(ctx, true)
+		remote, err := workerRef.ImmutableRef.GetRemote(ctx, true, compression.Default)
 		if err != nil || remote == nil {
 			return nil, nil
 		}

@@ -14,8 +14,8 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -52,7 +52,7 @@ func (ls *localSource) ID() string {
 	return source.LocalScheme
 }
 
-func (ls *localSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
+func (ls *localSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager, _ solver.Vertex) (source.SourceInstance, error) {
 	localIdentifier, ok := id.(*source.LocalIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid local identifier %v", id)
@@ -71,7 +71,7 @@ type localSourceHandler struct {
 	*localSource
 }
 
-func (ls *localSourceHandler) CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error) {
+func (ls *localSourceHandler) CacheKey(ctx context.Context, index int) (string, solver.CacheOpts, bool, error) {
 	sessionID := ls.src.SessionID
 
 	if sessionID == "" {

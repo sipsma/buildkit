@@ -1,51 +1,47 @@
 package cache
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/containerd/containerd/content"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
 )
 
-type descHandler struct {
-	count    int64
-	Provider content.Provider
-	ImageRef string
-	progress.Callbacks
+type DescHandlerKey digest.Digest
+
+type DescHandler struct {
+	count          int64
+	started        *time.Time
+	Provider       content.Provider
+	ImageRef       string
+	ProgressWriter progress.Writer
+	VertexDigest   digest.Digest
+	VertexName     string
 }
 
-type DescHandlerSet interface {
-	Get(digest.Digest) *descHandler
+type MissingDescHandler DescHandlerKey
+
+func (m MissingDescHandler) Error() string {
+	return fmt.Sprintf("missing descriptor handler for lazy blob %q", digest.Digest(m))
 }
 
-type descHandlerKey digest.Digest
-
-func (descHandlerKey) OptSetKey() {}
-
-type descHandlerSet struct {
-	cacheutil.OptSet
-}
-
-func (s descHandlerSet) Get(k digest.Digest) *descHandler {
-	if v, ok := s.Value(descHandlerKey(k)).(*descHandler); ok {
+func (m MissingDescHandler) FindIn(getter func(interface{}) interface{}) *DescHandler {
+	if getter == nil {
+		return nil
+	}
+	if v, ok := getter(DescHandlerKey(m)).(*DescHandler); ok {
 		return v
 	}
 	return nil
 }
 
-func AsDescHandlerSet(optSet cacheutil.OptSet) DescHandlerSet {
-	return descHandlerSet{OptSet: optSet}
-}
-
-func AsOptSet(r *Remote, pc progress.Callbacks, imageRef string) cacheutil.OptSet {
-	descHandler := &descHandler{
-		Provider:  r.Provider,
-		ImageRef:  imageRef,
-		Callbacks: pc,
+func descHandlerOf(opts ...RefOption) *DescHandler {
+	for _, opt := range opts {
+		if opt, ok := opt.(*DescHandler); ok {
+			return opt
+		}
 	}
-	m := cacheutil.OptSetMap(make(map[interface{}]interface{}))
-	for _, desc := range r.Descriptors {
-		m[descHandlerKey(desc.Digest)] = descHandler
-	}
-	return m
+	return nil
 }

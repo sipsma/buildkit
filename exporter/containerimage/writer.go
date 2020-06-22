@@ -141,7 +141,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	return &idxDesc, nil
 }
 
-func (ic *ImageWriter) exportLayers(ctx context.Context, compression compression.Type, refs ...cache.ImmutableRef) ([]*cache.Remote, error) {
+func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compression.Type, refs ...cache.ImmutableRef) ([]*cache.Remote, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 	layersDone := oneOffProgress(ctx, "exporting layers")
 
@@ -153,7 +153,8 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, compression compression
 				return
 			}
 			eg.Go(func() error {
-				remote, err := ref.GetRemote(ctx, true)
+				// TODO remote, err := ref.GetRemote(ctx, true, compressionType)
+				remote, err := ref.GetRemote(ctx, true, compression.Default)
 				if err != nil {
 					return err
 				}

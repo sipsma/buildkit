@@ -22,8 +22,8 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -168,7 +168,7 @@ func (gs *gitSourceHandler) shaToCacheKey(sha string) string {
 	return key
 }
 
-func (gs *gitSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
+func (gs *gitSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager, _ solver.Vertex) (source.SourceInstance, error) {
 	gitIdentifier, ok := id.(*source.GitIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid git identifier %v", id)
@@ -245,7 +245,7 @@ func (gs *gitSourceHandler) getAuthToken(ctx context.Context) error {
 	return nil
 }
 
-func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error) {
+func (gs *gitSourceHandler) CacheKey(ctx context.Context, index int) (string, solver.CacheOpts, bool, error) {
 	remote := gs.src.Remote
 	ref := gs.src.Ref
 	if ref == "" {

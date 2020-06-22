@@ -179,7 +179,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 
 	providers := []content.Provider{e.opt.ImageWriter.ContentStore()}
 	if src.Ref != nil {
-		remote, err := src.Ref.GetRemote(ctx, false)
+		remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression)
 		if err != nil {
 			return nil, err
 		}
@@ -187,7 +187,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 	}
 	if len(src.Refs) > 0 {
 		for _, r := range src.Refs {
-			remote, err := r.GetRemote(ctx, false)
+			remote, err := r.GetRemote(ctx, false, e.layerCompression)
 			if err != nil {
 				return nil, err
 			}

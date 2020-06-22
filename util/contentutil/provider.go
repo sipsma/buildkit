@@ -15,6 +15,7 @@ func (f ProviderFunc) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (co
 	return f(ctx, desc)
 }
 
+// TODO move this back
 func ReadBlob(ctx context.Context, provider content.Provider, desc ocispec.Descriptor) ([]byte, error) {
 	dt, err := content.ReadBlob(ctx, provider, desc)
 	if err != nil {

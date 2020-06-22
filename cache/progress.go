@@ -13,6 +13,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// TODO delete this
+
 type providerWithProgress struct {
 	provider content.Provider
 	manager  interface {
@@ -33,12 +35,16 @@ func (p *providerWithProgress) ReaderAt(ctx context.Context, desc ocispec.Descri
 		ingestRef := remotes.MakeRefKey(ctx, desc)
 
 		started := time.Now()
+		onFinalStatus := false
 		for {
+			if onFinalStatus {
+				return
+			}
 			select {
 			case <-doneCh:
-				return
+				onFinalStatus = true
 			case <-ctx.Done():
-				return
+				onFinalStatus = true
 			case <-ticker.C:
 			}
 

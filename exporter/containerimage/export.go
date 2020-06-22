@@ -241,7 +241,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 			if e.push {
 				providers := []content.Provider{e.opt.ImageWriter.ContentStore()}
 				if src.Ref != nil {
-					remote, err := src.Ref.GetRemote(ctx, false)
+					remote, err := src.Ref.GetRemote(ctx, false, e.layerCompression)
 					if err != nil {
 						return nil, err
 					}
@@ -249,7 +249,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src exporter.Source)
 				}
 				if len(src.Refs) > 0 {
 					for _, r := range src.Refs {
-						remote, err := r.GetRemote(ctx, false)
+						remote, err := r.GetRemote(ctx, false, e.layerCompression)
 						if err != nil {
 							return nil, err
 						}
@@ -296,7 +296,7 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 		}
 	}
 
-	remote, err := topLayerRef.GetRemote(ctx, true)
+	remote, err := topLayerRef.GetRemote(ctx, true, e.layerCompression)
 	if err != nil {
 		return err
 	}
@@ -306,8 +306,7 @@ func (e *imageExporterInstance) unpackImage(ctx context.Context, img images.Imag
 	eg, egctx := errgroup.WithContext(ctx)
 	for _, desc := range remote.Descriptors {
 		eg.Go(func() error {
-			_, err := contentutil.ReadBlob(egctx, remote.Provider, desc)
-			return err
+			return contentutil.Copy(egctx, contentutil.DiscardIngester(), remote.Provider, desc)
 		})
 	}
 	err = eg.Wait()

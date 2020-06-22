@@ -21,8 +21,8 @@ import (
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
-	"github.com/moby/buildkit/util/cacheutil"
 	"github.com/moby/buildkit/util/tracing"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -68,7 +68,7 @@ type httpSourceHandler struct {
 	client   *http.Client
 }
 
-func (hs *httpSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
+func (hs *httpSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager, _ solver.Vertex) (source.SourceInstance, error) {
 	httpIdentifier, ok := id.(*source.HttpIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid http identifier %v", id)
@@ -121,7 +121,7 @@ func (hs *httpSourceHandler) formatCacheKey(filename string, dgst digest.Digest,
 	return digest.FromBytes(dt)
 }
 
-func (hs *httpSourceHandler) CacheKey(ctx context.Context, index int) (string, cacheutil.OptSet, bool, error) {
+func (hs *httpSourceHandler) CacheKey(ctx context.Context, index int) (string, solver.CacheOpts, bool, error) {
 	if hs.src.Checksum != "" {
 		hs.cacheKey = hs.src.Checksum
 		return hs.formatCacheKey(getFileName(hs.src.URL, hs.src.Filename, nil), hs.src.Checksum, "").String(), nil, true, nil
