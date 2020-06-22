@@ -157,6 +157,7 @@ func (p *puller) CacheKey(ctx context.Context, index int) (_ string, cacheOpts s
 		return "", nil, false, err
 	}
 	p.releaseTmpLeases = done
+	imageutil.AddLease(p.releaseTmpLeases)
 	defer func() {
 		if err != nil {
 			p.releaseTmpLeases(ctx)
