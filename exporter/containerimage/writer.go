@@ -153,8 +153,7 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compres
 				return
 			}
 			eg.Go(func() error {
-				// TODO remote, err := ref.GetRemote(ctx, true, compressionType)
-				remote, err := ref.GetRemote(ctx, true, compression.Default)
+				remote, err := ref.GetRemote(ctx, true, compressionType)
 				if err != nil {
 					return err
 				}
