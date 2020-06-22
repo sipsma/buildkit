@@ -2086,6 +2086,11 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	checkAllRemoved(t, c, sb)
 
+	for _, layer := range manifest.Layers {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
+	}
+
 	// retag the image we just pushed with no actual changes, which
 	// should not result in the image getting un-lazied
 	def, err = llb.Image(target).Marshal(context.TODO())
