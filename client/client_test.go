@@ -2113,7 +2113,7 @@ func testLazyImagePush(t *testing.T, sb integration.Sandbox) {
 
 	for _, layer := range manifest.Layers {
 		_, err = contentStore.Info(ctx, layer.Digest)
-		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound))
+		require.True(t, errors.Is(err, ctderrdefs.ErrNotFound), "unexpected error %v", err)
 	}
 
 	// check that a subsequent build can use the previously lazy image in an exec
