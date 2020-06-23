@@ -105,7 +105,8 @@ func GetMediaTypeForLayers(diffPairs []DiffPair, ref cache.ImmutableRef) []strin
 	tref := ref
 
 	layerTypes := make([]string, 0, len(diffPairs))
-	for _, dp := range diffPairs {
+	for i := range diffPairs {
+		dp := diffPairs[len(diffPairs)-1-i]
 		if tref == nil {
 			return nil
 		}
@@ -115,7 +116,7 @@ func GetMediaTypeForLayers(diffPairs []DiffPair, ref cache.ImmutableRef) []strin
 			return nil
 		}
 
-		layerTypes = append(layerTypes, info.MediaType)
+		layerTypes[len(diffPairs)-1-i] = info.MediaType
 		tref = tref.Parent()
 	}
 	return layerTypes
