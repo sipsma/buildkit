@@ -118,6 +118,7 @@ func GetMediaTypeForLayers(diffPairs []DiffPair, ref cache.ImmutableRef) []strin
 		}
 		info := tref.Info()
 		if !(info.DiffID == dp.DiffID && info.Blob == dp.Blobsum) {
+			tref.Release(context.TODO())
 			break
 		}
 		layerTypes[len(diffPairs)-1-i] = info.MediaType
@@ -126,6 +127,5 @@ func GetMediaTypeForLayers(diffPairs []DiffPair, ref cache.ImmutableRef) []strin
 		tref.Release(context.TODO())
 		tref = parent
 	}
-	tref.Release(context.TODO())
 	return layerTypes
 }
