@@ -102,22 +102,29 @@ func detectCompressionType(cr io.Reader) (CompressionType, error) {
 
 // GetMediaTypeForLayers retrieves media type for layer from ref information.
 func GetMediaTypeForLayers(diffPairs []DiffPair, ref cache.ImmutableRef) []string {
-	tref := ref
+	layerTypes := make([]string, len(diffPairs))
+	if ref == nil {
+		return layerTypes
+	}
 
-	layerTypes := make([]string, 0, len(diffPairs))
+	tref := ref.Clone()
+	// diffPairs is ordered parent->child, but we iterate over refs from child->parent,
+	// so iterate over diffPairs in reverse
 	for i := range diffPairs {
 		dp := diffPairs[len(diffPairs)-1-i]
-		if tref == nil {
-			return nil
-		}
 
+		if tref == nil {
+			return layerTypes
+		}
 		info := tref.Info()
 		if !(info.DiffID == dp.DiffID && info.Blob == dp.Blobsum) {
-			return nil
+			return layerTypes
 		}
-
 		layerTypes[len(diffPairs)-1-i] = info.MediaType
-		tref = tref.Parent()
+
+		parent := tref.Parent()
+		tref.Release(context.TODO())
+		tref = parent
 	}
 	return layerTypes
 }
