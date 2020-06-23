@@ -362,7 +362,7 @@ func (w *Worker) GetRemote(ctx context.Context, ref cache.ImmutableRef, createIf
 	defer done(ctx)
 
 	// TODO(fuweid): add compression option or config for cache exporter.
-	diffPairs, err := blobs.GetDiffPairs(ctx, w.ContentStore(), w.Differ, ref, createIfNeeded, blobs.DefaultCompression)
+	diffPairs, err := blobs.GetDiffPairs(ctx, w.ContentStore(), w.Differ, ref, createIfNeeded, blobs.DefaultCompression, true)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed calculating diff pairs for exported snapshot")
 	}

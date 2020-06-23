@@ -53,7 +53,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	}
 
 	if len(inp.Refs) == 0 {
-		layers, err := ic.exportLayers(ctx, compression, inp.Ref)
+		layers, err := ic.exportLayers(ctx, compression, oci, inp.Ref)
 		if err != nil {
 			return nil, err
 		}
@@ -76,7 +76,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 		refs = append(refs, r)
 	}
 
-	layers, err := ic.exportLayers(ctx, compression, refs...)
+	layers, err := ic.exportLayers(ctx, compression, oci, refs...)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	return &idxDesc, nil
 }
 
-func (ic *ImageWriter) exportLayers(ctx context.Context, compression blobs.CompressionType, refs ...cache.ImmutableRef) ([][]blobs.DiffPair, error) {
+func (ic *ImageWriter) exportLayers(ctx context.Context, compression blobs.CompressionType, oci bool, refs ...cache.ImmutableRef) ([][]blobs.DiffPair, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 	layersDone := oneOffProgress(ctx, "exporting layers")
 
@@ -150,7 +150,7 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, compression blobs.Compr
 	for i, ref := range refs {
 		func(i int, ref cache.ImmutableRef) {
 			eg.Go(func() error {
-				diffPairs, err := blobs.GetDiffPairs(ctx, ic.opt.ContentStore, ic.opt.Differ, ref, true, compression)
+				diffPairs, err := blobs.GetDiffPairs(ctx, ic.opt.ContentStore, ic.opt.Differ, ref, true, compression, oci)
 				if err != nil {
 					return errors.Wrap(err, "failed calculating diff pairs for exported snapshot")
 				}
