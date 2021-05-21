@@ -45,11 +45,11 @@ func getDefaultManager() *cacheManager {
 // header, "/dir" is for contents. For the root node "" (empty string) is the
 // key for root, "/" for the root header
 
-func Checksum(ctx context.Context, ref cache.ImmutableRef, path string, followLinks bool, s session.Group) (digest.Digest, error) {
+func Checksum(ctx context.Context, ref cache.Ref, path string, followLinks bool, s session.Group) (digest.Digest, error) {
 	return getDefaultManager().Checksum(ctx, ref, path, followLinks, s)
 }
 
-func ChecksumWildcard(ctx context.Context, ref cache.ImmutableRef, path string, followLinks bool, s session.Group) (digest.Digest, error) {
+func ChecksumWildcard(ctx context.Context, ref cache.Ref, path string, followLinks bool, s session.Group) (digest.Digest, error) {
 	return getDefaultManager().ChecksumWildcard(ctx, ref, path, followLinks, s)
 }
 
@@ -86,7 +86,7 @@ type cacheManager struct {
 	lruMu  sync.Mutex
 }
 
-func (cm *cacheManager) Checksum(ctx context.Context, ref cache.ImmutableRef, p string, followLinks bool, s session.Group) (digest.Digest, error) {
+func (cm *cacheManager) Checksum(ctx context.Context, ref cache.Ref, p string, followLinks bool, s session.Group) (digest.Digest, error) {
 	cc, err := cm.GetCacheContext(ctx, ensureOriginMetadata(ref.Metadata()), ref.IdentityMapping())
 	if err != nil {
 		return "", nil
@@ -94,7 +94,7 @@ func (cm *cacheManager) Checksum(ctx context.Context, ref cache.ImmutableRef, p 
 	return cc.Checksum(ctx, ref, p, followLinks, s)
 }
 
-func (cm *cacheManager) ChecksumWildcard(ctx context.Context, ref cache.ImmutableRef, p string, followLinks bool, s session.Group) (digest.Digest, error) {
+func (cm *cacheManager) ChecksumWildcard(ctx context.Context, ref cache.Ref, p string, followLinks bool, s session.Group) (digest.Digest, error) {
 	cc, err := cm.GetCacheContext(ctx, ensureOriginMetadata(ref.Metadata()), ref.IdentityMapping())
 	if err != nil {
 		return "", nil

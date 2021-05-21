@@ -40,23 +40,11 @@ type Ref interface {
 
 type ImmutableRef interface {
 	Ref
-	Parent() ImmutableRef
-	Finalize(ctx context.Context, commit bool) error // Make sure reference is flushed to driver
 	Clone() ImmutableRef
-
-	Info() RefInfo
+	Finalize(ctx context.Context, commit bool) error // Make sure reference is flushed to driver
 	Extract(ctx context.Context, s session.Group) error // +progress
+	LayerChain() (layers []ImmutableRef, release func(ctx context.Context) error)
 	GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type, s session.Group) (*solver.Remote, error)
-}
-
-type RefInfo struct {
-	SnapshotID  string
-	ChainID     digest.Digest
-	BlobChainID digest.Digest
-	DiffID      digest.Digest
-	Blob        digest.Digest
-	MediaType   string
-	Extracted   bool
 }
 
 type MutableRef interface {
@@ -78,7 +66,7 @@ type cacheRecord struct {
 
 	mutable bool
 	refs    map[ref]struct{}
-	parent  *immutableRef
+	parent  *mergedRef
 	md      *metadata.StorageItem
 
 	// dead means record is marked as deleted
@@ -118,6 +106,7 @@ func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) *mu
 	return ref
 }
 
+// TODO fix
 func (cr *cacheRecord) parentChain() []digest.Digest {
 	if cr.parentChainCache != nil {
 		return cr.parentChainCache
@@ -214,6 +203,7 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 	return s.(int64), nil
 }
 
+// TODO fix
 func (cr *cacheRecord) parentRef(hidden bool, descHandlers DescHandlers) *immutableRef {
 	p := cr.parent
 	if p == nil {
@@ -273,6 +263,7 @@ func (cr *cacheRecord) mount(ctx context.Context, readonly bool) (snapshot.Mount
 }
 
 // call when holding the manager lock
+// TODO fix
 func (cr *cacheRecord) remove(ctx context.Context, removeSnapshot bool) error {
 	delete(cr.cm.records, cr.ID())
 	if cr.parent != nil {
@@ -298,6 +289,46 @@ func (cr *cacheRecord) ID() string {
 	return cr.md.ID()
 }
 
+type mergedRef struct {
+	merged []*immutableRef
+}
+
+func (mr *mergedRef) Clone() ImmutableRef {
+	clone := &mergedRef{}
+	for _, r := range mr.merged {
+		clone.merged = append(clone.merged, r.clone())
+	}
+	return &clone
+}
+
+func (mr *mergedRef) Finalize(ctx context.Context, commit bool) error {
+	for _, r := range mr.merged {
+		if err := r.Finalize(ctx, commit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (mr *mergedRef) Extract(ctx context.Context, s session.Group) error {
+	for _, r := range mr.merged {
+		if err := r.Extract(ctx, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (mr *mergedRef) LayerChain() ([]ImmutableRef, func(context.Context) error) {
+	// TODO merge together descriptors and providers using toplogical sort
+	panic("not implemented")
+}
+
+func (mr *mergedRef) GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type, s session.Group) (*solver.Remote, error) {
+	// TODO merge together descriptors and providers using toplogical sort
+	panic("not implemented")
+}
+
 type immutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
@@ -310,13 +341,23 @@ type mutableRef struct {
 	descHandlers    DescHandlers
 }
 
-func (sr *immutableRef) Clone() ImmutableRef {
+func (sr *immutableRef) clone() *immutableRef {
 	sr.mu.Lock()
 	ref := sr.ref(false, sr.descHandlers)
 	sr.mu.Unlock()
 	return ref
 }
 
+func (sr *immutableRef) Clone() ImmutableRef {
+	return sr.clone()
+}
+
+func (sr *immutableRef) LayerChain() ([]ImmutableRef, func(context.Context) error) {
+	// TODO merge together descriptors and providers using toplogical sort
+	panic("not implemented")
+}
+
+/* TODO delete
 func (sr *immutableRef) Parent() ImmutableRef {
 	if p := sr.parentRef(true, sr.descHandlers); p != nil { // avoid returning typed nil pointer
 		return p
@@ -335,6 +376,7 @@ func (sr *immutableRef) Info() RefInfo {
 		Extracted:   !getBlobOnly(sr.md),
 	}
 }
+*/
 
 func (sr *immutableRef) ociDesc() (ocispec.Descriptor, error) {
 	desc := ocispec.Descriptor{
@@ -362,14 +404,15 @@ func (sr *immutableRef) ociDesc() (ocispec.Descriptor, error) {
 }
 
 // order is from parent->child, sr will be at end of slice
+// TODO fix
 func (sr *immutableRef) parentRefChain() []*immutableRef {
 	var count int
-	for ref := sr; ref != nil; ref = ref.parent {
+	for r := sr; r != nil; r = r.parent {
 		count++
 	}
 	refs := make([]*immutableRef, count)
-	for i, ref := count-1, sr; ref != nil; i, ref = i-1, ref.parent {
-		refs[i] = ref
+	for i, r := count-1, sr; r != nil; i, r = i-1, r.parent {
+		refs[i] = r
 	}
 	return refs
 }

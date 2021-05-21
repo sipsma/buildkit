@@ -50,6 +50,8 @@ type Accessor interface {
 
 	New(ctx context.Context, parent ImmutableRef, s session.Group, opts ...RefOption) (MutableRef, error)
 	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
+	Merge(ctx context.Context, parents []ImmutableRef, opts ...RefOption) (ImmutableRef, error)
+
 	IdentityMapping() *idtools.IdentityMapping
 	Metadata(string) *metadata.StorageItem
 }
@@ -117,7 +119,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	var p *immutableRef
 	var parentID string
 	if parent != nil {
-		pInfo := parent.Info()
+		pInfo := parent.ChainInfo()
 		if pInfo.ChainID == "" || pInfo.BlobChainID == "" {
 			return nil, errors.Errorf("failed to get ref by blob on non-addressable parent")
 		}
@@ -262,7 +264,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 }
 
 // init loads all snapshots from metadata state and tries to load the records
-// from the snapshotter. If snaphot can't be found, metadata is deleted as well.
+// from the snapshotter. If snapshot can't be found, metadata is deleted as well.
 func (cm *cacheManager) init(ctx context.Context) error {
 	items, err := cm.md.All()
 	if err != nil {
@@ -580,6 +582,9 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOp
 	}
 
 	return rec.mref(true, descHandlersOf(opts...)), nil
+}
+
+func (cm *cacheManager) Merge(ctx context.Context, parents []ImmutableRef, opts ...RefOption) (ImmutableRef, error) {
 }
 
 func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {

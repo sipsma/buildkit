@@ -487,27 +487,24 @@ type refMetadata struct {
 }
 
 func getRefMetadata(ref cache.ImmutableRef, limit int) []refMetadata {
-	if limit <= 0 {
-		return nil
+	layerRefs, release := ref.LayerChain()
+	defer release(context.TODO())
+
+	var metas []refMetadata
+	for i := 0; i < len(layerRefs) && i < limit; i++ {
+		now := time.Now()
+		meta := refMetadata{
+			description: "created by buildkit", // shouldn't be shown but don't fail build
+			createdAt:   &now,
+		}
+		if descr := cache.GetDescription(ref.Metadata()); descr != "" {
+			meta.description = descr
+		}
+		createdAt := cache.GetCreatedAt(ref.Metadata())
+		meta.createdAt = &createdAt
+		metas = append(metas, meta)
 	}
-	now := time.Now()
-	meta := refMetadata{
-		description: "created by buildkit", // shouldn't be shown but don't fail build
-		createdAt:   &now,
-	}
-	if ref == nil {
-		return append(getRefMetadata(nil, limit-1), meta)
-	}
-	if descr := cache.GetDescription(ref.Metadata()); descr != "" {
-		meta.description = descr
-	}
-	createdAt := cache.GetCreatedAt(ref.Metadata())
-	meta.createdAt = &createdAt
-	p := ref.Parent()
-	if p != nil {
-		defer p.Release(context.TODO())
-	}
-	return append(getRefMetadata(p, limit-1), meta)
+	return metas
 }
 
 func oneOffProgress(ctx context.Context, id string) func(err error) error {

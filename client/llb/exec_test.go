@@ -2,6 +2,7 @@ package llb
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -49,4 +50,90 @@ func TestValidGetMountIndex(t *testing.T) {
 	mountIndex, err = mountOutput.getIndex()
 	require.NoError(t, err, "failed to getIndex")
 	require.Equal(t, pb.OutputIndex(1), mountIndex, "unexpected mount index")
+}
+
+func TestTODODeleteMe(t *testing.T) {
+	img := Image("ubuntu")
+	lcl := Local("foo")
+	Git()
+	Merge(img, lcl) // img<-lcl
+
+	//
+	//
+	//
+
+	a := Scratch().
+		File(Mkfile("/foo", 0777, []byte("A"))).
+		File(Mkfile("/a", 0777, []byte("A")))
+	b := Scratch().
+		File(Mkfile("/foo", 0777, []byte("B"))).
+		File(Mkfile("/b", 0777, []byte("B")))
+
+	Merge(a, b) /*
+		/a   - contains A
+		/b   - contains B
+		/foo - contains B
+	*/
+
+	Merge(b, a) /*
+		/a   - contains A
+		/b   - contains B
+		/foo - contains A
+	*/
+
+	//
+	//
+	//
+
+	a := Scratch().
+		File(Mkfile("/foo", 0777, []byte("A"))).
+		File(Mkfile("/a", 0777, []byte("A")))
+	b := a.
+		File(Rm("/foo")).
+		File(Mkfile("/b", 0777, []byte("B")))
+	c := Scratch().
+		File(Mkfile("/foo", 0777, []byte("C"))).
+		File(Mkfile("/c", 0777, []byte("C")))
+
+	Merge(b, c) /*
+		/a   - contains A
+		/b   - contains B
+		/c   - contains C
+		/foo - contains C
+	*/
+
+	Merge(c, b) /*
+		/a   - contains A
+		/b   - contains B
+		/c   - contains C
+		/foo - [doesn't exist!]
+	*/
+
+	//
+	//
+	//
+
+	// TODO this doesn't really work well until we have DiffOp
+	base := Image("ubuntu")
+	serviceA := base.Run(Shlex("make A"))
+	serviceB := base.Run(Shlex("make B"))
+	Merge(serviceB, serviceA) // ubuntu<-"make B"<-ubuntu<-"make A"
+
+	//
+	//
+	//
+
+	base := Image("ubuntu")
+	serviceA := base.Run(Shlex("make A")).Diff(base)
+	serviceB := base.Run(Shlex("make B")).Diff(base)
+	Merge(serviceB, serviceA) // "make B"<-"make A"
+
+	//
+	//
+	//
+
+	base := Image("ubuntu")
+	serviceA := base.RunDiff(Shlex("make A"))
+	serviceB := base.RunDiff(Shlex("make B"))
+	Merge(serviceB, serviceA) // "make B"<-"make A"
 }

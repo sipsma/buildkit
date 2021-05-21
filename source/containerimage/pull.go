@@ -345,13 +345,14 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 }
 
 func markRefLayerTypeWindows(ref cache.ImmutableRef) error {
-	if parent := ref.Parent(); parent != nil {
-		defer parent.Release(context.TODO())
-		if err := markRefLayerTypeWindows(parent); err != nil {
+	layers, release := ref.LayerChain()
+	defer release(context.TODO())
+	for _, layer := range layers {
+		if err := cache.SetLayerType(layer, "windows"); err != nil {
 			return err
 		}
 	}
-	return cache.SetLayerType(ref, "windows")
+	return nil
 }
 
 // cacheKeyFromConfig returns a stable digest from image config. If image config
