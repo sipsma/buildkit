@@ -48,6 +48,7 @@ type ManagerOpt struct {
 type Accessor interface {
 	GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent ImmutableRef, opts ...RefOption) (ImmutableRef, error)
 	Get(ctx context.Context, id string, opts ...RefOption) (ImmutableRef, error)
+	Merge(ctx context.Context, parents []ImmutableRef, opts ...RefOption) (ImmutableRef, error)
 
 	New(ctx context.Context, parent ImmutableRef, s session.Group, opts ...RefOption) (MutableRef, error)
 	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
@@ -124,6 +125,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 		p = p2.(*immutableRef)
 
+		// TODO what if parent is a merge-op? This might happen if GetByBlob is called from worker.FromRemote
 		if p.getChainID() == "" || p.getBlobChainID() == "" {
 			p.Release(context.TODO())
 			return nil, errors.Errorf("failed to get ref by blob on non-addressable parent")
@@ -390,18 +392,16 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	checkLazyProviders := func(rec *cacheRecord) error {
 		missing := NeedsRemoteProvidersError(nil)
 		dhs := descHandlersOf(opts...)
-		for {
-			blob := rec.getBlob()
-			if isLazy, err := rec.isLazy(ctx); err != nil {
+		if err := rec.walkUniqueAncestors(func(cr *cacheRecord) error {
+			blob := cr.getBlob()
+			if isLazy, err := cr.isLazy(ctx); err != nil {
 				return err
 			} else if isLazy && dhs[blob] == nil {
 				missing = append(missing, blob)
 			}
-
-			if rec.parent == nil {
-				break
-			}
-			rec = rec.parent.cacheRecord
+			return nil
+		}); err != nil {
+			return err
 		}
 		if len(missing) > 0 {
 			return missing
@@ -425,26 +425,20 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	}
 	md := &storageItem{si}
 
-	var parent *immutableRef
-	if parentID := md.getParent(); parentID != "" {
-		var err error
-		parent, err = cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)...)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			if retErr != nil {
-				parent.mu.Lock()
-				parent.release(context.TODO())
-				parent.mu.Unlock()
-			}
-		}()
+	parents, err := cm.parentsOf(ctx, md, opts...)
+	if err != nil {
+		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			parents.release(context.TODO())
+		}
+	}()
 
 	rec := &cacheRecord{
 		cm:            cm,
 		storageItem:   md,
-		parent:        parent,
+		parentRefs:    parents,
 		immutableRefs: make(map[*immutableRef]struct{}),
 	}
 
@@ -489,6 +483,25 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, err
 	}
 	return rec, nil
+}
+
+func (cm *cacheManager) parentsOf(ctx context.Context, md *storageItem, opts ...RefOption) (ps parentRefs, rerr error) {
+	if parentID := md.getParent(); parentID != "" {
+		if p, err := cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)); err != nil {
+			return ps, err
+		} else {
+			ps.layerParent = p
+			return ps, nil
+		}
+	}
+	for _, parentID := range md.getMergeParents() {
+		if p, err := cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)); err != nil {
+			return ps, err
+		} else {
+			ps.mergeParents = append(ps.mergeParents, p)
+		}
+	}
+	return ps, nil
 }
 
 func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Group, opts ...RefOption) (mr MutableRef, err error) {

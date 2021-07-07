@@ -19,7 +19,6 @@ const keyLastUsedAt = "cache.lastUsedAt"
 const keyUsageCount = "cache.usageCount"
 const keyLayerType = "cache.layerType"
 const keyRecordType = "cache.recordType"
-const keyParent = "cache.parent"
 const keyDiffID = "cache.diffID"
 const keyChainID = "cache.chainID"
 const keyBlobChainID = "cache.blobChainID"
@@ -33,6 +32,9 @@ const keyETag = "etag"
 const keyChecksum = "http.checksum"
 const keyModTime = "http.modtime"
 const keyDeleted = "cache.deleted"
+const keyParent = "cache.parent"
+const keyMergeParents = "cache.mergeParents"
+
 // BlobSize is the packed blob size as specified in the oci descriptor
 const keyBlobSize = "cache.blobsize"
 
