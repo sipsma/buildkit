@@ -131,6 +131,7 @@ func TestIntegration(t *testing.T) {
 		testFileOpInputSwap,
 		testRelativeMountpoint,
 		testLocalSourceDiffer,
+		testMergeOp,
 	}, mirrors)
 
 	integration.Run(t, []integration.Test{
@@ -3525,6 +3526,50 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+}
+
+func testMergeOp(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	stateA := llb.Scratch().
+		File(llb.Mkfile("/foo", 0777, []byte("A"))).
+		File(llb.Mkfile("/a", 0777, []byte("A")))
+	stateB := stateA.
+		File(llb.Rm("/foo")).
+		File(llb.Mkfile("/b", 0777, []byte("B")))
+	stateC := llb.Scratch().
+		File(llb.Mkfile("/foo", 0777, []byte("C"))).
+		File(llb.Mkfile("/c", 0777, []byte("C")))
+
+	mergeA := llb.Merge([]llb.State{llb.Image("busybox:latest"), stateB, stateC})
+	mergeB := llb.Merge([]llb.State{llb.Image("busybox:latest"), stateC, stateB})
+
+	defA, err := mergeA.Run(llb.Shlex("sh -c '"+strings.Join([]string{
+		"test -f /a",
+		"test -f /b",
+		"test -f /c",
+		"test -f /foo",
+	}, " && ")+"'")).Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defA, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	defB, err := mergeB.Run(llb.Shlex("sh -c '"+strings.Join([]string{
+		"test -f /a",
+		"test -f /b",
+		"test -f /c",
+		"test ! -f /foo",
+	}, " && ")+"'")).Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defB, SolveOpt{}, nil)
+	require.NoError(t, err)
 }
 
 func requiresLinux(t *testing.T) {

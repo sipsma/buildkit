@@ -98,7 +98,18 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 		return base.WorkerOpt{}, err
 	}
 
-	snap := containerdsnapshot.NewSnapshotter(snapshotterName, client.SnapshotService(snapshotterName), ns, nil)
+	applier := winlayers.NewFileSystemApplierWithWindows(cs, df)
+	differ := winlayers.NewWalkingDiffWithWindows(cs, df)
+
+	snap := containerdsnapshot.NewSnapshotter(
+		snapshotterName,
+		client.SnapshotService(snapshotterName),
+		ns,
+		nil,
+		applier,
+		differ,
+		lm,
+	)
 
 	opt := base.WorkerOpt{
 		ID:                id,
@@ -106,8 +117,8 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 		Executor:          containerdexecutor.New(client, root, "", np, dns, apparmorProfile, traceSocket),
 		Snapshotter:       snap,
 		ContentStore:      cs,
-		Applier:           winlayers.NewFileSystemApplierWithWindows(cs, df),
-		Differ:            winlayers.NewWalkingDiffWithWindows(cs, df),
+		Applier:           applier,
+		Differ:            differ,
 		ImageStore:        client.ImageService(),
 		Platforms:         platforms,
 		LeaseManager:      lm,

@@ -20,8 +20,9 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/flightcontrol"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -50,7 +51,7 @@ type Accessor interface {
 	MetadataStore
 	GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent *ImmutableRef, opts ...RefOption) (*ImmutableRef, error)
 	Get(ctx context.Context, id string, opts ...RefOption) (*ImmutableRef, error)
-
+	Merge(ctx context.Context, parents []*ImmutableRef, opts ...RefOption) (*ImmutableRef, error)
 	New(ctx context.Context, parent *ImmutableRef, s session.Group, opts ...RefOption) (*MutableRef, error)
 	GetMutable(ctx context.Context, id string, opts ...RefOption) (*MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
@@ -77,7 +78,8 @@ type cacheManager struct {
 	records map[string]*cacheRecord
 	mu      sync.Mutex
 	ManagerOpt
-	store *metadata.Store
+	Differ diff.Comparer
+	store  *metadata.Store
 
 	muPrune sync.Mutex // make sure parallel prune is not allowed so there will not be inconsistent results
 	unlazyG flightcontrol.Group
@@ -115,6 +117,134 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 	return cm, nil
 }
 
+func (cm *cacheManager) Merge(ctx context.Context, inputParents []*ImmutableRef, opts ...RefOption) (ir *ImmutableRef, rerr error) {
+	/* TODO notes
+	* Probably don't wait to set cache retain on merge refs especially if one of the parents is not finalized, because
+	  that would result in the lazy commit optimization always failing due to there being an open immutableref to the
+	  unfinalized parent
+	* Add children field to ref, when a ref is finalized, update its children to tell them about the new diff id so the
+	  child can update its digest and check to see if it is now the same as any existing snapshots, in which case it can
+	  de-dupe (especially helpful in the inefficient case)
+	* ^^ Also do that if chainIDs are calc'd lazily and get updated
+	* What if you want a mutable version of this? I.e. one of the input parents is uncommitted and can be made mutable
+	  and you want to mount it merged with some others without committing it first?
+	  * Could add a new MergeMutable method, but even better might be to add a ToMutable method to refs, which might
+	    keep the rules about who owns refs simpler?
+	  * What are the actual use cases for this though? Does llb.Local really benefit from this? think through more
+	*/
+
+	id := identity.NewID()
+
+	var parents parentRefs
+	var parentSnapshotIDs []string
+	defer func() {
+		if rerr != nil {
+			parents.release(context.TODO())
+		}
+	}()
+	for _, parent := range inputParents {
+		parents.mergeParents = append(parents.mergeParents, parent.Clone())
+		parentSnapshotIDs = append(parentSnapshotIDs, parent.getSnapshotID())
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	var parentDgsts []digest.Digest
+	for _, parent := range parents.mergeParents {
+		if chainID := parent.getChainID(); chainID != "" {
+			parentDgsts = append(parentDgsts, chainID)
+		} else {
+			// TODO calculate chainID here? Or leave that to be lazy and updated later through children field?
+			parentDgsts = append(parentDgsts, digest.Digest(parent.ID()))
+		}
+	}
+	mergeDigest := imagespecidentity.ChainID(parentDgsts)
+
+	// Check if there's already an equal merged ref, return it if so
+	if mds, err := cm.searchMergeDigest(ctx, mergeDigest); err != nil {
+		return nil, err
+	} else {
+		for _, md := range mds {
+			if ref, err := cm.get(ctx, md.ID(), opts...); err != nil { // TODO add any opts?
+				bklog.G(ctx).Debugf("failed to get ref %q for matching merge digest %q", md.ID(), mergeDigest)
+			} else {
+				return ref, nil
+			}
+		}
+	}
+
+	// TODO
+	// TODO
+	// TODO
+	// TODO
+	bklog.G(ctx).Debugf("creating merge ref %s from %+v based on %+v", id, parents.mergeParents, inputParents)
+
+	// Build the new ref
+	md, _ := cm.getMetadata(id)
+
+	rec := &cacheRecord{
+		cm:            cm,
+		cacheMetadata: md,
+		parentRefs:    parents,
+		immutableRefs: make(map[*ImmutableRef]struct{}),
+		isCommitted:   true,
+	}
+
+	/* TODO probably don't need this, right?
+	for _, p := range rec.parentRefs.mergeParents {
+		if !p.isCommitted {
+			rec.isCommitted = false
+			break
+		}
+	}
+	*/
+
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
+		return nil, err
+	}
+
+	snapshotID := id
+
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+		l.ID = id
+		l.Labels = map[string]string{
+			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create lease")
+	}
+	defer func() {
+		if rerr != nil {
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+				ID: l.ID,
+			}); err != nil {
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
+			}
+		}
+	}()
+
+	if err := cm.Snapshotter.AddLease(leases.WithLease(ctx, l.ID), snapshotID); err != nil {
+		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
+	}
+	// TODO merge should be lazy (for inefficient case)
+	if err := cm.Snapshotter.Merge(leases.WithLease(ctx, l.ID), snapshotID, parentSnapshotIDs); err != nil {
+		return nil, errors.Wrapf(err, "failed to create merge snapshot %s", snapshotID)
+	}
+
+	rec.queueMergeDigest(mergeDigest)
+	rec.queueSnapshotID(snapshotID)
+	if err := rec.commitMetadata(); err != nil {
+		return nil, err
+	}
+
+	cm.records[id] = rec
+
+	return rec.ref(true, descHandlersOf(opts...))
+}
+
 func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent *ImmutableRef, opts ...RefOption) (ir *ImmutableRef, rerr error) {
 	diffID, err := diffIDFromDescriptor(desc)
 	if err != nil {
@@ -133,10 +263,10 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	}
 
 	var p *ImmutableRef
-	var parentID string
 	if parent != nil {
 		p = parent.Clone()
 
+		// TODO what if parent is a merge-op? This might happen if GetByBlob is called from worker.FromRemote
 		if p.getChainID() == "" || p.getBlobChainID() == "" {
 			p.Release(context.TODO())
 			return nil, errors.Errorf("failed to get ref by blob on non-addressable parent")
@@ -148,7 +278,6 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 			p.Release(context.TODO())
 			return nil, err
 		}
-		parentID = p.ID()
 	}
 
 	releaseParent := false
@@ -210,7 +339,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		go link.Release(context.TODO())
 	}
 
-	l, err := cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 		l.ID = id
 		l.Labels = map[string]string{
 			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
@@ -220,10 +349,9 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create lease")
 	}
-
 	defer func() {
 		if rerr != nil {
-			if err := cm.ManagerOpt.LeaseManager.Delete(context.TODO(), leases.Lease{
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				logrus.Errorf("failed to remove lease: %+v", err)
@@ -231,15 +359,8 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 	}()
 
-	if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, l, leases.Resource{
-		ID:   snapshotID,
-		Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-	}); err != nil {
-		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
-	}
-
 	if desc.Digest != "" {
-		if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+		if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
 			ID:   desc.Digest.String(),
 			Type: "content",
 		}); err != nil {
@@ -247,17 +368,21 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 	}
 
+	if err := cm.Snapshotter.AddLease(leases.WithLease(ctx, l.ID), snapshotID); err != nil {
+		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
+	}
+
 	md, _ := cm.getMetadata(id)
 
 	rec := &cacheRecord{
 		cm:            cm,
 		immutableRefs: make(map[*ImmutableRef]struct{}),
-		parent:        p,
+		parentRefs:    parentRefs{layerParent: p},
 		cacheMetadata: md,
 		isCommitted:   true,
 	}
 
-	if err := initializeMetadata(rec.cacheMetadata, parentID, opts...); err != nil {
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
 		return nil, err
 	}
 
@@ -299,7 +424,7 @@ func (cm *cacheManager) init(ctx context.Context) error {
 			if emMd, exists := cm.getMetadata(em); exists {
 				md.clearEqualMutable()
 				md.queueSnapshotID(emMd.ID())
-				_, err := cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+				_, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 					l.ID = md.ID()
 					l.Labels = map[string]string{
 						"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
@@ -311,10 +436,7 @@ func (cm *cacheManager) init(ctx context.Context) error {
 					toRemove[md.ID()] = true
 					continue
 				}
-				if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: md.ID()}, leases.Resource{
-					ID:   emMd.ID(),
-					Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-				}); err != nil && !errors.Is(err, errdefs.ErrAlreadyExists) {
+				if err := cm.Snapshotter.AddLease(leases.WithLease(ctx, md.ID()), emMd.ID()); err != nil {
 					logrus.Debugf("failed to add snapshot %s to lease: %+v", emMd.ID(), err)
 					toRemove[md.ID()] = true
 					continue
@@ -360,7 +482,7 @@ func (cm *cacheManager) Close() error {
 	return cm.store.Close()
 }
 
-// Get returns an immutable snapshot reference for ID
+// Get returns an immutable cache reference for ID
 func (cm *cacheManager) Get(ctx context.Context, id string, opts ...RefOption) (*ImmutableRef, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -392,18 +514,16 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	checkLazyProviders := func(rec *cacheRecord) error {
 		missing := NeedsRemoteProvidersError(nil)
 		dhs := descHandlersOf(opts...)
-		for {
-			blob := rec.getBlob()
-			if isLazy, err := rec.isLazy(ctx); err != nil {
+		if err := rec.walkUniqueRecords(func(cr *cacheRecord) error {
+			blob := cr.getBlob()
+			if isLazy, err := cr.isLazy(ctx); err != nil {
 				return err
 			} else if isLazy && dhs[blob] == nil {
 				missing = append(missing, blob)
 			}
-
-			if rec.parent == nil {
-				break
-			}
-			rec = rec.parent.cacheRecord
+			return nil
+		}); err != nil {
+			return err
 		}
 		if len(missing) > 0 {
 			return missing
@@ -426,26 +546,22 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, errors.Wrap(errNotFound, id)
 	}
 
-	var parent *ImmutableRef
-	if parentID := md.getParent(); parentID != "" {
-		var err error
-		parent, err = cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)...)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			if retErr != nil {
-				parent.mu.Lock()
-				parent.release(context.TODO())
-				parent.mu.Unlock()
-			}
-		}()
+	parents, err := cm.parentsOf(ctx, md, opts...)
+	if err != nil {
+		// TODO when error is that parent no longer exists, give context here? That's expected when an unfinalized
+		// TODO parent of a merge becomes mutable again
+		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			parents.release(context.TODO())
+		}
+	}()
 
 	rec := &cacheRecord{
 		cm:            cm,
 		cacheMetadata: md,
-		parent:        parent,
+		parentRefs:    parents,
 		immutableRefs: make(map[*ImmutableRef]struct{}),
 	}
 
@@ -457,7 +573,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, errors.Wrapf(errNotFound, "failed to get deleted record %s", id)
 	}
 
-	if err := initializeMetadata(rec.cacheMetadata, md.getParent(), opts...); err != nil {
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
 		return nil, err
 	}
 
@@ -465,24 +581,38 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, errors.Wrapf(err, "failed to append image ref metadata to ref %s", rec.ID())
 	}
 
-	rec.isCommitted = rec.getBlobOnly()
-	if !rec.isCommitted {
-		var info snapshots.Info
-		var err error
-		if info, err = rec.cm.Snapshotter.Stat(ctx, rec.getSnapshotID()); errdefs.IsNotFound(err) && rec.ID() != rec.getSnapshotID() {
-			// If there was a crash during a call to finalize, the snapshot ID could get out of sync, so check for a
-			// snapshot with the record's ID, which is what's switched to during finalize.
-			if info, err = rec.cm.Snapshotter.Stat(ctx, rec.ID()); err == nil {
-				rec.queueSnapshotID(rec.ID())
-				if err := rec.commitMetadata(); err != nil {
-					return nil, errors.Wrapf(err, "failed to correct snapshot id metadata for ref %s", rec.ID())
-				}
+	switch rec.kind() {
+	case MERGE:
+		rec.isCommitted = true
+		for _, p := range rec.parentRefs.mergeParents {
+			rec.isCommitted = p.isCommitted
+			if !rec.isCommitted {
+				break
 			}
 		}
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to stat snapshot for ref %s", rec.ID())
+	case LAYER:
+		rec.isCommitted = rec.getBlobOnly()
+		if !rec.isCommitted {
+			var info snapshots.Info
+			var err error
+			// TODO make sure Stat **always** fails when provided "" as a key (i.e. "" is not a valid key)
+			if info, err = rec.cm.Snapshotter.Stat(ctx, rec.getSnapshotID()); errdefs.IsNotFound(err) && rec.ID() != rec.getSnapshotID() {
+				// If there was a crash during a call to commit, the snapshot ID could get out of sync, so check for a
+				// snapshot with the record's ID, which is what's switched to during commit.
+				if info, err = rec.cm.Snapshotter.Stat(ctx, rec.ID()); err == nil {
+					rec.queueSnapshotID(rec.ID())
+					if err := rec.commitMetadata(); err != nil {
+						return nil, errors.Wrapf(err, "failed to correct snapshot id metadata for ref %s", rec.ID())
+					}
+				}
+			}
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to stat snapshot for ref %s", rec.ID())
+			}
+			rec.isCommitted = info.Kind == snapshots.KindCommitted
 		}
-		rec.isCommitted = info.Kind == snapshots.KindCommitted
+	default:
+		return nil, invalidRefKind
 	}
 
 	cm.records[id] = rec
@@ -492,22 +622,39 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	return rec, nil
 }
 
+func (cm *cacheManager) parentsOf(ctx context.Context, md *cacheMetadata, opts ...RefOption) (ps parentRefs, rerr error) {
+	if parentID := md.getParent(); parentID != "" {
+		if p, err := cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)); err != nil {
+			return ps, err
+		} else {
+			ps.layerParent = p
+			return ps, nil
+		}
+	}
+	for _, parentID := range md.getMergeParents() {
+		if p, err := cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)); err != nil {
+			return ps, err
+		} else {
+			ps.mergeParents = append(ps.mergeParents, p)
+		}
+	}
+	return ps, nil
+}
+
 func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.Group, opts ...RefOption) (mr *MutableRef, err error) {
 	id := identity.NewID()
 
 	var parent *ImmutableRef
-	var parentID string
 	var parentSnapshotID string
 	if p != nil {
 		parent = p.Clone()
 		if err := parent.commitLocked(ctx); err != nil {
 			return nil, err
 		}
-		if err := parent.Extract(ctx, sess); err != nil {
+		if err := parent.PrepareMount(ctx, sess); err != nil {
 			return nil, err
 		}
 		parentSnapshotID = parent.getSnapshotID()
-		parentID = parent.ID()
 	}
 
 	defer func() {
@@ -516,7 +663,7 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 		}
 	}()
 
-	l, err := cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 		l.ID = id
 		l.Labels = map[string]string{
 			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
@@ -529,7 +676,7 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 
 	defer func() {
 		if err != nil {
-			if err := cm.ManagerOpt.LeaseManager.Delete(context.TODO(), leases.Lease{
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				logrus.Errorf("failed to remove lease: %+v", err)
@@ -539,15 +686,12 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 
 	snapshotID := identity.NewID()
 	opts = append(opts, withSnapshotID(snapshotID))
-	if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, l, leases.Resource{
-		ID:   snapshotID,
-		Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-	}); err != nil {
+	if err := cm.Snapshotter.AddLease(leases.WithLease(ctx, l.ID), snapshotID); err != nil {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", snapshotID)
 	}
 
 	if cm.Snapshotter.Name() == "stargz" && parent != nil {
-		if rerr := parent.withRemoteSnapshotLabelsStargzMode(ctx, sess, func() {
+		if rerr := parent.withRemoteSnapshotLabelsStargzMode(ctx, parent.descHandlers, sess, func() {
 			err = cm.Snapshotter.Prepare(ctx, snapshotID, parentSnapshotID)
 		}); rerr != nil {
 			return nil, rerr
@@ -564,11 +708,11 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 	rec := &cacheRecord{
 		cm:            cm,
 		cacheMetadata: md,
-		parent:        parent,
+		parentRefs:    parentRefs{layerParent: parent},
 		immutableRefs: make(map[*ImmutableRef]struct{}),
 	}
 
-	if err := initializeMetadata(rec.cacheMetadata, parentID, opts...); err != nil {
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
 		return nil, err
 	}
 
@@ -579,14 +723,14 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cm.records[id] = rec // TODO: save to db
+	cm.records[id] = rec
 
 	// parent refs are possibly lazy so keep it hold the description handlers.
 	var dhs DescHandlers
 	if parent != nil {
 		dhs = parent.descHandlers
 	}
-	return rec.mref(true, dhs)
+	return rec.mref(ctx, true, dhs)
 }
 
 func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOption) (*MutableRef, error) {
@@ -600,7 +744,7 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOp
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	return rec.mref(true, descHandlersOf(opts...))
+	return rec.mref(ctx, true, descHandlersOf(opts...))
 }
 
 func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {
@@ -696,7 +840,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 			shared := false
 			if opt.checkShared != nil {
-				shared = opt.checkShared.Exists(cr.ID(), cr.parentChain())
+				shared = opt.checkShared.Exists(cr.ID(), cr.layerDigestChain())
 			}
 
 			if !opt.all {
@@ -807,8 +951,9 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 			UsageCount:  usageCount,
 		}
 
-		if cr.parent != nil {
-			c.Parent = cr.parent.ID()
+		// TODO need to handle merged refs better
+		if cr.layerParent != nil {
+			c.Parent = cr.layerParent.ID()
 		}
 		opt.totalSize -= c.Size
 
@@ -902,13 +1047,14 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			lastUsedAt:  lastUsedAt,
 			description: cr.GetDescription(),
 			recordType:  cr.GetRecordType(),
-			parentChain: cr.parentChain(),
+			parentChain: cr.layerDigestChain(),
 		}
 		if c.recordType == "" {
 			c.recordType = client.UsageRecordTypeRegular
 		}
-		if cr.parent != nil {
-			c.parent = cr.parent.ID()
+		// TODO handle merge refs
+		if cr.layerParent != nil {
+			c.parent = cr.layerParent.ID()
 		}
 		if cr.mutableRef != nil {
 			c.size = 0 // size can not be determined because it is changing
@@ -1061,13 +1207,28 @@ func setImageRefMetadata(m *cacheMetadata, opts ...RefOption) error {
 	return m.commitMetadata()
 }
 
-func initializeMetadata(m *cacheMetadata, parent string, opts ...RefOption) error {
+func initializeMetadata(m *cacheMetadata, parents parentRefs, opts ...RefOption) error {
 	if tm := m.GetCreatedAt(); !tm.IsZero() {
 		return nil
 	}
 
-	if err := m.queueParent(parent); err != nil {
-		return err
+	switch parents.kind() {
+	case MERGE:
+		var ids []string
+		for _, p := range parents.mergeParents {
+			ids = append(ids, p.ID())
+		}
+		if err := m.queueMergeParents(ids); err != nil {
+			return err
+		}
+	case LAYER:
+		if parents.layerParent != nil {
+			if err := m.queueParent(parents.layerParent.ID()); err != nil {
+				return err
+			}
+		}
+	default:
+		return invalidRefKind
 	}
 
 	if err := m.queueCreatedAt(time.Now()); err != nil {

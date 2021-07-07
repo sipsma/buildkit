@@ -203,7 +203,7 @@ func TestManager(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
 
-	err = snap.finalizeLocked(ctx)
+	err = snap.commitLocked(ctx)
 	require.NoError(t, err)
 
 	err = snap.Release(ctx)
@@ -367,7 +367,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkNumBlobs(ctx, t, co.cs, 2)
 
-	err = snap2.Extract(ctx, nil)
+	err = snap2.PrepareMount(ctx, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, true, !snap.getBlobOnly())
@@ -521,7 +521,7 @@ func TestExtractOnMutable(t *testing.T) {
 
 	checkNumBlobs(ctx, t, co.cs, 2)
 
-	err = snap2.Extract(ctx, nil)
+	err = snap2.PrepareMount(ctx, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, true, !snap.getBlobOnly())
@@ -908,7 +908,7 @@ func TestToImmutable(t *testing.T) {
 	require.NoError(t, err)
 
 	// this time finalize commit
-	err = snap.finalizeLocked(ctx)
+	err = snap.commitLocked(ctx)
 	require.NoError(t, err)
 
 	err = snap.Release(ctx)
@@ -982,7 +982,7 @@ func TestToImmutable(t *testing.T) {
 	require.NoError(t, err)
 	snap2ID := snap2.ID()
 
-	err = snap2.finalizeLocked(ctx)
+	err = snap2.commitLocked(ctx)
 	require.NoError(t, err)
 	require.NoError(t, snap2.SetDescription("foo"))
 

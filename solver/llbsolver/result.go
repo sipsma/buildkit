@@ -35,7 +35,11 @@ func UnlazyResultFunc(ctx context.Context, res solver.Result, g session.Group) e
 	if ref.ImmutableRef == nil {
 		return nil
 	}
-	return ref.ImmutableRef.Extract(ctx, g)
+	// get the mounts to force the ref to be unlazied
+	if _, err := ref.ImmutableRef.Mount(ctx, true, g); err != nil {
+		return err
+	}
+	return nil
 }
 
 func NewContentHashFunc(selectors []Selector) solver.ResultBasedCacheFunc {

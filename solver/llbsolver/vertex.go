@@ -309,6 +309,11 @@ func ValidateOp(op *pb.Op) error {
 		if op.Build == nil {
 			return errors.Errorf("invalid nil build op")
 		}
+	case *pb.Op_Merge:
+		if op.Merge == nil {
+			return errors.Errorf("invalid nil merge op")
+		}
+		// TODO anything else for merge?
 	}
 	return nil
 }

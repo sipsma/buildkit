@@ -39,14 +39,14 @@ func (sr *ImmutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 		return nil, err
 	}
 
-	chain := sr.parentRefChain()
+	chain := sr.layerChain()
 	mproviderBase := contentutil.NewMultiProvider(nil)
 	mprovider := &lazyMultiProvider{mprovider: mproviderBase}
 	remote := &solver.Remote{
 		Provider: mprovider,
 	}
-	for _, ref := range chain {
-		desc, err := ref.ociDesc()
+	for _, rec := range chain {
+		desc, err := rec.ociDesc()
 		if err != nil {
 			return nil, err
 		}
@@ -66,10 +66,10 @@ func (sr *ImmutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 		// update distribution source annotation for lazy-refs (non-lazy refs
 		// will already have their dsl stored in the content store, which is
 		// used by the push handlers)
-		if isLazy, err := ref.isLazy(ctx); err != nil {
+		if isLazy, err := rec.isLazy(ctx); err != nil {
 			return nil, err
 		} else if isLazy {
-			imageRefs := ref.getImageRefs()
+			imageRefs := rec.getImageRefs()
 			for _, imageRef := range imageRefs {
 				refspec, err := reference.Parse(imageRef)
 				if err != nil {
@@ -114,7 +114,7 @@ func (sr *ImmutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 			}
 			if convertMediaTypeFunc != nil {
 				// needs conversion
-				info, err := ref.getCompressionBlob(ctx, compressionType)
+				info, err := rec.getCompressionBlob(ctx, compressionType)
 				if err != nil {
 					return nil, err
 				}
@@ -123,7 +123,7 @@ func (sr *ImmutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 				newDesc.Digest = info.Digest
 				newDesc.Size = info.Size
 				if desc.Digest != newDesc.Digest {
-					mproviderBase.Add(newDesc.Digest, ref.cm.ContentStore)
+					mproviderBase.Add(newDesc.Digest, rec.cm.ContentStore)
 				}
 				desc = newDesc
 			}
@@ -131,7 +131,7 @@ func (sr *ImmutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 
 		remote.Descriptors = append(remote.Descriptors, desc)
 		mprovider.Add(lazyRefProvider{
-			ref:     ref,
+			rec:     rec,
 			desc:    desc,
 			dh:      sr.descHandlers[desc.Digest],
 			session: s,
@@ -166,7 +166,7 @@ func (mp *lazyMultiProvider) Unlazy(ctx context.Context) error {
 }
 
 type lazyRefProvider struct {
-	ref     *ImmutableRef
+	rec     *cacheRecord
 	desc    ocispec.Descriptor
 	dh      *DescHandler
 	session session.Group
@@ -179,12 +179,12 @@ func (p lazyRefProvider) ReaderAt(ctx context.Context, desc ocispec.Descriptor) 
 	if err := p.Unlazy(ctx); err != nil {
 		return nil, err
 	}
-	return p.ref.cm.ContentStore.ReaderAt(ctx, desc)
+	return p.rec.cm.ContentStore.ReaderAt(ctx, desc)
 }
 
 func (p lazyRefProvider) Unlazy(ctx context.Context) error {
-	_, err := p.ref.cm.unlazyG.Do(ctx, string(p.desc.Digest), func(ctx context.Context) (_ interface{}, rerr error) {
-		if isLazy, err := p.ref.isLazy(ctx); err != nil {
+	_, err := p.rec.cm.unlazyG.Do(ctx, string(p.desc.Digest), func(ctx context.Context) (_ interface{}, rerr error) {
+		if isLazy, err := p.rec.isLazy(ctx); err != nil {
 			return nil, err
 		} else if !isLazy {
 			return nil, nil
@@ -205,19 +205,19 @@ func (p lazyRefProvider) Unlazy(ctx context.Context) error {
 		// For now, just pull down the whole content and then return a ReaderAt from the local content
 		// store. If efficient partial reads are desired in the future, something more like a "tee"
 		// that caches remote partial reads to a local store may need to replace this.
-		err := contentutil.Copy(ctx, p.ref.cm.ContentStore, &pullprogress.ProviderWithProgress{
+		err := contentutil.Copy(ctx, p.rec.cm.ContentStore, &pullprogress.ProviderWithProgress{
 			Provider: p.dh.Provider(p.session),
-			Manager:  p.ref.cm.ContentStore,
+			Manager:  p.rec.cm.ContentStore,
 		}, p.desc, p.dh.Ref, logs.LoggerFromContext(ctx))
 		if err != nil {
 			return nil, err
 		}
 
-		if imageRefs := p.ref.getImageRefs(); len(imageRefs) > 0 {
+		if imageRefs := p.rec.getImageRefs(); len(imageRefs) > 0 {
 			// just use the first image ref, it's arbitrary
 			imageRef := imageRefs[0]
-			if p.ref.GetDescription() == "" {
-				if err := p.ref.SetDescription("pulled from "+imageRef); err != nil {
+			if p.rec.GetDescription() == "" {
+				if err := p.rec.SetDescription("pulled from "+imageRef); err != nil {
 					return nil, err
 				}
 			}

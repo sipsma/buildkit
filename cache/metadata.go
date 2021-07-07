@@ -21,7 +21,6 @@ const keyLastUsedAt = "cache.lastUsedAt"
 const keyUsageCount = "cache.usageCount"
 const keyLayerType = "cache.layerType"
 const keyRecordType = "cache.recordType"
-const keyParent = "cache.parent"
 const keyDiffID = "cache.diffID"
 const keyChainID = "cache.chainID"
 const keyBlobChainID = "cache.blobChainID"
@@ -40,6 +39,9 @@ const keySharedKey = "local.sharedKey"
 const keyBlobSize = "cache.blobsize" // the packed blob size as specified in the oci descriptor
 const keyGitRemote = "git-remote"
 const keyGitSnapshot = "git-snapshot"
+const keyParent = "cache.parent"
+const keyMergeParents = "cache.mergeParents"
+const keyMergeDigest = "cache.mergeDigest"
 
 // Deprecated keys, only retained when needed for migrating from older versions of buildkit
 const deprecatedKeyEqualMutable = "cache.equalMutable"
@@ -47,10 +49,11 @@ const deprecatedKeyEqualMutable = "cache.equalMutable"
 // Indexes
 const blobchainIndex = "blobchainid:"
 const chainIndex = "chainid:"
-const cacheDirIndex = keyCacheDir+":"
-const sharedKeyIndex = keySharedKey+":"
-const gitRemoteIndex = keyGitRemote+"::"
-const gitSnapshotIndex = keyGitSnapshot+"::"
+const mergeDigestIndex = keyMergeDigest + ":"
+const cacheDirIndex = keyCacheDir + ":"
+const sharedKeyIndex = keySharedKey + ":"
+const gitRemoteIndex = keyGitRemote + "::"
+const gitSnapshotIndex = keyGitSnapshot + "::"
 
 type MetadataStore interface {
 	SearchCacheDir(context.Context, string) ([]Metadata, error)
@@ -151,6 +154,10 @@ func (cm *cacheManager) searchBlobchain(ctx context.Context, id digest.Digest) (
 
 func (cm *cacheManager) searchChain(ctx context.Context, id digest.Digest) ([]Metadata, error) {
 	return cm.search(ctx, chainIndex+id.String())
+}
+
+func (cm *cacheManager) searchMergeDigest(ctx context.Context, id digest.Digest) ([]Metadata, error) {
+	return cm.search(ctx, mergeDigestIndex+id.String())
 }
 
 func (cm *cacheManager) search(ctx context.Context, idx string) ([]Metadata, error) {
@@ -328,6 +335,14 @@ func (md *cacheMetadata) GetHTTPChecksum() digest.Digest {
 	return digest.Digest(md.getString(keyHTTPChecksum))
 }
 
+func (md *cacheMetadata) getMergeDigest() digest.Digest {
+	return digest.Digest(md.getString(keyMergeDigest))
+}
+
+func (md *cacheMetadata) queueMergeDigest(d digest.Digest) error {
+	return md.queueValue(keyMergeDigest, d, mergeDigestIndex+d.String())
+}
+
 func (md *cacheMetadata) queueDiffID(str digest.Digest) error {
 	return md.queueValue(keyDiffID, str, "")
 }
@@ -398,6 +413,14 @@ func (md *cacheMetadata) queueParent(parent string) error {
 
 func (md *cacheMetadata) getParent() string {
 	return md.getString(keyParent)
+}
+
+func (md *cacheMetadata) getMergeParents() []string {
+	return md.getStringSlice(keyMergeParents)
+}
+
+func (md *cacheMetadata) queueMergeParents(parents []string) error {
+	return md.queueValue(keyMergeParents, parents, "")
 }
 
 func (md *cacheMetadata) queueSize(s int64) error {
@@ -610,4 +633,3 @@ func (md *cacheMetadata) getStringSlice(key string) []string {
 	}
 	return s
 }
-

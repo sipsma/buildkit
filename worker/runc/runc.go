@@ -99,8 +99,20 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 	for k, v := range labels {
 		xlabels[k] = v
 	}
-	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap)
+
+	applier := winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c))
+	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
+	snap := containerdsnapshot.NewSnapshotter(
+		snFactory.Name,
+		mdb.Snapshotter(snFactory.Name),
+		"buildkit",
+		idmap,
+		applier,
+		differ,
+		lm,
+	)
 
 	opt = base.WorkerOpt{
 		ID:                id,
@@ -108,8 +120,8 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		Executor:          exe,
 		Snapshotter:       snap,
 		ContentStore:      c,
-		Applier:           winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c)),
-		Differ:            winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c)),
+		Applier:           applier,
+		Differ:            differ,
 		ImageStore:        nil, // explicitly
 		Platforms:         []specs.Platform{platforms.Normalize(platforms.DefaultSpec())},
 		IdentityMapping:   idmap,
