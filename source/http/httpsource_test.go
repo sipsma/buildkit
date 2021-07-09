@@ -13,7 +13,6 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/moby/buildkit/cache"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
@@ -328,11 +327,6 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 		return nil, err
 	}
 
-	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
-	if err != nil {
-		return nil, err
-	}
-
 	store, err := local.NewStore(tmpdir)
 	if err != nil {
 		return nil, err
@@ -348,11 +342,11 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 	})
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
-		MetadataStore:  md,
-		LeaseManager:   leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
-		ContentStore:   mdb.ContentStore(),
-		GarbageCollect: mdb.GarbageCollect,
+		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
+		LeaseManager:      leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
+		ContentStore:      mdb.ContentStore(),
+		GarbageCollect:    mdb.GarbageCollect,
+		MetadataStoreRoot: tmpdir,
 	})
 	if err != nil {
 		return nil, err
@@ -360,6 +354,5 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 
 	return NewSource(Opt{
 		CacheAccessor: cm,
-		MetadataStore: md,
 	})
 }

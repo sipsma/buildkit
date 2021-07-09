@@ -12,8 +12,6 @@ import (
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
@@ -22,7 +20,7 @@ import (
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/winlayers"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -32,11 +30,8 @@ import (
 // Ref is a reference to cacheable objects.
 type Ref interface {
 	Mountable
-	ID() string
+	Metadata
 	Release(context.Context) error
-	Size(ctx context.Context) (int64, error)
-	Metadata() *metadata.StorageItem
-	IdentityMapping() *idtools.IdentityMapping
 }
 
 type ImmutableRef interface {
@@ -44,19 +39,8 @@ type ImmutableRef interface {
 	Parent() ImmutableRef
 	Clone() ImmutableRef
 
-	Info() RefInfo
 	Extract(ctx context.Context, s session.Group) error // +progress
 	GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) (*solver.Remote, error)
-}
-
-type RefInfo struct {
-	SnapshotID  string
-	ChainID     digest.Digest
-	BlobChainID digest.Digest
-	DiffID      digest.Digest
-	Blob        digest.Digest
-	MediaType   string
-	Extracted   bool
 }
 
 type MutableRef interface {
@@ -70,10 +54,10 @@ type Mountable interface {
 
 type cacheRecord struct {
 	cm     *cacheManager
-	md     *metadata.StorageItem
 	mu     sync.Mutex
 	sizeG  flightcontrol.Group
 	parent *immutableRef
+	*cacheMetadata
 
 	// immutableRefs keeps track of each ref pointing to this cacheRecord that can't change the underlying snapshot
 	// data. When it's empty and mutableRef below is empty, that means there's no more unreleased pointers to this
@@ -163,7 +147,7 @@ func (cr *cacheRecord) parentChain() []digest.Digest {
 	if cr.parentChainCache != nil {
 		return cr.parentChainCache
 	}
-	blob := getBlob(cr.md)
+	blob := cr.getBlob()
 	if blob == "" {
 		return nil
 	}
@@ -180,15 +164,15 @@ func (cr *cacheRecord) parentChain() []digest.Digest {
 }
 
 func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
-	if !getBlobOnly(cr.md) {
+	if !cr.getBlobOnly() {
 		return false, nil
 	}
-	dgst := getBlob(cr.md)
+	dgst := cr.getBlob()
 	// special case for moby where there is no compressed blob (empty digest)
 	if dgst == "" {
 		return false, nil
 	}
-	_, err := cr.cm.ContentStore.Info(ctx, digest.Digest(dgst))
+	_, err := cr.cm.ContentStore.Info(ctx, dgst)
 	if errors.Is(err, errdefs.ErrNotFound) {
 		return true, nil
 	} else if err != nil {
@@ -196,7 +180,7 @@ func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
 	}
 
 	// If the snapshot is a remote snapshot, this layer is lazy.
-	if info, err := cr.cm.Snapshotter.Stat(ctx, getSnapshotID(cr.md)); err == nil {
+	if info, err := cr.cm.Snapshotter.Stat(ctx, cr.getSnapshotID()); err == nil {
 		if _, ok := info.Labels["containerd.io/snapshot/remote"]; ok {
 			return true, nil
 		}
@@ -205,23 +189,19 @@ func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (cr *cacheRecord) IdentityMapping() *idtools.IdentityMapping {
-	return cr.cm.IdentityMapping()
-}
-
-func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
+func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 	// this expects that usage() is implemented lazily
 	s, err := cr.sizeG.Do(ctx, cr.ID(), func(ctx context.Context) (interface{}, error) {
 		cr.mu.Lock()
-		s := getSize(cr.md)
+		s := cr.getSize()
 		if s != sizeUnknown {
 			cr.mu.Unlock()
 			return s, nil
 		}
-		driverID := getSnapshotID(cr.md)
+		driverID := cr.getSnapshotID()
 		cr.mu.Unlock()
 		var usage snapshots.Usage
-		if !getBlobOnly(cr.md) {
+		if !cr.getBlobOnly() {
 			var err error
 			usage, err = cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID)
 			if err != nil {
@@ -236,7 +216,7 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 				}
 			}
 		}
-		if dgst := getBlob(cr.md); dgst != "" {
+		if dgst := cr.getBlob(); dgst != "" {
 			info, err := cr.cm.ContentStore.Info(ctx, digest.Digest(dgst))
 			if err == nil {
 				usage.Size += info.Size
@@ -257,8 +237,8 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 			}
 		}
 		cr.mu.Lock()
-		setSize(cr.md, usage.Size)
-		if err := cr.md.Commit(); err != nil {
+		cr.queueSize(usage.Size)
+		if err := cr.commitMetadata(); err != nil {
 			cr.mu.Unlock()
 			return s, err
 		}
@@ -285,14 +265,10 @@ func (cr *cacheRecord) remove(ctx context.Context) error {
 	if err := cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.ID()}); err != nil {
 		return errors.Wrapf(err, "failed to remove %s", cr.ID())
 	}
-	if err := cr.cm.md.Clear(cr.ID()); err != nil {
+	if err := cr.cm.store.Clear(cr.ID()); err != nil {
 		return err
 	}
 	return nil
-}
-
-func (cr *cacheRecord) ID() string {
-	return cr.md.ID()
 }
 
 // hold cacheRecord.mu lock before calling
@@ -309,7 +285,7 @@ func (cr *cacheRecord) release(ctx context.Context, forceKeep bool) error {
 		cr.viewMount = nil
 	}
 
-	if getCachePolicy(cr.md) == cachePolicyRetain {
+	if cr.HasCachePolicyRetain() {
 		return nil
 	}
 
@@ -347,32 +323,20 @@ func (sr *immutableRef) Parent() ImmutableRef {
 	return p.clone(true)
 }
 
-func (sr *immutableRef) Info() RefInfo {
-	return RefInfo{
-		ChainID:     digest.Digest(getChainID(sr.md)),
-		DiffID:      digest.Digest(getDiffID(sr.md)),
-		Blob:        digest.Digest(getBlob(sr.md)),
-		MediaType:   getMediaType(sr.md),
-		BlobChainID: digest.Digest(getBlobChainID(sr.md)),
-		SnapshotID:  getSnapshotID(sr.md),
-		Extracted:   !getBlobOnly(sr.md),
-	}
-}
-
 func (sr *immutableRef) ociDesc() (ocispec.Descriptor, error) {
 	desc := ocispec.Descriptor{
-		Digest:      digest.Digest(getBlob(sr.md)),
-		Size:        getBlobSize(sr.md),
-		MediaType:   getMediaType(sr.md),
+		Digest:      sr.getBlob(),
+		Size:        sr.getBlobSize(),
+		MediaType:   sr.getMediaType(),
 		Annotations: make(map[string]string),
 	}
 
-	diffID := getDiffID(sr.md)
+	diffID := sr.getDiffID()
 	if diffID != "" {
-		desc.Annotations["containerd.io/uncompressed"] = diffID
+		desc.Annotations["containerd.io/uncompressed"] = string(diffID)
 	}
 
-	createdAt := GetCreatedAt(sr.md)
+	createdAt := sr.GetCreatedAt()
 	if !createdAt.IsZero() {
 		createdAt, err := createdAt.MarshalText()
 		if err != nil {
@@ -392,7 +356,7 @@ func compressionVariantDigestLabel(compressionType compression.Type) string {
 
 func (sr *immutableRef) getCompressionBlob(ctx context.Context, compressionType compression.Type) (content.Info, error) {
 	cs := sr.cm.ContentStore
-	info, err := cs.Info(ctx, digest.Digest(getBlob(sr.md)))
+	info, err := cs.Info(ctx, sr.getBlob())
 	if err != nil {
 		return content.Info{}, err
 	}
@@ -415,7 +379,7 @@ func (sr *immutableRef) addCompressionBlob(ctx context.Context, dgst digest.Dige
 	}); err != nil {
 		return err
 	}
-	info, err := cs.Info(ctx, digest.Digest(getBlob(sr.md)))
+	info, err := cs.Info(ctx, sr.getBlob())
 	if err != nil {
 		return err
 	}
@@ -473,7 +437,7 @@ func (sr *immutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
 	if !sr.isFinalized {
 		// if not finalized, there must be a mutable ref still around, return its mounts
 		// but set read-only
-		m, err := sr.cm.Snapshotter.Mounts(ctx, getSnapshotID(sr.md))
+		m, err := sr.cm.Snapshotter.Mounts(ctx, sr.getSnapshotID())
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to mount %s", sr.ID())
 		}
@@ -494,7 +458,7 @@ func (sr *immutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
 			return nil, err
 		}
 		ctx = leases.WithLease(ctx, l.ID)
-		m, err := sr.cm.Snapshotter.View(ctx, view, getSnapshotID(sr.md))
+		m, err := sr.cm.Snapshotter.View(ctx, view, sr.getSnapshotID())
 		if err != nil {
 			sr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: l.ID})
 			return nil, errors.Wrapf(err, "failed to mount %s", sr.ID())
@@ -506,7 +470,7 @@ func (sr *immutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
 }
 
 func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr error) {
-	if !getBlobOnly(sr.md) {
+	if !sr.getBlobOnly() {
 		return
 	}
 
@@ -516,7 +480,7 @@ func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr erro
 	}
 	defer done(ctx)
 
-	if GetLayerType(sr) == "windows" {
+	if sr.GetLayerType() == "windows" {
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
@@ -539,7 +503,7 @@ func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, 
 	dhs := sr.descHandlers
 	for _, r := range sr.parentRefChain() {
 		r := r
-		info, err := r.cm.Snapshotter.Stat(ctx, getSnapshotID(r.md))
+		info, err := r.cm.Snapshotter.Stat(ctx, r.getSnapshotID())
 		if err != nil && !errdefs.IsNotFound(err) {
 			return err
 		} else if errdefs.IsNotFound(err) {
@@ -585,7 +549,7 @@ func (sr *immutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s 
 		dhs := sr.descHandlers
 		for _, r := range sr.parentRefChain() {
 			r := r
-			snapshotID := getSnapshotID(r.md)
+			snapshotID := r.getSnapshotID()
 			if _, err := r.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
 				continue
 			}
@@ -612,7 +576,7 @@ func (sr *immutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s 
 
 			// Prepare remote snapshots
 			var (
-				key  = fmt.Sprintf("tmp-%s %s", identity.NewID(), r.Info().ChainID)
+				key  = fmt.Sprintf("tmp-%s %s", identity.NewID(), r.getChainID())
 				opts = []snapshots.Opt{
 					snapshots.WithLabels(defaultLabels),
 					snapshots.WithLabels(tmpLabels),
@@ -620,7 +584,7 @@ func (sr *immutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s 
 			)
 			parentID := ""
 			if r.parent != nil {
-				parentID = getSnapshotID(r.parent.md)
+				parentID = r.parent.getSnapshotID()
 			}
 			if err = r.cm.Snapshotter.Prepare(ctx, key, parentID, opts...); err != nil {
 				if errdefs.IsAlreadyExists(err) {
@@ -673,7 +637,7 @@ func makeTmpLabelsStargzMode(labels map[string]string, s session.Group) (fields 
 
 func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session.Group) error {
 	_, err := sr.sizeG.Do(ctx, sr.ID()+"-extract", func(ctx context.Context) (_ interface{}, rerr error) {
-		snapshotID := getSnapshotID(sr.md)
+		snapshotID := sr.getSnapshotID()
 		if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
 			return nil, nil
 		}
@@ -690,7 +654,7 @@ func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session
 				if err := sr.parent.extract(egctx, dhs, s); err != nil {
 					return err
 				}
-				parentID = getSnapshotID(sr.parent.md)
+				parentID = sr.parent.getSnapshotID()
 				return nil
 			})
 		}
@@ -722,7 +686,7 @@ func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session
 			defer statusDone()
 		}
 
-		key := fmt.Sprintf("extract-%s %s", identity.NewID(), sr.Info().ChainID)
+		key := fmt.Sprintf("extract-%s %s", identity.NewID(), sr.getChainID())
 
 		err = sr.cm.Snapshotter.Prepare(ctx, key, parentID)
 		if err != nil {
@@ -746,14 +710,14 @@ func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session
 		if err := unmount(); err != nil {
 			return nil, err
 		}
-		if err := sr.cm.Snapshotter.Commit(ctx, getSnapshotID(sr.md), key); err != nil {
+		if err := sr.cm.Snapshotter.Commit(ctx, sr.getSnapshotID(), key); err != nil {
 			if !errors.Is(err, errdefs.ErrAlreadyExists) {
 				return nil, err
 			}
 		}
-		queueBlobOnly(sr.md, false)
-		setSize(sr.md, sizeUnknown)
-		if err := sr.md.Commit(); err != nil {
+		sr.queueBlobOnly(false)
+		sr.queueSize(sizeUnknown)
+		if err := sr.commitMetadata(); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -788,7 +752,8 @@ func (sr *immutableRef) release(ctx context.Context) error {
 		}
 	}
 	if doUpdateLastUsed {
-		updateLastUsed(sr.md)
+		sr.queueLastUsed()
+		sr.commitMetadata()
 		sr.triggerLastUsed = false
 	}
 	return sr.cacheRecord.release(ctx, true)
@@ -798,10 +763,6 @@ func (sr *immutableRef) finalizeLocked(ctx context.Context) error {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.finalize(ctx)
-}
-
-func (cr *cacheRecord) Metadata() *metadata.StorageItem {
-	return cr.md
 }
 
 // caller must hold cacheRecord.mu
@@ -822,18 +783,18 @@ func (sr *immutableRef) finalize(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to add snapshot %s to lease", sr.ID())
 	}
 
-	if err := sr.cm.Snapshotter.Commit(ctx, sr.ID(), getSnapshotID(sr.md)); err != nil {
+	if err := sr.cm.Snapshotter.Commit(ctx, sr.ID(), sr.getSnapshotID()); err != nil {
 		sr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: sr.ID()})
-		return errors.Wrapf(err, "failed to commit %s", getSnapshotID(sr.md))
+		return errors.Wrapf(err, "failed to commit %s", sr.getSnapshotID())
 	}
 
 	sr.isFinalized = true
-	queueSnapshotID(sr.md, sr.ID())
+	sr.queueSnapshotID(sr.ID())
 
 	// If there is a hard-crash here, the old snapshot id written to metadata is no longer valid, but
 	// this situation is checked for and fixed in cacheManager.getRecord.
 
-	return sr.md.Commit()
+	return sr.commitMetadata()
 }
 
 func (sr *mutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
@@ -858,7 +819,7 @@ func (sr *mutableRef) Mount(ctx context.Context, readonly bool, s session.Group)
 
 // must be called holding cacheRecord mu
 func (sr *mutableRef) mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
-	m, err := sr.cm.Snapshotter.Mounts(ctx, getSnapshotID(sr.md))
+	m, err := sr.cm.Snapshotter.Mounts(ctx, sr.getSnapshotID())
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to mount %s", sr.ID())
 	}
@@ -905,7 +866,8 @@ func (sr *mutableRef) release(ctx context.Context) error {
 	sr.mutableRef = nil
 
 	if sr.triggerLastUsed {
-		updateLastUsed(sr.md)
+		sr.queueLastUsed()
+		sr.commitMetadata()
 		sr.triggerLastUsed = false
 	}
 	return sr.cacheRecord.release(ctx, false)

@@ -10,8 +10,6 @@ import (
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/leases"
 	gogoptypes "github.com/gogo/protobuf/types"
-	"github.com/moby/buildkit/cache"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/executor/containerdexecutor"
 	"github.com/moby/buildkit/executor/oci"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
@@ -102,29 +100,20 @@ func newContainerd(root string, client *containerd.Client, snapshotterName, ns s
 
 	snap := containerdsnapshot.NewSnapshotter(snapshotterName, client.SnapshotService(snapshotterName), ns, nil)
 
-	if err := cache.MigrateV2(context.TODO(), filepath.Join(root, "metadata.db"), filepath.Join(root, "metadata_v2.db"), cs, snap, lm); err != nil {
-		return base.WorkerOpt{}, err
-	}
-
-	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"))
-	if err != nil {
-		return base.WorkerOpt{}, err
-	}
-
 	opt := base.WorkerOpt{
-		ID:             id,
-		Labels:         xlabels,
-		MetadataStore:  md,
-		Executor:       containerdexecutor.New(client, root, "", np, dns, apparmorProfile, traceSocket),
-		Snapshotter:    snap,
-		ContentStore:   cs,
-		Applier:        winlayers.NewFileSystemApplierWithWindows(cs, df),
-		Differ:         winlayers.NewWalkingDiffWithWindows(cs, df),
-		ImageStore:     client.ImageService(),
-		Platforms:      platforms,
-		LeaseManager:   lm,
-		GarbageCollect: gc,
-		ParallelismSem: parallelismSem,
+		ID:                id,
+		Labels:            xlabels,
+		Executor:          containerdexecutor.New(client, root, "", np, dns, apparmorProfile, traceSocket),
+		Snapshotter:       snap,
+		ContentStore:      cs,
+		Applier:           winlayers.NewFileSystemApplierWithWindows(cs, df),
+		Differ:            winlayers.NewWalkingDiffWithWindows(cs, df),
+		ImageStore:        client.ImageService(),
+		Platforms:         platforms,
+		LeaseManager:      lm,
+		GarbageCollect:    gc,
+		ParallelismSem:    parallelismSem,
+		MetadataStoreRoot: root,
 	}
 	return opt, nil
 }
