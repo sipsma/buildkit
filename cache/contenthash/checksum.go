@@ -12,29 +12,23 @@ import (
 	"sync"
 
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/idtools"
 	iradix "github.com/hashicorp/go-immutable-radix"
 	"github.com/hashicorp/golang-lru/simplelru"
 	"github.com/moby/buildkit/cache"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/locker"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
-	bolt "go.etcd.io/bbolt"
 )
 
 var errNotFound = errors.Errorf("not found")
 
 var defaultManager *cacheManager
 var defaultManagerOnce sync.Once
-
-const keyContentHash = "buildkit.contenthash.v0"
-const keyCacheContextID = "buildkit.cacheContextID.v0"
 
 func getDefaultManager() *cacheManager {
 	defaultManagerOnce.Do(func() {
@@ -61,16 +55,16 @@ func Checksum(ctx context.Context, ref cache.ImmutableRef, path string, opts Che
 	return getDefaultManager().Checksum(ctx, ref, path, opts, s)
 }
 
-func GetCacheContext(ctx context.Context, md *metadata.StorageItem, idmap *idtools.IdentityMapping) (CacheContext, error) {
-	return getDefaultManager().GetCacheContext(ctx, md, idmap)
+func GetCacheContext(ctx context.Context, md cache.Metadata) (CacheContext, error) {
+	return getDefaultManager().GetCacheContext(ctx, md)
 }
 
-func SetCacheContext(ctx context.Context, md *metadata.StorageItem, cc CacheContext) error {
+func SetCacheContext(ctx context.Context, md cache.Metadata, cc CacheContext) error {
 	return getDefaultManager().SetCacheContext(ctx, md, cc)
 }
 
-func ClearCacheContext(md *metadata.StorageItem) {
-	getDefaultManager().clearCacheContext(getCacheContextID(md))
+func ClearCacheContext(md cache.Metadata) {
+	getDefaultManager().clearCacheContext(md.GetCacheContextID())
 }
 
 type CacheContext interface {
@@ -100,18 +94,18 @@ func (cm *cacheManager) Checksum(ctx context.Context, ref cache.ImmutableRef, p 
 		}
 		return "", errors.Errorf("%s: no such file or directory", p)
 	}
-	cc, err := cm.GetCacheContext(ctx, ensureOriginMetadata(ref.Metadata()), ref.IdentityMapping())
+	cc, err := cm.GetCacheContext(ctx, ref)
 	if err != nil {
 		return "", nil
 	}
 	return cc.Checksum(ctx, ref, p, opts, s)
 }
 
-func (cm *cacheManager) GetCacheContext(ctx context.Context, md *metadata.StorageItem, idmap *idtools.IdentityMapping) (CacheContext, error) {
-	id := getCacheContextID(md)
+func (cm *cacheManager) GetCacheContext(ctx context.Context, md cache.Metadata) (CacheContext, error) {
+	id := md.GetCacheContextID()
 	if id == "" {
 		id = identity.NewID()
-		if err := setCacheContextID(md, id); err != nil {
+		if err := md.SetCacheContextID(id); err != nil {
 			return nil, err
 		}
 	}
@@ -124,7 +118,7 @@ func (cm *cacheManager) GetCacheContext(ctx context.Context, md *metadata.Storag
 		v.(*cacheContext).linkMap = map[string][][]byte{}
 		return v.(*cacheContext), nil
 	}
-	cc, err := newCacheContext(md, idmap)
+	cc, err := newCacheContext(md)
 	if err != nil {
 		cm.locker.Unlock(id)
 		return nil, err
@@ -136,13 +130,13 @@ func (cm *cacheManager) GetCacheContext(ctx context.Context, md *metadata.Storag
 	return cc, nil
 }
 
-func (cm *cacheManager) SetCacheContext(ctx context.Context, md *metadata.StorageItem, cci CacheContext) error {
+func (cm *cacheManager) SetCacheContext(ctx context.Context, md cache.Metadata, cci CacheContext) error {
 	cc, ok := cci.(*cacheContext)
 	if !ok {
 		return errors.Errorf("invalid cachecontext: %T", cc)
 	}
-	id := getCacheContextID(md)
-	if id != getCacheContextID(cc.md) {
+	id := md.GetCacheContextID()
+	if id != cc.md.GetCacheContextID() {
 		cc = &cacheContext{
 			md:       md,
 			tree:     cci.(*cacheContext).tree,
@@ -168,7 +162,7 @@ func (cm *cacheManager) clearCacheContext(id string) {
 
 type cacheContext struct {
 	mu    sync.RWMutex
-	md    *metadata.StorageItem
+	md    cache.Metadata
 	tree  *iradix.Tree
 	dirty bool // needs to be persisted to disk
 
@@ -177,7 +171,6 @@ type cacheContext struct {
 	node     *iradix.Node
 	dirtyMap map[string]struct{}
 	linkMap  map[string][][]byte
-	idmap    *idtools.IdentityMapping
 }
 
 type mount struct {
@@ -218,38 +211,12 @@ func (m *mount) clean() error {
 	return nil
 }
 
-func getCacheContextID(md *metadata.StorageItem) string {
-	v := md.Get(keyCacheContextID)
-	if v == nil {
-		return ""
-	}
-	var str string
-	if err := v.Unmarshal(&str); err != nil {
-		return ""
-	}
-	return str
-}
-
-func setCacheContextID(md *metadata.StorageItem, id string) error {
-	if id == "" {
-		return nil
-	}
-	v, err := metadata.NewValue(id)
-	if err != nil {
-		return errors.Wrap(err, "failed to set cache context ID value")
-	}
-	return md.Update(func(b *bolt.Bucket) error {
-		return md.SetValue(b, keyCacheContextID, v)
-	})
-}
-
-func newCacheContext(md *metadata.StorageItem, idmap *idtools.IdentityMapping) (*cacheContext, error) {
+func newCacheContext(md cache.Metadata) (*cacheContext, error) {
 	cc := &cacheContext{
 		md:       md,
 		tree:     iradix.New(),
 		dirtyMap: map[string]struct{}{},
 		linkMap:  map[string][][]byte{},
-		idmap:    idmap,
 	}
 	if err := cc.load(); err != nil {
 		return nil, err
@@ -258,7 +225,7 @@ func newCacheContext(md *metadata.StorageItem, idmap *idtools.IdentityMapping) (
 }
 
 func (cc *cacheContext) load() error {
-	dt, err := cc.md.GetExternal(keyContentHash)
+	dt, err := cc.md.GetContentHash()
 	if err != nil {
 		return nil
 	}
@@ -274,8 +241,8 @@ func (cc *cacheContext) load() error {
 	}
 	cc.tree = txn.Commit()
 
-	if id := getCacheContextID(cc.md); id == "" {
-		if err := setCacheContextID(cc.md, identity.NewID()); err != nil {
+	if id := cc.md.GetCacheContextID(); id == "" {
+		if err := cc.md.SetCacheContextID(identity.NewID()); err != nil {
 			return err
 		}
 	}
@@ -305,7 +272,7 @@ func (cc *cacheContext) save() error {
 		return err
 	}
 
-	return cc.md.SetExternal(keyContentHash, dt)
+	return cc.md.SetContentHash(dt)
 }
 
 func keyPath(p string) string {
@@ -1019,22 +986,6 @@ func addParentToMap(d string, m map[string]struct{}) {
 	}
 	m[d] = struct{}{}
 	addParentToMap(d, m)
-}
-
-func ensureOriginMetadata(md *metadata.StorageItem) *metadata.StorageItem {
-	v := md.Get("cache.equalMutable") // TODO: const
-	if v == nil {
-		return md
-	}
-	var mutable string
-	if err := v.Unmarshal(&mutable); err != nil {
-		return md
-	}
-	si, ok := md.Storage().Get(mutable)
-	if ok {
-		return si
-	}
-	return md
 }
 
 var pool32K = sync.Pool{

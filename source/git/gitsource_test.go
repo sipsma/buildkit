@@ -16,7 +16,6 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/moby/buildkit/cache"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/source"
@@ -428,9 +427,6 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	assert.NoError(t, err)
 
-	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
-	assert.NoError(t, err)
-
 	store, err := local.NewStore(tmpdir)
 	require.NoError(t, err)
 
@@ -442,17 +438,16 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	})
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
-		MetadataStore:  md,
-		LeaseManager:   leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
-		ContentStore:   mdb.ContentStore(),
-		GarbageCollect: mdb.GarbageCollect,
+		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
+		LeaseManager:      leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
+		ContentStore:      mdb.ContentStore(),
+		GarbageCollect:    mdb.GarbageCollect,
+		MetadataStoreRoot: tmpdir,
 	})
 	require.NoError(t, err)
 
 	gs, err := NewSource(Opt{
 		CacheAccessor: cm,
-		MetadataStore: md,
 	})
 	require.NoError(t, err)
 

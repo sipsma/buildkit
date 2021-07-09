@@ -17,10 +17,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/moby/buildkit/util/bklog"
-
 	"github.com/moby/buildkit/cache"
-	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
@@ -29,10 +26,10 @@ import (
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/locker"
 	"github.com/pkg/errors"
-	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -42,11 +39,9 @@ var defaultBranch = regexp.MustCompile(`refs/heads/(\S+)`)
 
 type Opt struct {
 	CacheAccessor cache.Accessor
-	MetadataStore *metadata.Store
 }
 
 type gitSource struct {
-	md     *metadata.Store
 	cache  cache.Accessor
 	locker *locker.Locker
 }
@@ -61,7 +56,6 @@ func Supported() error {
 
 func NewSource(opt Opt) (source.Source, error) {
 	gs := &gitSource{
-		md:     opt.MetadataStore,
 		cache:  opt.CacheAccessor,
 		locker: locker.New(),
 	}
@@ -74,9 +68,7 @@ func (gs *gitSource) ID() string {
 
 // needs to be called with repo lock
 func (gs *gitSource) mountRemote(ctx context.Context, remote string, auth []string, g session.Group) (target string, release func(), retErr error) {
-	remoteKey := "git-remote::" + remote
-
-	sis, err := gs.md.Search(remoteKey)
+	sis, err := gs.cache.SearchGitRemote(ctx, remote)
 	if err != nil {
 		return "", nil, errors.Wrapf(err, "failed to search metadata for %s", redactCredentials(remote))
 	}
@@ -140,17 +132,8 @@ func (gs *gitSource) mountRemote(ctx context.Context, remote string, auth []stri
 			return "", nil, errors.Wrapf(err, "failed add origin repo at %s", dir)
 		}
 
-		// same new remote metadata
-		si := remoteRef.Metadata()
-		v, err := metadata.NewValue(remoteKey)
-		if err != nil {
-			return "", nil, err
-		}
-		v.Index = remoteKey
-
-		if err := si.Update(func(b *bolt.Bucket) error {
-			return si.SetValue(b, "git-remote", v)
-		}); err != nil {
+		// save new remote metadata
+		if err := remoteRef.SetGitRemote(remote); err != nil {
 			return "", nil, err
 		}
 	}
@@ -387,11 +370,11 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 
 	gs.getAuthToken(ctx, g)
 
-	snapshotKey := "git-snapshot::" + cacheKey + ":" + gs.src.Subdir
+	snapshotKey := cacheKey + ":" + gs.src.Subdir
 	gs.locker.Lock(snapshotKey)
 	defer gs.locker.Unlock(snapshotKey)
 
-	sis, err := gs.md.Search(snapshotKey)
+	sis, err := gs.cache.SearchGitSnapshot(ctx, snapshotKey)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to search metadata for %s", snapshotKey)
 	}
@@ -601,19 +584,9 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 		}
 	}()
 
-	si, _ := gs.md.Get(snap.ID())
-	v, err := metadata.NewValue(snapshotKey)
-	if err != nil {
+	if err := snap.SetGitSnapshot(snapshotKey); err != nil {
 		return nil, err
 	}
-	v.Index = snapshotKey
-
-	if err := si.Update(func(b *bolt.Bucket) error {
-		return si.SetValue(b, "git-snapshot", v)
-	}); err != nil {
-		return nil, err
-	}
-
 	return snap, nil
 }
 
