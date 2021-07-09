@@ -26,7 +26,6 @@ import (
 	"github.com/moby/locker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	bolt "go.etcd.io/bbolt"
 )
 
 type Opt struct {
@@ -145,7 +144,7 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, g session.Group, inde
 		return "", nil, false, err
 	}
 	req = req.WithContext(ctx)
-	m := map[string]*metadata.StorageItem{}
+	m := map[string]cache.Metadata{}
 
 	// If we request a single ETag in 'If-None-Match', some servers omit the
 	// unambiguous ETag in their response.
@@ -154,10 +153,11 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, g session.Group, inde
 
 	if len(sis) > 0 {
 		for _, si := range sis {
+			md := cache.MetadataFromStorageItem(si)
 			// if metaDigest := getMetaDigest(si); metaDigest == hs.formatCacheKey("") {
-			if etag := getETag(si); etag != "" {
-				if dgst := getChecksum(si); dgst != "" {
-					m[etag] = si
+			if etag := md.GetETag(); etag != "" {
+				if dgst := md.GetHTTPChecksum(); dgst != "" {
+					m[etag] = md
 				}
 			}
 			// }
@@ -192,12 +192,12 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, g session.Group, inde
 				if respETag == "" && onlyETag != "" && resp.StatusCode == http.StatusNotModified {
 					respETag = onlyETag
 				}
-				si, ok := m[respETag]
+				md, ok := m[respETag]
 				if ok {
-					hs.refID = si.ID()
-					dgst := getChecksum(si)
+					hs.refID = md.ID()
+					dgst := md.GetHTTPChecksum()
 					if dgst != "" {
-						modTime := getModTime(si)
+						modTime := md.GetHTTPModTime()
 						resp.Body.Close()
 						return hs.formatCacheKey(getFileName(hs.src.URL, hs.src.Filename, resp), dgst, modTime).String(), nil, true, nil
 					}
@@ -224,16 +224,16 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, g session.Group, inde
 			// to .save()
 			resp.Header.Set("ETag", onlyETag)
 		}
-		si, ok := m[respETag]
+		md, ok := m[respETag]
 		if !ok {
 			return "", nil, false, errors.Errorf("invalid not-modified ETag: %v", respETag)
 		}
-		hs.refID = si.ID()
-		dgst := getChecksum(si)
+		hs.refID = md.ID()
+		dgst := md.GetHTTPChecksum()
 		if dgst == "" {
 			return "", nil, false, errors.Errorf("invalid metadata change")
 		}
-		modTime := getModTime(si)
+		modTime := md.GetHTTPModTime()
 		resp.Body.Close()
 		return hs.formatCacheKey(getFileName(hs.src.URL, hs.src.Filename, resp), dgst, modTime).String(), nil, true, nil
 	}
@@ -353,19 +353,20 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 	dgst = digest.NewDigest(digest.SHA256, h)
 
 	if respETag := resp.Header.Get("ETag"); respETag != "" {
-		setETag(ref.Metadata(), respETag)
+		ref.QueueETag(respETag)
 		uh, err := hs.urlHash()
 		if err != nil {
 			return nil, "", err
 		}
-		setChecksum(ref.Metadata(), uh.String(), dgst)
-		if err := ref.Metadata().Commit(); err != nil {
-			return nil, "", err
-		}
+		ref.QueueHTTPChecksum(uh.String(), dgst)
 	}
 
 	if modTime := resp.Header.Get("Last-Modified"); modTime != "" {
-		setModTime(ref.Metadata(), modTime)
+		ref.QueueHTTPModTime(modTime)
+	}
+
+	if err := ref.CommitMetadata(); err != nil {
+		return nil, "", err
 	}
 
 	return ref, dgst, nil
@@ -402,84 +403,6 @@ func (hs *httpSourceHandler) Snapshot(ctx context.Context, g session.Group) (cac
 	}
 
 	return ref, nil
-}
-
-const keyETag = "etag"
-const keyChecksum = "http.checksum"
-const keyModTime = "http.modtime"
-
-func setETag(si *metadata.StorageItem, s string) error {
-	v, err := metadata.NewValue(s)
-	if err != nil {
-		return errors.Wrap(err, "failed to create etag value")
-	}
-	si.Queue(func(b *bolt.Bucket) error {
-		return si.SetValue(b, keyETag, v)
-	})
-	return nil
-}
-
-func getETag(si *metadata.StorageItem) string {
-	v := si.Get(keyETag)
-	if v == nil {
-		return ""
-	}
-	var etag string
-	if err := v.Unmarshal(&etag); err != nil {
-		return ""
-	}
-	return etag
-}
-
-func setModTime(si *metadata.StorageItem, s string) error {
-	v, err := metadata.NewValue(s)
-	if err != nil {
-		return errors.Wrap(err, "failed to create modtime value")
-	}
-	si.Queue(func(b *bolt.Bucket) error {
-		return si.SetValue(b, keyModTime, v)
-	})
-	return nil
-}
-
-func getModTime(si *metadata.StorageItem) string {
-	v := si.Get(keyModTime)
-	if v == nil {
-		return ""
-	}
-	var modTime string
-	if err := v.Unmarshal(&modTime); err != nil {
-		return ""
-	}
-	return modTime
-}
-
-func setChecksum(si *metadata.StorageItem, url string, d digest.Digest) error {
-	v, err := metadata.NewValue(d)
-	if err != nil {
-		return errors.Wrap(err, "failed to create checksum value")
-	}
-	v.Index = url
-	si.Queue(func(b *bolt.Bucket) error {
-		return si.SetValue(b, keyChecksum, v)
-	})
-	return nil
-}
-
-func getChecksum(si *metadata.StorageItem) digest.Digest {
-	v := si.Get(keyChecksum)
-	if v == nil {
-		return ""
-	}
-	var dgstStr string
-	if err := v.Unmarshal(&dgstStr); err != nil {
-		return ""
-	}
-	dgst, err := digest.Parse(dgstStr)
-	if err != nil {
-		return ""
-	}
-	return dgst
 }
 
 func getFileName(urlStr, manualFilename string, resp *http.Response) string {

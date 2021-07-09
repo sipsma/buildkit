@@ -25,7 +25,6 @@ import (
 	"github.com/moby/locker"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 )
 
@@ -72,7 +71,7 @@ type cacheRefGetter struct {
 }
 
 func (g *cacheRefGetter) getRefCacheDir(ctx context.Context, ref cache.ImmutableRef, id string, sharing pb.CacheSharingOpt) (mref cache.MutableRef, err error) {
-	key := "cache-dir:" + id
+	key := id
 	if ref != nil {
 		key += ":" + ref.ID()
 	}
@@ -113,7 +112,7 @@ func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, 
 	cacheRefsLocker.Lock(key)
 	defer cacheRefsLocker.Unlock(key)
 	for {
-		sis, err := g.md.Search(key)
+		sis, err := g.md.Search(cache.KeyCacheDirIndex+key)
 		if err != nil {
 			return nil, err
 		}
@@ -144,16 +143,11 @@ func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, 
 		return nil, err
 	}
 
-	si, _ := g.md.Get(mRef.ID())
-	v, err := metadata.NewValue(key)
-	if err != nil {
+	if err := mRef.QueueCacheDirIndex(id); err != nil {
 		mRef.Release(context.TODO())
 		return nil, err
 	}
-	v.Index = key
-	if err := si.Update(func(b *bolt.Bucket) error {
-		return si.SetValue(b, key, v)
-	}); err != nil {
+	if err := mRef.CommitMetadata(); err != nil {
 		mRef.Release(context.TODO())
 		return nil, err
 	}

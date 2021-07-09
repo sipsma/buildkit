@@ -5,6 +5,7 @@ import (
 
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
+	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
 )
@@ -27,16 +28,195 @@ const keySnapshot = "cache.snapshot"
 const keyBlobOnly = "cache.blobonly"
 const keyMediaType = "cache.mediatype"
 const keyImageRefs = "cache.imageRefs"
-
+const keyContentHash = "buildkit.contenthash.v0"
+const keyETag = "etag"
+const keyChecksum = "http.checksum"
+const keyModTime = "http.modtime"
+const keyDeleted = "cache.deleted"
 // BlobSize is the packed blob size as specified in the oci descriptor
 const keyBlobSize = "cache.blobsize"
 
-const keyDeleted = "cache.deleted"
+// TODO(sipsma) remove need for this to be public by creating a wrapper interface around searching the full metadata store
+const KeyCacheDirIndex = "cache-dir:"
 
 // Deprecated keys, only retained when needed for migrating from older versions of buildkit
 const deprecatedKeyEqualMutable = "cache.equalMutable"
 
-func queueDiffID(si *metadata.StorageItem, str string) error {
+type storageItem struct {
+	*metadata.StorageItem
+}
+
+func MetadataFromStorageItem(si *metadata.StorageItem) Metadata {
+	return &storageItem{si}
+}
+
+type Metadata interface {
+	ID() string
+	CommitMetadata() error
+
+	GetDescription() string
+	QueueDescription(string) error
+
+	GetCreatedAt() time.Time
+	QueueCreatedAt(time.Time) error
+
+	GetContentHash() ([]byte, error)
+	SetContentHash([]byte) error
+
+	GetETag() string
+	QueueETag(string) error
+
+	GetHTTPModTime() string
+	QueueHTTPModTime(string) error
+
+	GetHTTPChecksum() digest.Digest
+	QueueHTTPChecksum(url string, d digest.Digest) error
+
+	HasCachePolicyDefault() bool
+	QueueCachePolicyDefault() error
+	HasCachePolicyRetain() bool
+	QueueCachePolicyRetain() error
+
+	GetLayerType() string
+	QueueLayerType(string) error
+
+	GetRecordType() client.UsageRecordType
+	QueueRecordType(client.UsageRecordType) error
+
+	QueueCacheDirIndex(string) error
+	ClearCacheDirIndex(string) error
+}
+
+func (si *storageItem) CommitMetadata() error {
+	return si.StorageItem.Commit()
+}
+
+func (si *storageItem) QueueCacheDirIndex(id string) error {
+	v, err := metadata.NewValue(KeyCacheDirIndex+id)
+	if err != nil {
+		return errors.Wrap(err, "failed to create etag value")
+	}
+	v.Index = KeyCacheDirIndex+id
+	si.Queue(func(b *bolt.Bucket) error {
+		return si.SetValue(b, KeyCacheDirIndex+id, v)
+	})
+	return nil
+}
+
+func (si *storageItem) ClearCacheDirIndex(id string) error {
+	si.Queue(func(b *bolt.Bucket) error {
+		if err := si.SetValue(b, KeyCacheDirIndex+id, nil); err != nil {
+			return err
+		}
+		// force clearing index, see #1836 https://github.com/moby/buildkit/pull/1836
+		return si.ClearIndex(b.Tx(), KeyCacheDirIndex+id)
+	})
+	return nil
+}
+
+func (si *storageItem) HasCachePolicyDefault() bool {
+	return si.getCachePolicy() == cachePolicyDefault
+}
+
+func (si *storageItem) QueueCachePolicyDefault() error {
+	return si.queueCachePolicy(cachePolicyDefault)
+}
+
+func (si *storageItem) HasCachePolicyRetain() bool {
+	return si.getCachePolicy() == cachePolicyRetain
+}
+
+func (si *storageItem) QueueCachePolicyRetain() error {
+	return si.queueCachePolicy(cachePolicyRetain)
+}
+
+func (si *storageItem) SetContentHash(dt []byte) error {
+	return si.SetExternal(keyContentHash, dt)
+}
+
+func (si *storageItem) GetContentHash() ([]byte, error) {
+	dt, err := si.GetExternal(keyContentHash)
+	if err != nil {
+		return nil, err
+	}
+	return dt, nil
+}
+
+func (si *storageItem) QueueETag(s string) error {
+	v, err := metadata.NewValue(s)
+	if err != nil {
+		return errors.Wrap(err, "failed to create etag value")
+	}
+	si.Queue(func(b *bolt.Bucket) error {
+		return si.SetValue(b, keyETag, v)
+	})
+	return nil
+}
+
+func (si *storageItem) GetETag() string {
+	v := si.Get(keyETag)
+	if v == nil {
+		return ""
+	}
+	var etag string
+	if err := v.Unmarshal(&etag); err != nil {
+		return ""
+	}
+	return etag
+}
+
+func (si *storageItem) QueueHTTPModTime(s string) error {
+	v, err := metadata.NewValue(s)
+	if err != nil {
+		return errors.Wrap(err, "failed to create modtime value")
+	}
+	si.Queue(func(b *bolt.Bucket) error {
+		return si.SetValue(b, keyModTime, v)
+	})
+	return nil
+}
+
+func (si *storageItem) GetHTTPModTime() string {
+	v := si.Get(keyModTime)
+	if v == nil {
+		return ""
+	}
+	var modTime string
+	if err := v.Unmarshal(&modTime); err != nil {
+		return ""
+	}
+	return modTime
+}
+
+func (si *storageItem) QueueHTTPChecksum(url string, d digest.Digest) error {
+	v, err := metadata.NewValue(d)
+	if err != nil {
+		return errors.Wrap(err, "failed to create checksum value")
+	}
+	v.Index = url
+	si.Queue(func(b *bolt.Bucket) error {
+		return si.SetValue(b, keyChecksum, v)
+	})
+	return nil
+}
+
+func (si *storageItem) GetHTTPChecksum() digest.Digest {
+	v := si.Get(keyChecksum)
+	if v == nil {
+		return ""
+	}
+	var dgstStr string
+	if err := v.Unmarshal(&dgstStr); err != nil {
+		return ""
+	}
+	dgst, err := digest.Parse(dgstStr)
+	if err != nil {
+		return ""
+	}
+	return dgst
+}
+
+func (si *storageItem) queueDiffID(str digest.Digest) error {
 	if str == "" {
 		return nil
 	}
@@ -50,7 +230,7 @@ func queueDiffID(si *metadata.StorageItem, str string) error {
 	return nil
 }
 
-func getMediaType(si *metadata.StorageItem) string {
+func (si *storageItem) getMediaType() string {
 	v := si.Get(keyMediaType)
 	if v == nil {
 		return si.ID()
@@ -62,7 +242,7 @@ func getMediaType(si *metadata.StorageItem) string {
 	return str
 }
 
-func queueMediaType(si *metadata.StorageItem, str string) error {
+func (si *storageItem) queueMediaType(str string) error {
 	if str == "" {
 		return nil
 	}
@@ -76,7 +256,7 @@ func queueMediaType(si *metadata.StorageItem, str string) error {
 	return nil
 }
 
-func getSnapshotID(si *metadata.StorageItem) string {
+func (si *storageItem) getSnapshotID() string {
 	v := si.Get(keySnapshot)
 	if v == nil {
 		return si.ID()
@@ -88,7 +268,7 @@ func getSnapshotID(si *metadata.StorageItem) string {
 	return str
 }
 
-func queueSnapshotID(si *metadata.StorageItem, str string) error {
+func (si *storageItem) queueSnapshotID(str string) error {
 	if str == "" {
 		return nil
 	}
@@ -102,7 +282,7 @@ func queueSnapshotID(si *metadata.StorageItem, str string) error {
 	return nil
 }
 
-func getDiffID(si *metadata.StorageItem) string {
+func (si *storageItem) getDiffID() digest.Digest {
 	v := si.Get(keyDiffID)
 	if v == nil {
 		return ""
@@ -111,10 +291,10 @@ func getDiffID(si *metadata.StorageItem) string {
 	if err := v.Unmarshal(&str); err != nil {
 		return ""
 	}
-	return str
+	return digest.Digest(str)
 }
 
-func queueChainID(si *metadata.StorageItem, str string) error {
+func (si *storageItem) queueChainID(str digest.Digest) error {
 	if str == "" {
 		return nil
 	}
@@ -122,14 +302,14 @@ func queueChainID(si *metadata.StorageItem, str string) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create chainID value")
 	}
-	v.Index = "chainid:" + str
+	v.Index = "chainid:" + string(str)
 	si.Update(func(b *bolt.Bucket) error {
 		return si.SetValue(b, keyChainID, v)
 	})
 	return nil
 }
 
-func getBlobChainID(si *metadata.StorageItem) string {
+func (si *storageItem) getBlobChainID() digest.Digest {
 	v := si.Get(keyBlobChainID)
 	if v == nil {
 		return ""
@@ -138,10 +318,10 @@ func getBlobChainID(si *metadata.StorageItem) string {
 	if err := v.Unmarshal(&str); err != nil {
 		return ""
 	}
-	return str
+	return digest.Digest(str)
 }
 
-func queueBlobChainID(si *metadata.StorageItem, str string) error {
+func (si *storageItem) queueBlobChainID(str digest.Digest) error {
 	if str == "" {
 		return nil
 	}
@@ -149,14 +329,14 @@ func queueBlobChainID(si *metadata.StorageItem, str string) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create chainID value")
 	}
-	v.Index = "blobchainid:" + str
+	v.Index = "blobchainid:" + string(str)
 	si.Update(func(b *bolt.Bucket) error {
 		return si.SetValue(b, keyBlobChainID, v)
 	})
 	return nil
 }
 
-func getChainID(si *metadata.StorageItem) string {
+func (si *storageItem) getChainID() digest.Digest {
 	v := si.Get(keyChainID)
 	if v == nil {
 		return ""
@@ -165,10 +345,10 @@ func getChainID(si *metadata.StorageItem) string {
 	if err := v.Unmarshal(&str); err != nil {
 		return ""
 	}
-	return str
+	return digest.Digest(str)
 }
 
-func queueBlob(si *metadata.StorageItem, str string) error {
+func (si *storageItem) queueBlob(str digest.Digest) error {
 	if str == "" {
 		return nil
 	}
@@ -182,7 +362,7 @@ func queueBlob(si *metadata.StorageItem, str string) error {
 	return nil
 }
 
-func getBlob(si *metadata.StorageItem) string {
+func (si *storageItem) getBlob() digest.Digest {
 	v := si.Get(keyBlob)
 	if v == nil {
 		return ""
@@ -191,10 +371,10 @@ func getBlob(si *metadata.StorageItem) string {
 	if err := v.Unmarshal(&str); err != nil {
 		return ""
 	}
-	return str
+	return digest.Digest(str)
 }
 
-func queueBlobOnly(si *metadata.StorageItem, b bool) error {
+func (si *storageItem) queueBlobOnly(b bool) error {
 	v, err := metadata.NewValue(b)
 	if err != nil {
 		return errors.Wrap(err, "failed to create blobonly value")
@@ -205,7 +385,7 @@ func queueBlobOnly(si *metadata.StorageItem, b bool) error {
 	return nil
 }
 
-func getBlobOnly(si *metadata.StorageItem) bool {
+func (si *storageItem) getBlobOnly() bool {
 	v := si.Get(keyBlobOnly)
 	if v == nil {
 		return false
@@ -217,18 +397,18 @@ func getBlobOnly(si *metadata.StorageItem) bool {
 	return blobOnly
 }
 
-func setDeleted(si *metadata.StorageItem) error {
+func (si *storageItem) queueDeleted() error {
 	v, err := metadata.NewValue(true)
 	if err != nil {
 		return errors.Wrap(err, "failed to create deleted value")
 	}
-	si.Update(func(b *bolt.Bucket) error {
+	si.Queue(func(b *bolt.Bucket) error {
 		return si.SetValue(b, keyDeleted, v)
 	})
 	return nil
 }
 
-func getDeleted(si *metadata.StorageItem) bool {
+func (si *storageItem) getDeleted() bool {
 	v := si.Get(keyDeleted)
 	if v == nil {
 		return false
@@ -240,7 +420,7 @@ func getDeleted(si *metadata.StorageItem) bool {
 	return deleted
 }
 
-func queueParent(si *metadata.StorageItem, parent string) error {
+func (si *storageItem) queueParent(parent string) error {
 	if parent == "" {
 		return nil
 	}
@@ -254,7 +434,7 @@ func queueParent(si *metadata.StorageItem, parent string) error {
 	return nil
 }
 
-func getParent(si *metadata.StorageItem) string {
+func (si *storageItem) getParent() string {
 	v := si.Get(keyParent)
 	if v == nil {
 		return ""
@@ -266,7 +446,7 @@ func getParent(si *metadata.StorageItem) string {
 	return parent
 }
 
-func setSize(si *metadata.StorageItem, s int64) error {
+func (si *storageItem) queueSize(s int64) error {
 	v, err := metadata.NewValue(s)
 	if err != nil {
 		return errors.Wrap(err, "failed to create size value")
@@ -277,7 +457,7 @@ func setSize(si *metadata.StorageItem, s int64) error {
 	return nil
 }
 
-func getSize(si *metadata.StorageItem) int64 {
+func (si *storageItem) getSize() int64 {
 	v := si.Get(keySize)
 	if v == nil {
 		return sizeUnknown
@@ -289,7 +469,7 @@ func getSize(si *metadata.StorageItem) int64 {
 	return size
 }
 
-func appendImageRef(si *metadata.StorageItem, s string) error {
+func (si *storageItem) appendImageRef(s string) error {
 	return si.GetAndSetValue(keyImageRefs, func(v *metadata.Value) (*metadata.Value, error) {
 		var imageRefs []string
 		if v != nil {
@@ -311,7 +491,7 @@ func appendImageRef(si *metadata.StorageItem, s string) error {
 	})
 }
 
-func getImageRefs(si *metadata.StorageItem) []string {
+func (si *storageItem) getImageRefs() []string {
 	v := si.Get(keyImageRefs)
 	if v == nil {
 		return nil
@@ -323,7 +503,7 @@ func getImageRefs(si *metadata.StorageItem) []string {
 	return refs
 }
 
-func queueBlobSize(si *metadata.StorageItem, s int64) error {
+func (si *storageItem) queueBlobSize(s int64) error {
 	v, err := metadata.NewValue(s)
 	if err != nil {
 		return errors.Wrap(err, "failed to create blobsize value")
@@ -334,7 +514,7 @@ func queueBlobSize(si *metadata.StorageItem, s int64) error {
 	return nil
 }
 
-func getBlobSize(si *metadata.StorageItem) int64 {
+func (si *storageItem) getBlobSize() int64 {
 	v := si.Get(keyBlobSize)
 	if v == nil {
 		return sizeUnknown
@@ -346,7 +526,7 @@ func getBlobSize(si *metadata.StorageItem) int64 {
 	return size
 }
 
-func getEqualMutable(si *metadata.StorageItem) string {
+func (si *storageItem) getEqualMutable() string {
 	v := si.Get(deprecatedKeyEqualMutable)
 	if v == nil {
 		return ""
@@ -358,7 +538,7 @@ func getEqualMutable(si *metadata.StorageItem) string {
 	return str
 }
 
-func setEqualMutable(si *metadata.StorageItem, s string) error {
+func (si *storageItem) queueEqualMutable(s string) error {
 	v, err := metadata.NewValue(s)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create %s meta value", deprecatedKeyEqualMutable)
@@ -369,14 +549,14 @@ func setEqualMutable(si *metadata.StorageItem, s string) error {
 	return nil
 }
 
-func clearEqualMutable(si *metadata.StorageItem) error {
+func (si *storageItem) clearEqualMutable() error {
 	si.Queue(func(b *bolt.Bucket) error {
 		return si.SetValue(b, deprecatedKeyEqualMutable, nil)
 	})
 	return nil
 }
 
-func queueCachePolicy(si *metadata.StorageItem, p cachePolicy) error {
+func (si *storageItem) queueCachePolicy(p cachePolicy) error {
 	v, err := metadata.NewValue(p)
 	if err != nil {
 		return errors.Wrap(err, "failed to create cachePolicy value")
@@ -387,7 +567,7 @@ func queueCachePolicy(si *metadata.StorageItem, p cachePolicy) error {
 	return nil
 }
 
-func getCachePolicy(si *metadata.StorageItem) cachePolicy {
+func (si *storageItem) getCachePolicy() cachePolicy {
 	v := si.Get(keyCachePolicy)
 	if v == nil {
 		return cachePolicyDefault
@@ -399,7 +579,7 @@ func getCachePolicy(si *metadata.StorageItem) cachePolicy {
 	return p
 }
 
-func queueDescription(si *metadata.StorageItem, descr string) error {
+func (si *storageItem) QueueDescription(descr string) error {
 	v, err := metadata.NewValue(descr)
 	if err != nil {
 		return errors.Wrap(err, "failed to create description value")
@@ -410,7 +590,7 @@ func queueDescription(si *metadata.StorageItem, descr string) error {
 	return nil
 }
 
-func GetDescription(si *metadata.StorageItem) string {
+func (si *storageItem) GetDescription() string {
 	v := si.Get(keyDescription)
 	if v == nil {
 		return ""
@@ -422,7 +602,7 @@ func GetDescription(si *metadata.StorageItem) string {
 	return str
 }
 
-func queueCreatedAt(si *metadata.StorageItem, tm time.Time) error {
+func (si *storageItem) QueueCreatedAt(tm time.Time) error {
 	v, err := metadata.NewValue(tm.UnixNano())
 	if err != nil {
 		return errors.Wrap(err, "failed to create createdAt value")
@@ -433,7 +613,7 @@ func queueCreatedAt(si *metadata.StorageItem, tm time.Time) error {
 	return nil
 }
 
-func GetCreatedAt(si *metadata.StorageItem) time.Time {
+func (si *storageItem) GetCreatedAt() time.Time {
 	v := si.Get(keyCreatedAt)
 	if v == nil {
 		return time.Time{}
@@ -445,7 +625,7 @@ func GetCreatedAt(si *metadata.StorageItem) time.Time {
 	return time.Unix(tm/1e9, tm%1e9)
 }
 
-func getLastUsed(si *metadata.StorageItem) (int, *time.Time) {
+func (si *storageItem) getLastUsed() (int, *time.Time) {
 	v := si.Get(keyUsageCount)
 	if v == nil {
 		return 0, nil
@@ -466,8 +646,8 @@ func getLastUsed(si *metadata.StorageItem) (int, *time.Time) {
 	return usageCount, &tm
 }
 
-func updateLastUsed(si *metadata.StorageItem) error {
-	count, _ := getLastUsed(si)
+func (si *storageItem) queueLastUsed() error {
+	count, _ := si.getLastUsed()
 	count++
 
 	v, err := metadata.NewValue(count)
@@ -478,27 +658,17 @@ func updateLastUsed(si *metadata.StorageItem) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create lastUsedAt value")
 	}
-	return si.Update(func(b *bolt.Bucket) error {
+	si.Queue(func(b *bolt.Bucket) error {
 		if err := si.SetValue(b, keyUsageCount, v); err != nil {
 			return err
 		}
 		return si.SetValue(b, keyLastUsedAt, v2)
 	})
+	return nil
 }
 
-func SetLayerType(m withMetadata, value string) error {
-	v, err := metadata.NewValue(value)
-	if err != nil {
-		return errors.Wrap(err, "failed to create layertype value")
-	}
-	m.Metadata().Queue(func(b *bolt.Bucket) error {
-		return m.Metadata().SetValue(b, keyLayerType, v)
-	})
-	return m.Metadata().Commit()
-}
-
-func GetLayerType(m withMetadata) string {
-	v := m.Metadata().Get(keyLayerType)
+func (si *storageItem) GetLayerType() string {
+	v := si.Get(keyLayerType)
 	if v == nil {
 		return ""
 	}
@@ -509,8 +679,19 @@ func GetLayerType(m withMetadata) string {
 	return str
 }
 
-func GetRecordType(m withMetadata) client.UsageRecordType {
-	v := m.Metadata().Get(keyRecordType)
+func (si *storageItem) QueueLayerType(value string) error {
+	v, err := metadata.NewValue(value)
+	if err != nil {
+		return errors.Wrap(err, "failed to create layertype value")
+	}
+	si.Queue(func(b *bolt.Bucket) error {
+		return si.SetValue(b, keyLayerType, v)
+	})
+	return nil
+}
+
+func (si *storageItem) GetRecordType() client.UsageRecordType {
+	v := si.Get(keyRecordType)
 	if v == nil {
 		return ""
 	}
@@ -521,14 +702,7 @@ func GetRecordType(m withMetadata) client.UsageRecordType {
 	return client.UsageRecordType(str)
 }
 
-func SetRecordType(m withMetadata, value client.UsageRecordType) error {
-	if err := queueRecordType(m.Metadata(), value); err != nil {
-		return err
-	}
-	return m.Metadata().Commit()
-}
-
-func queueRecordType(si *metadata.StorageItem, value client.UsageRecordType) error {
+func (si *storageItem) QueueRecordType(value client.UsageRecordType) error {
 	v, err := metadata.NewValue(value)
 	if err != nil {
 		return errors.Wrap(err, "failed to create recordtype value")
