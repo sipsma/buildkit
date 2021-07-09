@@ -54,8 +54,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 	}
 	eg.Go(func() error {
 		dp, err := g.Do(ctx, sr.ID(), func(ctx context.Context) (interface{}, error) {
-			refInfo := sr.Info()
-			if refInfo.Blob != "" {
+			if sr.getBlob() != "" {
 				if forceCompression {
 					desc, err := sr.ociDesc()
 					if err != nil {
@@ -186,7 +185,7 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 
-	if getChainID(sr.md) != "" {
+	if sr.getChainID() != "" {
 		return nil
 	}
 
@@ -198,12 +197,11 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 	var parentChainID digest.Digest
 	var parentBlobChainID digest.Digest
 	if p != nil {
-		pInfo := p.Info()
-		if pInfo.ChainID == "" || pInfo.BlobChainID == "" {
+		parentChainID = p.getChainID()
+		parentBlobChainID = p.getBlobChainID()
+		if parentChainID == "" || parentBlobChainID == "" {
 			return errors.Errorf("failed to set blob for reference with non-addressable parent")
 		}
-		parentChainID = pInfo.ChainID
-		parentBlobChainID = pInfo.BlobChainID
 	}
 
 	if err := sr.cm.LeaseManager.AddResource(ctx, leases.Lease{ID: sr.ID()}, leases.Resource{
@@ -213,26 +211,26 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 		return err
 	}
 
-	queueDiffID(sr.md, diffID.String())
-	queueBlob(sr.md, desc.Digest.String())
+	sr.queueDiffID(diffID)
+	sr.queueBlob(desc.Digest)
 	chainID := diffID
 	blobChainID := imagespecidentity.ChainID([]digest.Digest{desc.Digest, diffID})
 	if parentChainID != "" {
 		chainID = imagespecidentity.ChainID([]digest.Digest{parentChainID, chainID})
 		blobChainID = imagespecidentity.ChainID([]digest.Digest{parentBlobChainID, blobChainID})
 	}
-	queueChainID(sr.md, chainID.String())
-	queueBlobChainID(sr.md, blobChainID.String())
-	queueMediaType(sr.md, desc.MediaType)
-	queueBlobSize(sr.md, desc.Size)
-	if err := sr.md.Commit(); err != nil {
+	sr.queueChainID(chainID)
+	sr.queueBlobChainID(blobChainID)
+	sr.queueMediaType(desc.MediaType)
+	sr.queueBlobSize(desc.Size)
+	if err := sr.CommitMetadata(); err != nil {
 		return err
 	}
 	return nil
 }
 
 func isTypeWindows(sr *immutableRef) bool {
-	if GetLayerType(sr) == "windows" {
+	if sr.GetLayerType() == "windows" {
 		return true
 	}
 	if parent := sr.parent; parent != nil {

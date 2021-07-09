@@ -350,7 +350,7 @@ func TestSnapshotExtract(t *testing.T) {
 	snap, err := cm.GetByBlob(ctx, desc, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, false, snap.Info().Extracted)
+	require.Equal(t, false, !snap.(*immutableRef).getBlobOnly())
 
 	b2, desc2, err := mapToBlob(map[string]string{"foo": "bar123"}, true)
 	require.NoError(t, err)
@@ -361,11 +361,11 @@ func TestSnapshotExtract(t *testing.T) {
 	snap2, err := cm.GetByBlob(ctx, desc2, snap)
 	require.NoError(t, err)
 
-	size, err := snap2.Size(ctx)
+	size, err := snap2.(*immutableRef).size(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(b2)), size)
 
-	require.Equal(t, false, snap2.Info().Extracted)
+	require.Equal(t, false, !snap2.(*immutableRef).getBlobOnly())
 
 	dirs, err := ioutil.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -376,8 +376,8 @@ func TestSnapshotExtract(t *testing.T) {
 	err = snap2.Extract(ctx, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, true, snap.Info().Extracted)
-	require.Equal(t, true, snap2.Info().Extracted)
+	require.Equal(t, true, !snap.(*immutableRef).getBlobOnly())
+	require.Equal(t, true, !snap2.(*immutableRef).getBlobOnly())
 
 	dirs, err = ioutil.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -515,9 +515,9 @@ func TestExtractOnMutable(t *testing.T) {
 	err = snap.Release(context.TODO())
 	require.NoError(t, err)
 
-	require.Equal(t, false, snap2.Info().Extracted)
+	require.Equal(t, false, !snap2.(*immutableRef).getBlobOnly())
 
-	size, err := snap2.Size(ctx)
+	size, err := snap2.(*immutableRef).size(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(b2)), size)
 
@@ -530,8 +530,8 @@ func TestExtractOnMutable(t *testing.T) {
 	err = snap2.Extract(ctx, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, true, snap.Info().Extracted)
-	require.Equal(t, true, snap2.Info().Extracted)
+	require.Equal(t, true, !snap.(*immutableRef).getBlobOnly())
+	require.Equal(t, true, !snap2.(*immutableRef).getBlobOnly())
 
 	buf := pruneResultBuffer()
 	err = cm.Prune(ctx, buf.C, client.PruneInfo{})
@@ -598,12 +598,12 @@ func TestSetBlob(t *testing.T) {
 	snap, err := active.Commit(ctx)
 	require.NoError(t, err)
 
-	info := snap.Info()
-	require.Equal(t, "", string(info.DiffID))
-	require.Equal(t, "", string(info.Blob))
-	require.Equal(t, "", string(info.ChainID))
-	require.Equal(t, "", string(info.BlobChainID))
-	require.Equal(t, info.Extracted, true)
+	snapRef := snap.(*immutableRef)
+	require.Equal(t, "", string(snapRef.getDiffID()))
+	require.Equal(t, "", string(snapRef.getBlob()))
+	require.Equal(t, "", string(snapRef.getChainID()))
+	require.Equal(t, "", string(snapRef.getBlobChainID()))
+	require.Equal(t, !snapRef.getBlobOnly(), true)
 
 	ctx, clean, err := leaseutil.WithLease(ctx, co.lm)
 	require.NoError(t, err)
@@ -626,14 +626,14 @@ func TestSetBlob(t *testing.T) {
 	err = snap.(*immutableRef).setBlob(ctx, desc)
 	require.NoError(t, err)
 
-	info = snap.Info()
-	require.Equal(t, desc.Annotations["containerd.io/uncompressed"], string(info.DiffID))
-	require.Equal(t, desc.Digest, info.Blob)
-	require.Equal(t, desc.MediaType, info.MediaType)
-	require.Equal(t, info.DiffID, info.ChainID)
-	require.Equal(t, digest.FromBytes([]byte(desc.Digest+" "+info.DiffID)), info.BlobChainID)
-	require.Equal(t, snap.ID(), info.SnapshotID)
-	require.Equal(t, info.Extracted, true)
+	snapRef = snap.(*immutableRef)
+	require.Equal(t, desc.Annotations["containerd.io/uncompressed"], string(snapRef.getDiffID()))
+	require.Equal(t, desc.Digest, snapRef.getBlob())
+	require.Equal(t, desc.MediaType, snapRef.getMediaType())
+	require.Equal(t, snapRef.getDiffID(), snapRef.getChainID())
+	require.Equal(t, digest.FromBytes([]byte(desc.Digest+" "+snapRef.getDiffID())), snapRef.getBlobChainID())
+	require.Equal(t, snap.ID(), snapRef.getSnapshotID())
+	require.Equal(t, !snapRef.getBlobOnly(), true)
 
 	active, err = cm.New(ctx, snap, nil)
 	require.NoError(t, err)
@@ -650,14 +650,14 @@ func TestSetBlob(t *testing.T) {
 	err = snap2.(*immutableRef).setBlob(ctx, desc2)
 	require.NoError(t, err)
 
-	info2 := snap2.Info()
-	require.Equal(t, desc2.Annotations["containerd.io/uncompressed"], string(info2.DiffID))
-	require.Equal(t, desc2.Digest, info2.Blob)
-	require.Equal(t, desc2.MediaType, info2.MediaType)
-	require.Equal(t, digest.FromBytes([]byte(info.ChainID+" "+info2.DiffID)), info2.ChainID)
-	require.Equal(t, digest.FromBytes([]byte(info.BlobChainID+" "+digest.FromBytes([]byte(desc2.Digest+" "+info2.DiffID)))), info2.BlobChainID)
-	require.Equal(t, snap2.ID(), info2.SnapshotID)
-	require.Equal(t, info2.Extracted, true)
+	snapRef2 := snap2.(*immutableRef)
+	require.Equal(t, desc2.Annotations["containerd.io/uncompressed"], string(snapRef2.getDiffID()))
+	require.Equal(t, desc2.Digest, snapRef2.getBlob())
+	require.Equal(t, desc2.MediaType, snapRef2.getMediaType())
+	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef2.getDiffID())), snapRef2.getChainID())
+	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc2.Digest+" "+snapRef2.getDiffID())))), snapRef2.getBlobChainID())
+	require.Equal(t, snap2.ID(), snapRef2.getSnapshotID())
+	require.Equal(t, !snapRef2.getBlobOnly(), true)
 
 	b3, desc3, err := mapToBlob(map[string]string{"foo3": "bar3"}, true)
 	require.NoError(t, err)
@@ -668,14 +668,14 @@ func TestSetBlob(t *testing.T) {
 	snap3, err := cm.GetByBlob(ctx, desc3, snap)
 	require.NoError(t, err)
 
-	info3 := snap3.Info()
-	require.Equal(t, desc3.Annotations["containerd.io/uncompressed"], string(info3.DiffID))
-	require.Equal(t, desc3.Digest, info3.Blob)
-	require.Equal(t, desc3.MediaType, info3.MediaType)
-	require.Equal(t, digest.FromBytes([]byte(info.ChainID+" "+info3.DiffID)), info3.ChainID)
-	require.Equal(t, digest.FromBytes([]byte(info.BlobChainID+" "+digest.FromBytes([]byte(desc3.Digest+" "+info3.DiffID)))), info3.BlobChainID)
-	require.Equal(t, string(info3.ChainID), info3.SnapshotID)
-	require.Equal(t, info3.Extracted, false)
+	snapRef3 := snap3.(*immutableRef)
+	require.Equal(t, desc3.Annotations["containerd.io/uncompressed"], string(snapRef3.getDiffID()))
+	require.Equal(t, desc3.Digest, snapRef3.getBlob())
+	require.Equal(t, desc3.MediaType, snapRef3.getMediaType())
+	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef3.getDiffID())), snapRef3.getChainID())
+	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc3.Digest+" "+snapRef3.getDiffID())))), snapRef3.getBlobChainID())
+	require.Equal(t, string(snapRef3.getChainID()), snapRef3.getSnapshotID())
+	require.Equal(t, !snapRef3.getBlobOnly(), false)
 
 	// snap4 is same as snap2
 	snap4, err := cm.GetByBlob(ctx, desc2, snap)
@@ -687,7 +687,7 @@ func TestSetBlob(t *testing.T) {
 	b5, desc5, err := mapToBlob(map[string]string{"foo5": "bar5"}, true)
 	require.NoError(t, err)
 
-	desc5.Annotations["containerd.io/uncompressed"] = info2.DiffID.String()
+	desc5.Annotations["containerd.io/uncompressed"] = snapRef2.getDiffID().String()
 
 	err = content.WriteBlob(ctx, co.cs, "ref5", bytes.NewBuffer(b5), desc5)
 	require.NoError(t, err)
@@ -695,14 +695,15 @@ func TestSetBlob(t *testing.T) {
 	snap5, err := cm.GetByBlob(ctx, desc5, snap)
 	require.NoError(t, err)
 
+	snapRef5 := snap5.(*immutableRef)
 	require.NotEqual(t, snap2.ID(), snap5.ID())
-	require.Equal(t, snap2.Info().SnapshotID, snap5.Info().SnapshotID)
-	require.Equal(t, info2.DiffID, snap5.Info().DiffID)
-	require.Equal(t, desc5.Digest, snap5.Info().Blob)
+	require.Equal(t, snapRef2.getSnapshotID(), snapRef5.getSnapshotID())
+	require.Equal(t, snapRef2.getDiffID(), snapRef5.getDiffID())
+	require.Equal(t, desc5.Digest, snapRef5.getBlob())
 
-	require.Equal(t, snap2.Info().ChainID, snap5.Info().ChainID)
-	require.NotEqual(t, snap2.Info().BlobChainID, snap5.Info().BlobChainID)
-	require.Equal(t, digest.FromBytes([]byte(info.BlobChainID+" "+digest.FromBytes([]byte(desc5.Digest+" "+info2.DiffID)))), snap5.Info().BlobChainID)
+	require.Equal(t, snapRef2.getChainID(), snapRef5.getChainID())
+	require.NotEqual(t, snapRef2.getBlobChainID(), snapRef5.getBlobChainID())
+	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc5.Digest+" "+snapRef2.getDiffID())))), snapRef5.getBlobChainID())
 
 	// snap6 is a child of snap3
 	b6, desc6, err := mapToBlob(map[string]string{"foo6": "bar6"}, true)
@@ -714,13 +715,13 @@ func TestSetBlob(t *testing.T) {
 	snap6, err := cm.GetByBlob(ctx, desc6, snap3)
 	require.NoError(t, err)
 
-	info6 := snap6.Info()
-	require.Equal(t, desc6.Annotations["containerd.io/uncompressed"], string(info6.DiffID))
-	require.Equal(t, desc6.Digest, info6.Blob)
-	require.Equal(t, digest.FromBytes([]byte(snap3.Info().ChainID+" "+info6.DiffID)), info6.ChainID)
-	require.Equal(t, digest.FromBytes([]byte(info3.BlobChainID+" "+digest.FromBytes([]byte(info6.Blob+" "+info6.DiffID)))), info6.BlobChainID)
-	require.Equal(t, string(info6.ChainID), info6.SnapshotID)
-	require.Equal(t, info6.Extracted, false)
+	snapRef6 := snap6.(*immutableRef)
+	require.Equal(t, desc6.Annotations["containerd.io/uncompressed"], string(snapRef6.getDiffID()))
+	require.Equal(t, desc6.Digest, snapRef6.getBlob())
+	require.Equal(t, digest.FromBytes([]byte(snapRef3.getChainID()+" "+snapRef6.getDiffID())), snapRef6.getChainID())
+	require.Equal(t, digest.FromBytes([]byte(snapRef3.getBlobChainID()+" "+digest.FromBytes([]byte(snapRef6.getBlob()+" "+snapRef6.getDiffID())))), snapRef6.getBlobChainID())
+	require.Equal(t, string(snapRef6.getChainID()), snapRef6.getSnapshotID())
+	require.Equal(t, !snapRef6.getBlobOnly(), false)
 
 	_, err = cm.GetByBlob(ctx, ocispec.Descriptor{
 		Digest: digest.FromBytes([]byte("notexist")),
@@ -995,8 +996,8 @@ func TestLazyCommit(t *testing.T) {
 
 	err = snap2.(*immutableRef).finalizeLocked(ctx)
 	require.NoError(t, err)
-	queueDescription(snap2.Metadata(), "foo")
-	require.NoError(t, snap2.Metadata().Commit())
+	snap2.QueueDescription("foo")
+	require.NoError(t, snap2.CommitMetadata())
 
 	err = snap2.Release(ctx)
 	require.NoError(t, err)
@@ -1012,8 +1013,8 @@ func TestLazyCommit(t *testing.T) {
 	snap3ID := snap3.ID()
 
 	// simulate the old equalMutable format to test that the migration logic in cacheManager.init works as expected
-	setEqualMutable(snap3.Metadata(), snap2ID)
-	require.NoError(t, snap3.Metadata().Commit())
+	snap3.(*immutableRef).queueEqualMutable(snap2ID)
+	require.NoError(t, snap3.CommitMetadata())
 
 	require.NoError(t, snap3.Release(ctx))
 	checkDiskUsage(ctx, t, cm, 0, 3)
@@ -1042,9 +1043,9 @@ func TestLazyCommit(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 1, 1)
 
-	require.Equal(t, "", getEqualMutable(snap3.Metadata()))
-	require.Equal(t, "foo", GetDescription(snap3.Metadata()))
-	require.Equal(t, snap2ID, getSnapshotID(snap3.Metadata()))
+	require.Equal(t, "", snap3.(*immutableRef).getEqualMutable())
+	require.Equal(t, "foo", snap3.GetDescription())
+	require.Equal(t, snap2ID, snap3.(*immutableRef).getSnapshotID())
 }
 
 func checkDiskUsage(ctx context.Context, t *testing.T, cm Manager, inuse, unused int) {

@@ -39,8 +39,11 @@ func (rm *RefManager) Prepare(ctx context.Context, ref fileoptypes.Ref, readonly
 	}
 	defer func() {
 		if rerr != nil {
-			cache.CachePolicyDefault(mr)
-			if err := mr.Metadata().Commit(); err != nil {
+			err := mr.QueueCachePolicyDefault()
+			if err == nil {
+				err = mr.CommitMetadata()
+			}
+			if err != nil {
 				bklog.G(ctx).Errorf("failed to reset FileOp mutable ref cachepolicy: %v", err)
 			}
 			mr.Release(context.TODO())

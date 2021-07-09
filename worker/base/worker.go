@@ -49,7 +49,6 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -283,34 +282,29 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
 	defer mu.Unlock()
 
 	for _, id := range ids {
-		id = "cache-dir:" + id
-		sis, err := w.WorkerOpt.MetadataStore.Search(id)
+		index := "cache-dir:" + id
+		sis, err := w.WorkerOpt.MetadataStore.Search(index)
 		if err != nil {
 			return err
 		}
 		for _, si := range sis {
 			for _, k := range si.Indexes() {
-				if k == id || strings.HasPrefix(k, id+":") {
-					siOrig := si
-					if siCached := w.CacheMgr.Metadata(si.ID()); siCached != nil {
-						si = siCached
+				if k == index || strings.HasPrefix(k, index+":") {
+					md := cache.MetadataFromStorageItem(si)
+					if mdCached := w.CacheMgr.Metadata(md.ID()); mdCached != nil {
+						md = mdCached
 					}
-					if si.Get(k) == nil {
-						si.Update(func(b *bolt.Bucket) error {
-							return si.SetValue(b, k, siOrig.Get(k))
-						})
-					}
-					if err := cache.CachePolicyDefault(si); err != nil {
+					if err := md.QueueCachePolicyDefault(); err != nil {
 						return err
 					}
-					si.Queue(func(b *bolt.Bucket) error {
-						return si.SetValue(b, k, nil)
-					})
-					if err := si.Commit(); err != nil {
+					if err := md.ClearCacheDirIndex(id); err != nil {
+						return err
+					}
+					if err := md.CommitMetadata(); err != nil {
 						return err
 					}
 					// if ref is unused try to clean it up right away by releasing it
-					if mref, err := w.CacheMgr.GetMutable(ctx, si.ID()); err == nil {
+					if mref, err := w.CacheMgr.GetMutable(ctx, md.ID()); err == nil {
 						go mref.Release(context.TODO())
 					}
 					break

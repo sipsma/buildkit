@@ -335,8 +335,11 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 		}
 	}
 
-	if p.id.RecordType != "" && cache.GetRecordType(current) == "" {
-		if err := cache.SetRecordType(current, p.id.RecordType); err != nil {
+	if p.id.RecordType != "" && current.GetRecordType() == "" {
+		if err := current.QueueRecordType(p.id.RecordType); err != nil {
+			return nil, err
+		}
+		if err := current.CommitMetadata(); err != nil {
 			return nil, err
 		}
 	}
@@ -351,7 +354,10 @@ func markRefLayerTypeWindows(ref cache.ImmutableRef) error {
 			return err
 		}
 	}
-	return cache.SetLayerType(ref, "windows")
+	if err := ref.QueueLayerType("windows"); err != nil {
+		return err
+	}
+	return ref.CommitMetadata()
 }
 
 // cacheKeyFromConfig returns a stable digest from image config. If image config

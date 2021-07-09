@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/compression"
@@ -28,11 +27,14 @@ func (s *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solve
 		return solver.CacheResult{}, errors.Errorf("invalid result: %T", res.Sys())
 	}
 	if ref.ImmutableRef != nil {
-		if !cache.HasCachePolicyRetain(ref.ImmutableRef) {
-			if err := cache.CachePolicyRetain(ref.ImmutableRef); err != nil {
+		if !ref.ImmutableRef.HasCachePolicyRetain() {
+			err := ref.ImmutableRef.QueueCachePolicyRetain()
+			if err == nil {
+				err = ref.ImmutableRef.CommitMetadata()
+			}
+			if err != nil {
 				return solver.CacheResult{}, err
 			}
-			ref.ImmutableRef.Metadata().Commit()
 		}
 	}
 	return solver.CacheResult{ID: ref.ID(), CreatedAt: createdAt}, nil

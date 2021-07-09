@@ -138,11 +138,11 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, cal
 	defer func() {
 		if retErr != nil && mutable != nil {
 			// on error remove the record as checksum update is in undefined state
-			cache.CachePolicyDefault(mutable)
-			if err := mutable.Metadata().Commit(); err != nil {
+			mutable.QueueCachePolicyDefault()
+			if err := mutable.CommitMetadata(); err != nil {
 				bklog.G(ctx).Errorf("failed to reset mutable cachepolicy: %v", err)
 			}
-			contenthash.ClearCacheContext(mutable.Metadata())
+			contenthash.ClearCacheContext(mutable)
 			go mutable.Release(context.TODO())
 		}
 	}()
@@ -165,7 +165,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, cal
 		}
 	}()
 
-	cc, err := contenthash.GetCacheContext(ctx, mutable.Metadata(), mount.IdentityMapping())
+	cc, err := contenthash.GetCacheContext(ctx, mutable)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +209,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, cal
 	}
 	lm = nil
 
-	if err := contenthash.SetCacheContext(ctx, mutable.Metadata(), cc); err != nil {
+	if err := contenthash.SetCacheContext(ctx, mutable, cc); err != nil {
 		return nil, err
 	}
 
