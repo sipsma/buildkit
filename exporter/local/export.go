@@ -58,7 +58,7 @@ func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source,
 
 	isMap := len(inp.Refs) > 0
 
-	export := func(ctx context.Context, k string, ref cache.ImmutableRef) func() error {
+	export := func(ctx context.Context, k string, ref *cache.ImmutableRef) func() error {
 		return func() error {
 			var src string
 			var err error

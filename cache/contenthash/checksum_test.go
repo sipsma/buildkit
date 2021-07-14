@@ -1000,7 +1000,7 @@ func TestPersistence(t *testing.T) {
 	require.Equal(t, dgstFileData0, dgst)
 }
 
-func createRef(t *testing.T, cm cache.Manager, files []string) cache.ImmutableRef {
+func createRef(t *testing.T, cm cache.Manager, files []string) *cache.ImmutableRef {
 	if runtime.GOOS == "windows" && len(files) > 0 {
 		// lm.Mount() will fail
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")

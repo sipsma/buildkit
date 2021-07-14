@@ -48,12 +48,11 @@ type ManagerOpt struct {
 
 type Accessor interface {
 	MetadataStore
+	GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent *ImmutableRef, opts ...RefOption) (*ImmutableRef, error)
+	Get(ctx context.Context, id string, opts ...RefOption) (*ImmutableRef, error)
 
-	GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent ImmutableRef, opts ...RefOption) (ImmutableRef, error)
-	Get(ctx context.Context, id string, opts ...RefOption) (ImmutableRef, error)
-
-	New(ctx context.Context, parent ImmutableRef, s session.Group, opts ...RefOption) (MutableRef, error)
-	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
+	New(ctx context.Context, parent *ImmutableRef, s session.Group, opts ...RefOption) (*MutableRef, error)
+	GetMutable(ctx context.Context, id string, opts ...RefOption) (*MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
 }
 
@@ -116,7 +115,7 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 	return cm, nil
 }
 
-func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
+func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, parent *ImmutableRef, opts ...RefOption) (ir *ImmutableRef, rerr error) {
 	diffID, err := diffIDFromDescriptor(desc)
 	if err != nil {
 		return nil, err
@@ -133,14 +132,10 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 	}
 
-	var p *immutableRef
+	var p *ImmutableRef
 	var parentID string
 	if parent != nil {
-		p2, err := cm.Get(ctx, parent.ID(), NoUpdateLastUsed, descHandlers)
-		if err != nil {
-			return nil, err
-		}
-		p = p2.(*immutableRef)
+		p = parent.Clone()
 
 		if p.getChainID() == "" || p.getBlobChainID() == "" {
 			p.Release(context.TODO())
@@ -193,7 +188,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		return nil, err
 	}
 
-	var link *immutableRef
+	var link *ImmutableRef
 	for _, si := range sis {
 		ref, err := cm.get(ctx, si.ID(), opts...)
 		// if the error was NotFound or NeedsRemoteProvider, we can't re-use the snapshot from the blob so just skip it
@@ -256,7 +251,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 
 	rec := &cacheRecord{
 		cm:            cm,
-		immutableRefs: make(map[*immutableRef]struct{}),
+		immutableRefs: make(map[*ImmutableRef]struct{}),
 		parent:        p,
 		cacheMetadata: md,
 		isFinalized:   true,
@@ -366,14 +361,14 @@ func (cm *cacheManager) Close() error {
 }
 
 // Get returns an immutable snapshot reference for ID
-func (cm *cacheManager) Get(ctx context.Context, id string, opts ...RefOption) (ImmutableRef, error) {
+func (cm *cacheManager) Get(ctx context.Context, id string, opts ...RefOption) (*ImmutableRef, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.get(ctx, id, opts...)
 }
 
 // get requires manager lock to be taken
-func (cm *cacheManager) get(ctx context.Context, id string, opts ...RefOption) (*immutableRef, error) {
+func (cm *cacheManager) get(ctx context.Context, id string, opts ...RefOption) (*ImmutableRef, error) {
 	rec, err := cm.getRecord(ctx, id, opts...)
 	if err != nil {
 		return nil, err
@@ -431,7 +426,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, errors.Wrap(errNotFound, id)
 	}
 
-	var parent *immutableRef
+	var parent *ImmutableRef
 	if parentID := md.getParent(); parentID != "" {
 		var err error
 		parent, err = cm.get(ctx, parentID, append(opts, NoUpdateLastUsed)...)
@@ -451,7 +446,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		cm:            cm,
 		cacheMetadata: md,
 		parent:        parent,
-		immutableRefs: make(map[*immutableRef]struct{}),
+		immutableRefs: make(map[*ImmutableRef]struct{}),
 	}
 
 	// the record was deleted but we crashed before data on disk was removed
@@ -497,22 +492,14 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	return rec, nil
 }
 
-func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Group, opts ...RefOption) (mr MutableRef, err error) {
+func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.Group, opts ...RefOption) (mr *MutableRef, err error) {
 	id := identity.NewID()
 
-	var parent *immutableRef
+	var parent *ImmutableRef
 	var parentID string
 	var parentSnapshotID string
-	if s != nil {
-		if _, ok := s.(*immutableRef); ok {
-			parent = s.Clone().(*immutableRef)
-		} else {
-			p, err := cm.Get(ctx, s.ID(), append(opts, NoUpdateLastUsed)...)
-			if err != nil {
-				return nil, err
-			}
-			parent = p.(*immutableRef)
-		}
+	if p != nil {
+		parent = p.Clone()
 		if err := parent.finalizeLocked(ctx); err != nil {
 			return nil, err
 		}
@@ -578,7 +565,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		cm:            cm,
 		cacheMetadata: md,
 		parent:        parent,
-		immutableRefs: make(map[*immutableRef]struct{}),
+		immutableRefs: make(map[*ImmutableRef]struct{}),
 	}
 
 	if err := initializeMetadata(rec.cacheMetadata, parentID, opts...); err != nil {
@@ -602,7 +589,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 	return rec.mref(true, dhs)
 }
 
-func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) {
+func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOption) (*MutableRef, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 

@@ -273,7 +273,7 @@ func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cach
 	return p.configKey, cacheOpts, cacheDone, nil
 }
 
-func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.ImmutableRef, err error) {
+func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir *cache.ImmutableRef, err error) {
 	p.Puller.Resolver = resolver.DefaultPool.GetResolver(p.RegistryHosts, p.Ref, "pull", p.SessionManager, g).WithImageStore(p.ImageStore, p.id.ResolveMode)
 
 	if len(p.manifest.Descriptors) == 0 {
@@ -285,14 +285,14 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 		}
 	}()
 
-	var current cache.ImmutableRef
+	var current *cache.ImmutableRef
 	defer func() {
 		if err != nil && current != nil {
 			current.Release(context.TODO())
 		}
 	}()
 
-	var parent cache.ImmutableRef
+	var parent *cache.ImmutableRef
 	for _, layerDesc := range p.manifest.Descriptors {
 		parent = current
 		current, err = p.CacheAccessor.GetByBlob(ctx, layerDesc, parent,
@@ -344,7 +344,7 @@ func (p *puller) Snapshot(ctx context.Context, g session.Group) (ir cache.Immuta
 	return current, nil
 }
 
-func markRefLayerTypeWindows(ref cache.ImmutableRef) error {
+func markRefLayerTypeWindows(ref *cache.ImmutableRef) error {
 	if parent := ref.Parent(); parent != nil {
 		defer parent.Release(context.TODO())
 		if err := markRefLayerTypeWindows(parent); err != nil {

@@ -27,7 +27,7 @@ var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
 // a blob is missing and createIfNeeded is true, then the blob will be created, otherwise ErrNoBlobs will
 // be returned. Caller must hold a lease when calling this function.
 // If forceCompression is specified but the blob of compressionType doesn't exist, this function creates it.
-func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) error {
+func (sr *ImmutableRef) computeBlobChain(ctx context.Context, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) error {
 	if _, ok := leases.FromContext(ctx); !ok {
 		return errors.Errorf("missing lease requirement for computeBlobChain")
 	}
@@ -43,7 +43,7 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
 	return computeBlobChain(ctx, sr, createIfNeeded, compressionType, forceCompression, s)
 }
 
-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) error {
+func computeBlobChain(ctx context.Context, sr *ImmutableRef, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) error {
 	baseCtx := ctx
 	eg, ctx := errgroup.WithContext(ctx)
 	var currentDescr ocispec.Descriptor
@@ -169,7 +169,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 // setBlob associates a blob with the cache record.
 // A lease must be held for the blob when calling this function
 // Caller should call Info() for knowing what current values are actually set
-func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) error {
+func (sr *ImmutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) error {
 	if _, ok := leases.FromContext(ctx); !ok {
 		return errors.Errorf("missing lease requirement for setBlob")
 	}
@@ -229,7 +229,7 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 	return nil
 }
 
-func isTypeWindows(sr *immutableRef) bool {
+func isTypeWindows(sr *ImmutableRef) bool {
 	if sr.GetLayerType() == "windows" {
 		return true
 	}
@@ -240,7 +240,7 @@ func isTypeWindows(sr *immutableRef) bool {
 }
 
 // ensureCompression ensures the specified ref has the blob of the specified compression Type.
-func ensureCompression(ctx context.Context, ref *immutableRef, desc ocispec.Descriptor, compressionType compression.Type, s session.Group) error {
+func ensureCompression(ctx context.Context, ref *ImmutableRef, desc ocispec.Descriptor, compressionType compression.Type, s session.Group) error {
 	// Resolve converters
 	layerConvertFunc, _, err := getConverters(desc, compressionType)
 	if err != nil {

@@ -87,7 +87,7 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 	_, isDevel := opts[keyDevel]
 	var img specs.Image
 	var mfstDigest digest.Digest
-	var rootFS cache.MutableRef
+	var rootFS *cache.MutableRef
 	var readonly bool // TODO: try to switch to read-only by default.
 
 	if isDevel {
@@ -662,7 +662,7 @@ func (lbf *llbBridgeForwarder) Solve(ctx context.Context, req *pb.SolveRequest) 
 	return resp, nil
 }
 
-func (lbf *llbBridgeForwarder) getImmutableRef(ctx context.Context, id, path string) (cache.ImmutableRef, error) {
+func (lbf *llbBridgeForwarder) getImmutableRef(ctx context.Context, id, path string) (*cache.ImmutableRef, error) {
 	lbf.mu.Lock()
 	ref, ok := lbf.refs[id]
 	lbf.mu.Unlock()

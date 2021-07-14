@@ -87,8 +87,8 @@ func (ls *localSourceHandler) CacheKey(ctx context.Context, g session.Group, ind
 	return "session:" + ls.src.Name + ":" + digest.FromBytes(dt).String(), nil, true, nil
 }
 
-func (ls *localSourceHandler) Snapshot(ctx context.Context, g session.Group) (cache.ImmutableRef, error) {
-	var ref cache.ImmutableRef
+func (ls *localSourceHandler) Snapshot(ctx context.Context, g session.Group) (*cache.ImmutableRef, error) {
+	var ref *cache.ImmutableRef
 	err := ls.sm.Any(ctx, g, func(ctx context.Context, _ string, c session.Caller) error {
 		r, err := ls.snapshot(ctx, g, c)
 		if err != nil {
@@ -103,10 +103,10 @@ func (ls *localSourceHandler) Snapshot(ctx context.Context, g session.Group) (ca
 	return ref, nil
 }
 
-func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, caller session.Caller) (out cache.ImmutableRef, retErr error) {
+func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, caller session.Caller) (out *cache.ImmutableRef, retErr error) {
 	sharedKey := ls.src.Name + ":" + ls.src.SharedKeyHint + ":" + caller.SharedKey() // TODO: replace caller.SharedKey() with source based hint from client(absolute-path+nodeid)
 
-	var mutable cache.MutableRef
+	var mutable *cache.MutableRef
 	sis, err := ls.cm.SearchSharedKey(ctx, sharedKey)
 	if err != nil {
 		return nil, err

@@ -15,7 +15,6 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
-	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -32,43 +31,42 @@ type Ref interface {
 	Mountable
 	Metadata
 	Release(context.Context) error
-}
-
-type ImmutableRef interface {
-	Ref
-	Parent() ImmutableRef
-	Clone() ImmutableRef
-
-	Extract(ctx context.Context, s session.Group) error // +progress
-	GetRemote(ctx context.Context, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) (*solver.Remote, error)
-}
-
-type MutableRef interface {
-	Ref
-	Commit(context.Context) (ImmutableRef, error)
+	Commit(context.Context) (*ImmutableRef, error)
 }
 
 type Mountable interface {
 	Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error)
 }
 
+type ImmutableRef struct {
+	*cacheRecord
+	triggerLastUsed bool
+	descHandlers    DescHandlers
+}
+
+type MutableRef struct {
+	*cacheRecord
+	triggerLastUsed bool
+	descHandlers    DescHandlers
+}
+
 type cacheRecord struct {
 	cm     *cacheManager
 	mu     sync.Mutex
 	sizeG  flightcontrol.Group
-	parent *immutableRef
+	parent *ImmutableRef
 	*cacheMetadata
 
 	// immutableRefs keeps track of each ref pointing to this cacheRecord that can't change the underlying snapshot
 	// data. When it's empty and mutableRef below is empty, that means there's no more unreleased pointers to this
 	// struct and the cacheRecord can be considered for deletion. We enforce that there can not be immutableRefs while
 	// mutableRef is set.
-	immutableRefs map[*immutableRef]struct{}
+	immutableRefs map[*ImmutableRef]struct{}
 
 	// mutableRef keeps track of a ref to this cacheRecord whose snapshot can be mounted read-write.
 	// We enforce that at most one mutable ref points to this cacheRecord at a time and no immutableRefs
 	// are set while mutableRef is set.
-	mutableRef *mutableRef
+	mutableRef *MutableRef
 
 	// isFinalized means the underlying snapshot has been committed to its driver
 	isFinalized bool
@@ -82,29 +80,13 @@ type cacheRecord struct {
 	parentChainCache []digest.Digest
 }
 
-type immutableRef struct {
-	*cacheRecord
-	triggerLastUsed bool
-	descHandlers    DescHandlers
-}
-
-var _ ImmutableRef = &immutableRef{}
-
-type mutableRef struct {
-	*cacheRecord
-	triggerLastUsed bool
-	descHandlers    DescHandlers
-}
-
-var _ MutableRef = &mutableRef{}
-
 // hold cacheRecord.mu before calling
-func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*immutableRef, error) {
+func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*ImmutableRef, error) {
 	if cr.mutableRef != nil {
 		return nil, ErrLocked
 	}
 
-	r := &immutableRef{
+	r := &ImmutableRef{
 		cacheRecord:     cr,
 		triggerLastUsed: triggerLastUsed,
 		descHandlers:    descHandlers,
@@ -114,7 +96,7 @@ func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*im
 }
 
 // hold cacheRecord.mu lock before calling
-func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) (*mutableRef, error) {
+func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) (*MutableRef, error) {
 	if cr.isFinalized {
 		return nil, errors.Wrap(errInvalid, "cannot get mutable ref of finalized cache record")
 	}
@@ -125,7 +107,7 @@ func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) (*m
 		return nil, ErrLocked
 	}
 
-	r := &mutableRef{
+	r := &MutableRef{
 		cacheRecord:     cr,
 		triggerLastUsed: triggerLastUsed,
 		descHandlers:    descHandlers,
@@ -295,15 +277,15 @@ func (cr *cacheRecord) release(ctx context.Context, forceKeep bool) error {
 	return cr.remove(ctx)
 }
 
-func (sr *immutableRef) Clone() ImmutableRef {
+func (sr *ImmutableRef) Clone() *ImmutableRef {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.clone(false)
 }
 
 // hold cacheRecord.mu lock before calling
-func (sr *immutableRef) clone(triggerLastUsed bool) ImmutableRef {
-	ir2 := &immutableRef{
+func (sr *ImmutableRef) clone(triggerLastUsed bool) *ImmutableRef {
+	ir2 := &ImmutableRef{
 		cacheRecord:     sr.cacheRecord,
 		triggerLastUsed: triggerLastUsed,
 		descHandlers:    sr.descHandlers,
@@ -312,7 +294,7 @@ func (sr *immutableRef) clone(triggerLastUsed bool) ImmutableRef {
 	return ir2
 }
 
-func (sr *immutableRef) Parent() ImmutableRef {
+func (sr *ImmutableRef) Parent() *ImmutableRef {
 	p := sr.parent
 	if p == nil {
 		return nil
@@ -323,7 +305,7 @@ func (sr *immutableRef) Parent() ImmutableRef {
 	return p.clone(true)
 }
 
-func (sr *immutableRef) ociDesc() (ocispec.Descriptor, error) {
+func (sr *ImmutableRef) ociDesc() (ocispec.Descriptor, error) {
 	desc := ocispec.Descriptor{
 		Digest:      sr.getBlob(),
 		Size:        sr.getBlobSize(),
@@ -354,7 +336,7 @@ func compressionVariantDigestLabel(compressionType compression.Type) string {
 	return compressionVariantDigestLabelPrefix + compressionType.String()
 }
 
-func (sr *immutableRef) getCompressionBlob(ctx context.Context, compressionType compression.Type) (content.Info, error) {
+func (sr *ImmutableRef) getCompressionBlob(ctx context.Context, compressionType compression.Type) (content.Info, error) {
 	cs := sr.cm.ContentStore
 	info, err := cs.Info(ctx, sr.getBlob())
 	if err != nil {
@@ -371,7 +353,7 @@ func (sr *immutableRef) getCompressionBlob(ctx context.Context, compressionType 
 	return content.Info{}, errdefs.ErrNotFound
 }
 
-func (sr *immutableRef) addCompressionBlob(ctx context.Context, dgst digest.Digest, compressionType compression.Type) error {
+func (sr *ImmutableRef) addCompressionBlob(ctx context.Context, dgst digest.Digest, compressionType compression.Type) error {
 	cs := sr.cm.ContentStore
 	if err := sr.cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: sr.ID()}, leases.Resource{
 		ID:   dgst.String(),
@@ -395,19 +377,19 @@ func (sr *immutableRef) addCompressionBlob(ctx context.Context, dgst digest.Dige
 }
 
 // order is from parent->child, sr will be at end of slice
-func (sr *immutableRef) parentRefChain() []*immutableRef {
+func (sr *ImmutableRef) parentRefChain() []*ImmutableRef {
 	var count int
 	for ref := sr; ref != nil; ref = ref.parent {
 		count++
 	}
-	refs := make([]*immutableRef, count)
+	refs := make([]*ImmutableRef, count)
 	for i, ref := count-1, sr; ref != nil; i, ref = i-1, ref.parent {
 		refs[i] = ref
 	}
 	return refs
 }
 
-func (sr *immutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
+func (sr *ImmutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
 	if err := sr.Extract(ctx, s); err != nil {
 		return nil, err
 	}
@@ -433,7 +415,7 @@ func (sr *immutableRef) Mount(ctx context.Context, readonly bool, s session.Grou
 }
 
 // must be called holding cacheRecord mu
-func (sr *immutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
+func (sr *ImmutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
 	if !sr.isFinalized {
 		// if not finalized, there must be a mutable ref still around, return its mounts
 		// but set read-only
@@ -469,7 +451,7 @@ func (sr *immutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
 	return sr.viewMount, nil
 }
 
-func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr error) {
+func (sr *ImmutableRef) Extract(ctx context.Context, s session.Group) (rerr error) {
 	if !sr.getBlobOnly() {
 		return
 	}
@@ -499,7 +481,7 @@ func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr erro
 	return sr.extract(ctx, sr.descHandlers, s)
 }
 
-func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, s session.Group, f func()) error {
+func (sr *ImmutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, s session.Group, f func()) error {
 	dhs := sr.descHandlers
 	for _, r := range sr.parentRefChain() {
 		r := r
@@ -544,7 +526,7 @@ func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, 
 	return nil
 }
 
-func (sr *immutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s session.Group) error {
+func (sr *ImmutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s session.Group) error {
 	_, err := sr.sizeG.Do(ctx, sr.ID()+"-prepare-remote-snapshot", func(ctx context.Context) (_ interface{}, rerr error) {
 		dhs := sr.descHandlers
 		for _, r := range sr.parentRefChain() {
@@ -635,7 +617,7 @@ func makeTmpLabelsStargzMode(labels map[string]string, s session.Group) (fields 
 	return
 }
 
-func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session.Group) error {
+func (sr *ImmutableRef) extract(ctx context.Context, dhs DescHandlers, s session.Group) error {
 	_, err := sr.sizeG.Do(ctx, sr.ID()+"-extract", func(ctx context.Context) (_ interface{}, rerr error) {
 		snapshotID := sr.getSnapshotID()
 		if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
@@ -725,7 +707,11 @@ func (sr *immutableRef) extract(ctx context.Context, dhs DescHandlers, s session
 	return err
 }
 
-func (sr *immutableRef) Release(ctx context.Context) error {
+func (sr *ImmutableRef) Commit(ctx context.Context) (*ImmutableRef, error) {
+	return sr, nil
+}
+
+func (sr *ImmutableRef) Release(ctx context.Context) error {
 	sr.cm.mu.Lock()
 	defer sr.cm.mu.Unlock()
 
@@ -736,7 +722,7 @@ func (sr *immutableRef) Release(ctx context.Context) error {
 }
 
 // hold cacheRecord.mu lock before calling
-func (sr *immutableRef) release(ctx context.Context) error {
+func (sr *ImmutableRef) release(ctx context.Context) error {
 	delete(sr.immutableRefs, sr)
 
 	doUpdateLastUsed := sr.triggerLastUsed
@@ -759,14 +745,14 @@ func (sr *immutableRef) release(ctx context.Context) error {
 	return sr.cacheRecord.release(ctx, true)
 }
 
-func (sr *immutableRef) finalizeLocked(ctx context.Context) error {
+func (sr *ImmutableRef) finalizeLocked(ctx context.Context) error {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.finalize(ctx)
 }
 
 // caller must hold cacheRecord.mu
-func (sr *immutableRef) finalize(ctx context.Context) error {
+func (sr *ImmutableRef) finalize(ctx context.Context) error {
 	if sr.isFinalized {
 		return nil
 	}
@@ -797,7 +783,7 @@ func (sr *immutableRef) finalize(ctx context.Context) error {
 	return sr.commitMetadata()
 }
 
-func (sr *mutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
+func (sr *MutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 
@@ -818,7 +804,7 @@ func (sr *mutableRef) Mount(ctx context.Context, readonly bool, s session.Group)
 }
 
 // must be called holding cacheRecord mu
-func (sr *mutableRef) mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+func (sr *MutableRef) mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
 	m, err := sr.cm.Snapshotter.Mounts(ctx, sr.getSnapshotID())
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to mount %s", sr.ID())
@@ -829,7 +815,7 @@ func (sr *mutableRef) mount(ctx context.Context, readonly bool) (snapshot.Mounta
 	return m, nil
 }
 
-func (sr *mutableRef) Commit(ctx context.Context) (ImmutableRef, error) {
+func (sr *MutableRef) Commit(ctx context.Context) (*ImmutableRef, error) {
 	sr.cm.mu.Lock()
 	defer sr.cm.mu.Unlock()
 
@@ -838,7 +824,7 @@ func (sr *mutableRef) Commit(ctx context.Context) (ImmutableRef, error) {
 
 	rec := sr.cacheRecord
 
-	ir := &immutableRef{
+	ir := &ImmutableRef{
 		cacheRecord:  rec,
 		descHandlers: sr.descHandlers,
 	}
@@ -851,7 +837,7 @@ func (sr *mutableRef) Commit(ctx context.Context) (ImmutableRef, error) {
 	return ir, nil
 }
 
-func (sr *mutableRef) Release(ctx context.Context) error {
+func (sr *MutableRef) Release(ctx context.Context) error {
 	sr.cm.mu.Lock()
 	defer sr.cm.mu.Unlock()
 
@@ -862,7 +848,7 @@ func (sr *mutableRef) Release(ctx context.Context) error {
 }
 
 // hold cacheRecord.mu lock before calling
-func (sr *mutableRef) release(ctx context.Context) error {
+func (sr *MutableRef) release(ctx context.Context) error {
 	sr.mutableRef = nil
 
 	if sr.triggerLastUsed {

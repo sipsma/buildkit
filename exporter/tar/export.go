@@ -54,7 +54,7 @@ func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source,
 		}
 	}()
 
-	getDir := func(ctx context.Context, k string, ref cache.ImmutableRef) (*fsutil.Dir, error) {
+	getDir := func(ctx context.Context, k string, ref *cache.ImmutableRef) (*fsutil.Dir, error) {
 		var src string
 		var err error
 		var idmap *idtools.IdentityMapping

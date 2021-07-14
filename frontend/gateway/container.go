@@ -77,7 +77,7 @@ func NewContainer(ctx context.Context, w worker.Worker, sm *session.Manager, g s
 
 	name := fmt.Sprintf("container %s", req.ContainerID)
 	mm := mounts.NewMountManager(name, w.CacheManager(), sm)
-	p, err := PrepareMounts(ctx, mm, w.CacheManager(), g, "", mnts, refs, func(m *opspb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
+	p, err := PrepareMounts(ctx, mm, w.CacheManager(), g, "", mnts, refs, func(m *opspb.Mount, ref *cache.ImmutableRef) (*cache.MutableRef, error) {
 		cm := w.CacheManager()
 		if m.Input != opspb.Empty {
 			cm = refs[m.Input].Worker.CacheManager()
@@ -127,19 +127,19 @@ type MountRef struct {
 }
 
 type MountMutableRef struct {
-	Ref        cache.MutableRef
+	Ref cache.Ref
 	MountIndex int
 	NoCommit   bool
 }
 
-type MakeMutable func(m *opspb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error)
+type MakeMutable func(m *opspb.Mount, ref *cache.ImmutableRef) (*cache.MutableRef, error)
 
 func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manager, g session.Group, cwd string, mnts []*opspb.Mount, refs []*worker.WorkerRef, makeMutable MakeMutable) (p PreparedMounts, err error) {
 	// loop over all mounts, fill in mounts, root and outputs
 	for i, m := range mnts {
 		var (
 			mountable cache.Mountable
-			ref       cache.ImmutableRef
+			ref       *cache.ImmutableRef
 		)
 
 		if m.Dest == opspb.RootMount && m.MountType != opspb.MountType_BIND {
@@ -421,10 +421,9 @@ func addDefaultEnvvar(env []string, k, v string) []string {
 }
 
 func mountWithSession(m cache.Mountable, g session.Group) executor.Mount {
-	_, readonly := m.(cache.ImmutableRef)
 	return executor.Mount{
 		Src:      &mountable{m: m, g: g},
-		Readonly: readonly,
+		Readonly: false,
 	}
 }
 

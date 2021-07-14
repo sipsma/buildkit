@@ -182,7 +182,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 			}
 		}
 		if res.Refs != nil {
-			m := make(map[string]cache.ImmutableRef, len(res.Refs))
+			m := make(map[string]*cache.ImmutableRef, len(res.Refs))
 			for k, res := range res.Refs {
 				if res == nil {
 					m[k] = nil
