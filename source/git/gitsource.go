@@ -81,7 +81,7 @@ func (gs *gitSource) mountRemote(ctx context.Context, remote string, auth []stri
 		return "", nil, errors.Wrapf(err, "failed to search metadata for %s", redactCredentials(remote))
 	}
 
-	var remoteRef cache.MutableRef
+	var remoteRef *cache.MutableRef
 	for _, si := range sis {
 		remoteRef, err = gs.cache.GetMutable(ctx, si.ID())
 		if err != nil {
@@ -375,7 +375,7 @@ func (gs *gitSourceHandler) CacheKey(ctx context.Context, g session.Group, index
 	return sha, nil, true, nil
 }
 
-func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out cache.ImmutableRef, retErr error) {
+func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out *cache.ImmutableRef, retErr error) {
 	cacheKey := gs.cacheKey
 	if cacheKey == "" {
 		var err error

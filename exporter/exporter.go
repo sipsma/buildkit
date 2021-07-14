@@ -16,7 +16,7 @@ type ExporterInstance interface {
 }
 
 type Source struct {
-	Ref      cache.ImmutableRef
-	Refs     map[string]cache.ImmutableRef
+	Ref      *cache.ImmutableRef
+	Refs     map[string]*cache.ImmutableRef
 	Metadata map[string][]byte
 }

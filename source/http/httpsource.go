@@ -249,7 +249,7 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, g session.Group, inde
 	return hs.formatCacheKey(getFileName(hs.src.URL, hs.src.Filename, resp), dgst, resp.Header.Get("Last-Modified")).String(), nil, true, nil
 }
 
-func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s session.Group) (ref cache.ImmutableRef, dgst digest.Digest, retErr error) {
+func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s session.Group) (ref *cache.ImmutableRef, dgst digest.Digest, retErr error) {
 	newRef, err := hs.cache.New(ctx, nil, s, cache.CachePolicyRetain, cache.WithDescription(fmt.Sprintf("http url %s", hs.src.URL)))
 	if err != nil {
 		return nil, "", err
@@ -372,7 +372,7 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 	return ref, dgst, nil
 }
 
-func (hs *httpSourceHandler) Snapshot(ctx context.Context, g session.Group) (cache.ImmutableRef, error) {
+func (hs *httpSourceHandler) Snapshot(ctx context.Context, g session.Group) (*cache.ImmutableRef, error) {
 	if hs.refID != "" {
 		ref, err := hs.cache.Get(ctx, hs.refID)
 		if err == nil {

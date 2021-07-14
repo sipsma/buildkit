@@ -50,7 +50,7 @@ type ChecksumOpts struct {
 	ExcludePatterns []string
 }
 
-func Checksum(ctx context.Context, ref cache.ImmutableRef, path string, opts ChecksumOpts, s session.Group) (digest.Digest, error) {
+func Checksum(ctx context.Context, ref *cache.ImmutableRef, path string, opts ChecksumOpts, s session.Group) (digest.Digest, error) {
 	return getDefaultManager().Checksum(ctx, ref, path, opts, s)
 }
 
@@ -86,7 +86,7 @@ type cacheManager struct {
 	lruMu  sync.Mutex
 }
 
-func (cm *cacheManager) Checksum(ctx context.Context, ref cache.ImmutableRef, p string, opts ChecksumOpts, s session.Group) (digest.Digest, error) {
+func (cm *cacheManager) Checksum(ctx context.Context, ref *cache.ImmutableRef, p string, opts ChecksumOpts, s session.Group) (digest.Digest, error) {
 	if ref == nil {
 		if p == "/" {
 			return digest.FromBytes(nil), nil

@@ -77,7 +77,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 		return nil, errors.Errorf("number of platforms does not match references %d %d", len(p.Platforms), len(inp.Refs))
 	}
 
-	refs := make([]cache.ImmutableRef, 0, len(inp.Refs))
+	refs := make([]*cache.ImmutableRef, 0, len(inp.Refs))
 	remotesMap := make(map[string]int, len(inp.Refs))
 	for id, r := range inp.Refs {
 		remotesMap[id] = len(refs)
@@ -149,14 +149,14 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp exporter.Source, oci bool
 	return &idxDesc, nil
 }
 
-func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compression.Type, forceCompression bool, s session.Group, refs ...cache.ImmutableRef) ([]solver.Remote, error) {
+func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compression.Type, forceCompression bool, s session.Group, refs ...*cache.ImmutableRef) ([]solver.Remote, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 	layersDone := oneOffProgress(ctx, "exporting layers")
 
 	out := make([]solver.Remote, len(refs))
 
 	for i, ref := range refs {
-		func(i int, ref cache.ImmutableRef) {
+		func(i int, ref *cache.ImmutableRef) {
 			if ref == nil {
 				return
 			}
@@ -178,7 +178,7 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, compressionType compres
 	return out, nil
 }
 
-func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, ref cache.ImmutableRef, config []byte, remote *solver.Remote, oci bool, inlineCache []byte) (*ocispec.Descriptor, *ocispec.Descriptor, error) {
+func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, ref *cache.ImmutableRef, config []byte, remote *solver.Remote, oci bool, inlineCache []byte) (*ocispec.Descriptor, *ocispec.Descriptor, error) {
 	if len(config) == 0 {
 		var err error
 		config, err = emptyImageConfig()
@@ -389,7 +389,7 @@ func patchImageConfig(dt []byte, descs []ocispec.Descriptor, history []ocispec.H
 	return dt, errors.Wrap(err, "failed to marshal config after patch")
 }
 
-func normalizeLayersAndHistory(ctx context.Context, remote *solver.Remote, history []ocispec.History, ref cache.ImmutableRef, oci bool) (*solver.Remote, []ocispec.History) {
+func normalizeLayersAndHistory(ctx context.Context, remote *solver.Remote, history []ocispec.History, ref *cache.ImmutableRef, oci bool) (*solver.Remote, []ocispec.History) {
 	refMeta := getRefMetadata(ref, len(remote.Descriptors))
 
 	var historyLayers int
@@ -486,7 +486,7 @@ type refMetadata struct {
 	createdAt   *time.Time
 }
 
-func getRefMetadata(ref cache.ImmutableRef, limit int) []refMetadata {
+func getRefMetadata(ref *cache.ImmutableRef, limit int) []refMetadata {
 	if limit <= 0 {
 		return nil
 	}

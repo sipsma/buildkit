@@ -20,7 +20,7 @@ type RefManager struct {
 }
 
 func (rm *RefManager) Prepare(ctx context.Context, ref fileoptypes.Ref, readonly bool, g session.Group) (_ fileoptypes.Mount, rerr error) {
-	ir, ok := ref.(cache.ImmutableRef)
+	ir, ok := ref.(*cache.ImmutableRef)
 	if !ok && ref != nil {
 		return nil, errors.Errorf("invalid ref type: %T", ref)
 	}
@@ -72,7 +72,7 @@ func (rm *RefManager) Commit(ctx context.Context, mount fileoptypes.Mount) (file
 
 type Mount struct {
 	m        snapshot.Mountable
-	mr       cache.MutableRef
+	mr       *cache.MutableRef
 	readonly bool
 }
 

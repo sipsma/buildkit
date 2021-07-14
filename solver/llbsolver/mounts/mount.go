@@ -48,7 +48,7 @@ type MountManager struct {
 	managerName   string
 }
 
-func (mm *MountManager) getRefCacheDir(ctx context.Context, ref cache.ImmutableRef, id string, m *pb.Mount, sharing pb.CacheSharingOpt, s session.Group) (mref cache.MutableRef, err error) {
+func (mm *MountManager) getRefCacheDir(ctx context.Context, ref *cache.ImmutableRef, id string, m *pb.Mount, sharing pb.CacheSharingOpt, s session.Group) (mref *CacheRef, err error) {
 	g := &cacheRefGetter{
 		locker:          &mm.cacheMountsMu,
 		cacheMounts:     mm.cacheMounts,
@@ -71,7 +71,7 @@ type cacheRefGetter struct {
 	session         session.Group
 }
 
-func (g *cacheRefGetter) getRefCacheDir(ctx context.Context, ref cache.ImmutableRef, id string, sharing pb.CacheSharingOpt) (mref cache.MutableRef, err error) {
+func (g *cacheRefGetter) getRefCacheDir(ctx context.Context, ref *cache.ImmutableRef, id string, sharing pb.CacheSharingOpt) (*CacheRef, error) {
 	key := id
 	if ref != nil {
 		key += ":" + ref.ID()
@@ -83,30 +83,35 @@ func (g *cacheRefGetter) getRefCacheDir(ctx context.Context, ref cache.Immutable
 	if ref, ok := g.cacheMounts[key]; ok {
 		return ref.clone(), nil
 	}
-	defer func() {
-		if err == nil {
-			share := &cacheRefShare{MutableRef: mref, refs: map[*cacheRef]struct{}{}}
-			g.cacheMounts[key] = share
-			mref = share.clone()
-		}
-	}()
 
 	switch sharing {
 	case pb.CacheSharingOpt_SHARED:
-		return g.globalCacheRefs.get(key, func() (cache.MutableRef, error) {
+		return g.globalCacheRefs.get(key, func() (*cache.MutableRef, error) {
 			return g.getRefCacheDirNoCache(ctx, key, ref, id, false)
 		})
 	case pb.CacheSharingOpt_PRIVATE:
-		return g.getRefCacheDirNoCache(ctx, key, ref, id, false)
+		mref, err := g.getRefCacheDirNoCache(ctx, key, ref, id, false)
+		if err != nil {
+			return nil, err
+		}
+		share := &cacheRefShare{MutableRef: mref, refs: map[*CacheRef]struct{}{}}
+		g.cacheMounts[key] = share
+		return share.clone(), nil
 	case pb.CacheSharingOpt_LOCKED:
-		return g.getRefCacheDirNoCache(ctx, key, ref, id, true)
+		mref, err := g.getRefCacheDirNoCache(ctx, key, ref, id, true)
+		if err != nil {
+			return nil, err
+		}
+		share := &cacheRefShare{MutableRef: mref, refs: map[*CacheRef]struct{}{}}
+		g.cacheMounts[key] = share
+		return share.clone(), nil
 	default:
 		return nil, errors.Errorf("invalid cache sharing option: %s", sharing.String())
 	}
 }
 
-func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, ref cache.ImmutableRef, id string, block bool) (cache.MutableRef, error) {
-	makeMutable := func(ref cache.ImmutableRef) (cache.MutableRef, error) {
+func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, ref *cache.ImmutableRef, id string, block bool) (*cache.MutableRef, error) {
+	makeMutable := func(ref *cache.ImmutableRef) (*cache.MutableRef, error) {
 		return g.cm.New(ctx, ref, g.session, cache.WithRecordType(client.UsageRecordTypeCacheMount), cache.WithDescription(g.name), cache.CachePolicyRetain)
 	}
 
@@ -370,7 +375,7 @@ func (sm *secretMountInstance) IdentityMapping() *idtools.IdentityMapping {
 	return sm.idmap
 }
 
-func (mm *MountManager) MountableCache(ctx context.Context, m *pb.Mount, ref cache.ImmutableRef, g session.Group) (cache.MutableRef, error) {
+func (mm *MountManager) MountableCache(ctx context.Context, m *pb.Mount, ref *cache.ImmutableRef, g session.Group) (*CacheRef, error) {
 	if m.CacheOpt == nil {
 		return nil, errors.Errorf("missing cache mount options")
 	}
@@ -440,7 +445,7 @@ func CacheMountsLocker() sync.Locker {
 	return &sharedCacheRefs.mu
 }
 
-func (r *cacheRefs) get(key string, fn func() (cache.MutableRef, error)) (cache.MutableRef, error) {
+func (r *cacheRefs) get(key string, fn func() (*cache.MutableRef, error)) (*CacheRef, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -458,21 +463,21 @@ func (r *cacheRefs) get(key string, fn func() (cache.MutableRef, error)) (cache.
 		return nil, err
 	}
 
-	share = &cacheRefShare{MutableRef: mref, main: r, key: key, refs: map[*cacheRef]struct{}{}}
+	share = &cacheRefShare{MutableRef: mref, main: r, key: key, refs: map[*CacheRef]struct{}{}}
 	r.shares[key] = share
 	return share.clone(), nil
 }
 
 type cacheRefShare struct {
-	cache.MutableRef
+	*cache.MutableRef
 	mu   sync.Mutex
-	refs map[*cacheRef]struct{}
+	refs map[*CacheRef]struct{}
 	main *cacheRefs
 	key  string
 }
 
-func (r *cacheRefShare) clone() cache.MutableRef {
-	cacheRef := &cacheRef{cacheRefShare: r}
+func (r *cacheRefShare) clone() *CacheRef {
+	cacheRef := &CacheRef{cacheRefShare: r}
 	if cacheRefCloneHijack != nil {
 		cacheRefCloneHijack()
 	}
@@ -492,11 +497,11 @@ func (r *cacheRefShare) release(ctx context.Context) error {
 var cacheRefReleaseHijack func()
 var cacheRefCloneHijack func()
 
-type cacheRef struct {
+type CacheRef struct {
 	*cacheRefShare
 }
 
-func (r *cacheRef) Release(ctx context.Context) error {
+func (r *CacheRef) Release(ctx context.Context) error {
 	if r.main != nil {
 		r.main.mu.Lock()
 		defer r.main.mu.Unlock()

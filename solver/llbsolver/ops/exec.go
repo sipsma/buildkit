@@ -243,7 +243,7 @@ func (e *execOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		}
 	}
 
-	p, err := gateway.PrepareMounts(ctx, e.mm, e.cm, g, e.op.Meta.Cwd, e.op.Mounts, refs, func(m *pb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
+	p, err := gateway.PrepareMounts(ctx, e.mm, e.cm, g, e.op.Meta.Cwd, e.op.Mounts, refs, func(m *pb.Mount, ref *cache.ImmutableRef) (*cache.MutableRef, error) {
 		desc := fmt.Sprintf("mount %s from exec %s", m.Dest, strings.Join(e.op.Meta.Args, " "))
 		return e.cm.New(ctx, ref, g, cache.WithDescription(desc))
 	})
@@ -342,14 +342,14 @@ func (e *execOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 	}, nil)
 
 	for i, out := range p.OutputRefs {
-		if mutable, ok := out.Ref.(cache.MutableRef); ok {
+		if mutable, ok := out.Ref.(*cache.MutableRef); ok {
 			ref, err := mutable.Commit(ctx)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error committing %s", mutable.ID())
 			}
 			results = append(results, worker.NewWorkerRefResult(ref, e.w))
 		} else {
-			results = append(results, worker.NewWorkerRefResult(out.Ref.(cache.ImmutableRef), e.w))
+			results = append(results, worker.NewWorkerRefResult(out.Ref.(*cache.ImmutableRef), e.w))
 		}
 		// Prevent the result from being released.
 		p.OutputRefs[i].Ref = nil

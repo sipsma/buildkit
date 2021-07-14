@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func NewBusyboxSourceSnapshot(ctx context.Context, t *testing.T, w *base.Worker, sm *session.Manager) cache.ImmutableRef {
+func NewBusyboxSourceSnapshot(ctx context.Context, t *testing.T, w *base.Worker, sm *session.Manager) *cache.ImmutableRef {
 	img, err := source.NewImageIdentifier("docker.io/library/busybox:latest")
 	require.NoError(t, err)
 	src, err := w.SourceManager.Resolve(ctx, img, sm, nil)

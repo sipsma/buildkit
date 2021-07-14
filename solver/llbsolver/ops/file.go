@@ -176,7 +176,7 @@ func (f *fileOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 
 	outResults := make([]solver.Result, 0, len(outs))
 	for _, out := range outs {
-		outResults = append(outResults, worker.NewWorkerRefResult(out.(cache.ImmutableRef), f.w))
+		outResults = append(outResults, worker.NewWorkerRefResult(out.(*cache.ImmutableRef), f.w))
 	}
 
 	return outResults, nil
@@ -430,7 +430,7 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 			if err != nil && inpMount != nil {
 				inputRes := make([]solver.Result, len(inputs))
 				for i, input := range inputs {
-					inputRes[i] = worker.NewWorkerRefResult(input.(cache.ImmutableRef), s.w)
+					inputRes[i] = worker.NewWorkerRefResult(input.(*cache.ImmutableRef), s.w)
 				}
 
 				outputRes := make([]solver.Result, len(actions))
@@ -439,7 +439,7 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 				if !inpMount.Readonly() {
 					ref, cerr := s.r.Commit(ctx, inpMount)
 					if cerr == nil {
-						outputRes[idx-len(inputs)] = worker.NewWorkerRefResult(ref.(cache.ImmutableRef), s.w)
+						outputRes[idx-len(inputs)] = worker.NewWorkerRefResult(ref.(*cache.ImmutableRef), s.w)
 					}
 				}
 
@@ -448,7 +448,7 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 				if inpMountSecondary != nil && !inpMountSecondary.Readonly() {
 					ref2, cerr := s.r.Commit(ctx, inpMountSecondary)
 					if cerr == nil {
-						outputRes[int(action.SecondaryInput)-len(inputs)] = worker.NewWorkerRefResult(ref2.(cache.ImmutableRef), s.w)
+						outputRes[int(action.SecondaryInput)-len(inputs)] = worker.NewWorkerRefResult(ref2.(*cache.ImmutableRef), s.w)
 					}
 				}
 

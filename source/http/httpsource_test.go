@@ -300,7 +300,7 @@ func TestHTTPChecksum(t *testing.T) {
 
 }
 
-func readFile(ctx context.Context, ref cache.ImmutableRef, fp string) ([]byte, error) {
+func readFile(ctx context.Context, ref *cache.ImmutableRef, fp string) ([]byte, error) {
 	mount, err := ref.Mount(ctx, false, nil)
 	if err != nil {
 		return nil, err

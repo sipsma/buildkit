@@ -219,7 +219,7 @@ func (w *Worker) GCPolicy() []client.PruneInfo {
 	return w.WorkerOpt.GCPolicy
 }
 
-func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.ImmutableRef, error) {
+func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (*cache.ImmutableRef, error) {
 	var opts []cache.RefOption
 	if hidden {
 		opts = append(opts, cache.NoUpdateLastUsed)
@@ -366,7 +366,7 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 	}
 }
 
-func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cache.ImmutableRef, err error) {
+func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref *cache.ImmutableRef, err error) {
 	descHandler := &cache.DescHandler{
 		Provider: func(session.Group) content.Provider { return remote.Provider },
 		Progress: &controller.Controller{
@@ -378,7 +378,7 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 		descHandlers[desc.Digest] = descHandler
 	}
 
-	var current cache.ImmutableRef
+	var current *cache.ImmutableRef
 	for i, desc := range remote.Descriptors {
 		tm := time.Now()
 		if tmstr, ok := desc.Annotations[labelCreatedAt]; ok {
