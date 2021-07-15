@@ -265,7 +265,7 @@ func (e *execOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 				if active.NoCommit {
 					active.Ref.Release(context.TODO())
 				} else {
-					ref, cerr := active.Ref.Commit(ctx)
+					ref, cerr := active.Ref.ToImmutable(ctx)
 					if cerr != nil {
 						err = errors.Wrapf(err, "error committing %s: %s", active.Ref.ID(), cerr)
 						continue
@@ -343,7 +343,7 @@ func (e *execOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 
 	for i, out := range p.OutputRefs {
 		if mutable, ok := out.Ref.(*cache.MutableRef); ok {
-			ref, err := mutable.Commit(ctx)
+			ref, err := mutable.ToImmutable(ctx)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error committing %s", mutable.ID())
 			}

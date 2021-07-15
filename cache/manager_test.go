@@ -185,7 +185,7 @@ func TestManager(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
 
-	snap, err := active.Commit(ctx)
+	snap, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
@@ -204,7 +204,7 @@ func TestManager(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
 
-	snap, err = active.Commit(ctx)
+	snap, err = active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
@@ -241,7 +241,7 @@ func TestManager(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	snap3, err := active2.Commit(ctx)
+	snap3, err := active2.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	err = snap2.Release(ctx)
@@ -484,7 +484,7 @@ func TestExtractOnMutable(t *testing.T) {
 	active, err := cm.New(ctx, nil, nil)
 	require.NoError(t, err)
 
-	snap, err := active.Commit(ctx)
+	snap, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	b, desc, err := mapToBlob(map[string]string{"foo": "bar"}, true)
@@ -595,7 +595,7 @@ func TestSetBlob(t *testing.T) {
 	active, err := cm.New(ctx, nil, nil)
 	require.NoError(t, err)
 
-	snap, err := active.Commit(ctx)
+	snap, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	require.Equal(t, "", string(snap.getDiffID()))
@@ -636,7 +636,7 @@ func TestSetBlob(t *testing.T) {
 	active, err = cm.New(ctx, snap, nil)
 	require.NoError(t, err)
 
-	snap2, err := active.Commit(ctx)
+	snap2, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	b2, desc2, err := mapToBlob(map[string]string{"foo2": "bar2"}, true)
@@ -753,13 +753,13 @@ func TestPrune(t *testing.T) {
 	active, err := cm.New(ctx, nil, nil)
 	require.NoError(t, err)
 
-	snap, err := active.Commit(ctx)
+	snap, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	active, err = cm.New(ctx, snap, nil, CachePolicyRetain)
 	require.NoError(t, err)
 
-	snap2, err := active.Commit(ctx)
+	snap2, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
@@ -809,7 +809,7 @@ func TestPrune(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	snap2, err = active.Commit(ctx)
+	snap2, err = active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
@@ -846,7 +846,7 @@ func TestPrune(t *testing.T) {
 	require.Equal(t, 0, len(dirs))
 }
 
-func TestLazyCommit(t *testing.T) {
+func TestToImmutable(t *testing.T) {
 	t.Parallel()
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
@@ -869,8 +869,8 @@ func TestLazyCommit(t *testing.T) {
 	active, err := cm.New(ctx, nil, nil, CachePolicyRetain)
 	require.NoError(t, err)
 
-	// after commit mutable is locked
-	snap, err := active.Commit(ctx)
+	// after converting to immutable, mutable is locked
+	snap, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	_, err = cm.GetMutable(ctx, active.ID())
@@ -910,7 +910,7 @@ func TestLazyCommit(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, ErrLocked))
 
-	snap, err = active2.Commit(ctx)
+	snap, err = active2.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	// this time finalize commit
@@ -937,8 +937,8 @@ func TestLazyCommit(t *testing.T) {
 	active, err = cm.New(ctx, nil, nil, CachePolicyRetain)
 	require.NoError(t, err)
 
-	// after commit mutable is locked
-	snap, err = active.Commit(ctx)
+	// after converting to immutable, mutable is locked
+	snap, err = active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	err = cm.Close()
@@ -968,7 +968,7 @@ func TestLazyCommit(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, true, errors.Is(err, ErrLocked))
 
-	snap, err = active.Commit(ctx)
+	snap, err = active.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	err = cm.Close()
@@ -1002,7 +1002,7 @@ func TestLazyCommit(t *testing.T) {
 
 	active, err = cm.New(ctx, nil, nil, CachePolicyRetain)
 	require.NoError(t, err)
-	snap3, err := active.Commit(ctx)
+	snap3, err := active.ToImmutable(ctx)
 	require.NoError(t, err)
 	snap3ID := snap3.ID()
 

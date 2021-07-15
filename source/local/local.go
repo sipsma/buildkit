@@ -237,7 +237,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, s session.Group, cal
 		bklog.G(ctx).Debugf("saved %s as %s", mutable.ID(), sharedKey)
 	}
 
-	snap, err := mutable.Commit(ctx)
+	snap, err := mutable.ToImmutable(ctx)
 	if err != nil {
 		return nil, err
 	}

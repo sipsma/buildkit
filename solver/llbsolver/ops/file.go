@@ -435,7 +435,7 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 
 				outputRes := make([]solver.Result, len(actions))
 
-				// Commit the mutable for the primary input of the failed action.
+				// ToImmutable the mutable for the primary input of the failed action.
 				if !inpMount.Readonly() {
 					ref, cerr := s.r.Commit(ctx, inpMount)
 					if cerr == nil {

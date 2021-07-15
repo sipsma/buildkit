@@ -343,7 +343,7 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 	lm.Unmount()
 	lm = nil
 
-	ref, err = newRef.Commit(ctx)
+	ref, err = newRef.ToImmutable(ctx)
 	if err != nil {
 		return nil, "", err
 	}

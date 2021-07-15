@@ -32,7 +32,7 @@ func (sr *ImmutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
 		return errors.Errorf("missing lease requirement for computeBlobChain")
 	}
 
-	if err := sr.finalizeLocked(ctx); err != nil {
+	if err := sr.commitLocked(ctx); err != nil {
 		return err
 	}
 
@@ -189,7 +189,7 @@ func (sr *ImmutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 		return nil
 	}
 
-	if err := sr.finalize(ctx); err != nil {
+	if err := sr.commit(ctx); err != nil {
 		return err
 	}
 

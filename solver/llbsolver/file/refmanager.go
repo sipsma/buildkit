@@ -67,7 +67,7 @@ func (rm *RefManager) Commit(ctx context.Context, mount fileoptypes.Mount) (file
 	defer func() {
 		m.mr = nil
 	}()
-	return m.mr.Commit(ctx)
+	return m.mr.ToImmutable(ctx)
 }
 
 type Mount struct {

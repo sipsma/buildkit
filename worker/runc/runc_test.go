@@ -130,7 +130,7 @@ func TestRuncWorker(t *testing.T) {
 	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err)
 
-	rf, err := root.Commit(ctx)
+	rf, err := root.ToImmutable(ctx)
 	require.NoError(t, err)
 
 	mounts, err = rf.Mount(ctx, false, nil)

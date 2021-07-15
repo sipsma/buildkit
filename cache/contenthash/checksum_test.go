@@ -1022,7 +1022,7 @@ func createRef(t *testing.T, cm cache.Manager, files []string) *cache.ImmutableR
 	lm.Unmount()
 	require.NoError(t, err)
 
-	ref, err := mref.Commit(context.TODO())
+	ref, err := mref.ToImmutable(context.TODO())
 	require.NoError(t, err)
 
 	return ref

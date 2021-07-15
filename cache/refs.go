@@ -31,7 +31,7 @@ type Ref interface {
 	Mountable
 	Metadata
 	Release(context.Context) error
-	Commit(context.Context) (*ImmutableRef, error)
+	ToImmutable(context.Context) (*ImmutableRef, error)
 }
 
 type Mountable interface {
@@ -68,8 +68,8 @@ type cacheRecord struct {
 	// are set while mutableRef is set.
 	mutableRef *MutableRef
 
-	// isFinalized means the underlying snapshot has been committed to its driver
-	isFinalized bool
+	// isCommitted means the underlying snapshot has been committed to its driver
+	isCommitted bool
 
 	// dead means record is marked as deleted
 	dead bool
@@ -97,8 +97,8 @@ func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*Im
 
 // hold cacheRecord.mu lock before calling
 func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) (*MutableRef, error) {
-	if cr.isFinalized {
-		return nil, errors.Wrap(errInvalid, "cannot get mutable ref of finalized cache record")
+	if cr.isCommitted {
+		return nil, errors.Wrap(errInvalid, "cannot get mutable ref of committed cache record")
 	}
 	if cr.mutableRef != nil {
 		return nil, ErrLocked
@@ -416,8 +416,8 @@ func (sr *ImmutableRef) Mount(ctx context.Context, readonly bool, s session.Grou
 
 // must be called holding cacheRecord mu
 func (sr *ImmutableRef) mount(ctx context.Context) (snapshot.Mountable, error) {
-	if !sr.isFinalized {
-		// if not finalized, there must be a mutable ref still around, return its mounts
+	if !sr.isCommitted {
+		// if not committed, there must be a mutable ref still around, return its mounts
 		// but set read-only
 		m, err := sr.cm.Snapshotter.Mounts(ctx, sr.getSnapshotID())
 		if err != nil {
@@ -707,7 +707,7 @@ func (sr *ImmutableRef) extract(ctx context.Context, dhs DescHandlers, s session
 	return err
 }
 
-func (sr *ImmutableRef) Commit(ctx context.Context) (*ImmutableRef, error) {
+func (sr *ImmutableRef) ToImmutable(ctx context.Context) (*ImmutableRef, error) {
 	return sr, nil
 }
 
@@ -745,20 +745,20 @@ func (sr *ImmutableRef) release(ctx context.Context) error {
 	return sr.cacheRecord.release(ctx, true)
 }
 
-func (sr *ImmutableRef) finalizeLocked(ctx context.Context) error {
+func (sr *ImmutableRef) commitLocked(ctx context.Context) error {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-	return sr.finalize(ctx)
+	return sr.commit(ctx)
 }
 
 // caller must hold cacheRecord.mu
-func (sr *ImmutableRef) finalize(ctx context.Context) error {
-	if sr.isFinalized {
+func (sr *ImmutableRef) commit(ctx context.Context) error {
+	if sr.isCommitted {
 		return nil
 	}
 	if sr.mutableRef != nil {
 		// can't commit the snapshot if someone still has an open mutable ref to it
-		return errors.Wrap(ErrLocked, "cannot finalize record with open mutable ref")
+		return errors.Wrap(ErrLocked, "cannot commit record with open mutable ref")
 	}
 
 	if err := sr.cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: sr.ID()}, leases.Resource{
@@ -774,7 +774,7 @@ func (sr *ImmutableRef) finalize(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to commit %s", sr.getSnapshotID())
 	}
 
-	sr.isFinalized = true
+	sr.isCommitted = true
 	sr.queueSnapshotID(sr.ID())
 
 	// If there is a hard-crash here, the old snapshot id written to metadata is no longer valid, but
@@ -815,7 +815,7 @@ func (sr *MutableRef) mount(ctx context.Context, readonly bool) (snapshot.Mounta
 	return m, nil
 }
 
-func (sr *MutableRef) Commit(ctx context.Context) (*ImmutableRef, error) {
+func (sr *MutableRef) ToImmutable(ctx context.Context) (*ImmutableRef, error) {
 	sr.cm.mu.Lock()
 	defer sr.cm.mu.Unlock()
 
