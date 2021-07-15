@@ -572,7 +572,7 @@ func (gs *gitSourceHandler) Snapshot(ctx context.Context, g session.Group) (out 
 	lm.Unmount()
 	lm = nil
 
-	snap, err := checkoutRef.Commit(ctx)
+	snap, err := checkoutRef.ToImmutable(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -144,7 +144,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		chainID = imagespecidentity.ChainID([]digest.Digest{p.getChainID(), chainID})
 		blobChainID = imagespecidentity.ChainID([]digest.Digest{p.getBlobChainID(), blobChainID})
 
-		if err := p.finalizeLocked(ctx); err != nil {
+		if err := p.commitLocked(ctx); err != nil {
 			p.Release(context.TODO())
 			return nil, err
 		}
@@ -254,7 +254,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		immutableRefs: make(map[*ImmutableRef]struct{}),
 		parent:        p,
 		cacheMetadata: md,
-		isFinalized:   true,
+		isCommitted:   true,
 	}
 
 	if err := initializeMetadata(rec.cacheMetadata, parentID, opts...); err != nil {
@@ -465,8 +465,8 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		return nil, errors.Wrapf(err, "failed to append image ref metadata to ref %s", rec.ID())
 	}
 
-	rec.isFinalized = rec.getBlobOnly()
-	if !rec.isFinalized {
+	rec.isCommitted = rec.getBlobOnly()
+	if !rec.isCommitted {
 		var info snapshots.Info
 		var err error
 		if info, err = rec.cm.Snapshotter.Stat(ctx, rec.getSnapshotID()); errdefs.IsNotFound(err) && rec.ID() != rec.getSnapshotID() {
@@ -482,7 +482,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to stat snapshot for ref %s", rec.ID())
 		}
-		rec.isFinalized = info.Kind == snapshots.KindCommitted
+		rec.isCommitted = info.Kind == snapshots.KindCommitted
 	}
 
 	cm.records[id] = rec
@@ -500,7 +500,7 @@ func (cm *cacheManager) New(ctx context.Context, p *ImmutableRef, sess session.G
 	var parentSnapshotID string
 	if p != nil {
 		parent = p.Clone()
-		if err := parent.finalizeLocked(ctx); err != nil {
+		if err := parent.commitLocked(ctx); err != nil {
 			return nil, err
 		}
 		if err := parent.Extract(ctx, sess); err != nil {
@@ -708,7 +708,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 			c := &client.UsageInfo{
 				ID:         cr.ID(),
-				Mutable:    !cr.isFinalized,
+				Mutable:    !cr.isCommitted,
 				RecordType: recordType,
 				Shared:     shared,
 			}
@@ -798,7 +798,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 		c := client.UsageInfo{
 			ID:          cr.ID(),
-			Mutable:     !cr.isFinalized,
+			Mutable:     !cr.isCommitted,
 			InUse:       cr.refCount() > 0,
 			Size:        cr.getSize(),
 			CreatedAt:   cr.GetCreatedAt(),
@@ -895,7 +895,7 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 		usageCount, lastUsedAt := cr.getLastUsed()
 		c := &cacheUsageInfo{
 			refs:        cr.refCount(),
-			mutable:     !cr.isFinalized,
+			mutable:     !cr.isCommitted,
 			size:        cr.getSize(),
 			createdAt:   cr.GetCreatedAt(),
 			usageCount:  usageCount,
