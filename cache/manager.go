@@ -19,7 +19,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/flightcontrol"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -520,17 +520,10 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
 	}
 
-	if cm.Snapshotter.Name() == "stargz" && parent != nil {
-		if rerr := parent.withRemoteSnapshotLabelsStargzMode(ctx, sess, func() {
-			err = cm.Snapshotter.Prepare(ctx, id, parentSnapshotID)
-		}); rerr != nil {
-			return nil, rerr
+	if parent != nil {
+		if err := cm.Snapshotter.Prepare(ctx, id, parentSnapshotID); err != nil {
+			return nil, errors.Wrapf(err, "failed to prepare parent %s", id)
 		}
-	} else {
-		err = cm.Snapshotter.Prepare(ctx, id, parentSnapshotID)
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to prepare %s", id)
 	}
 
 	md, _ := cm.md.Get(id)

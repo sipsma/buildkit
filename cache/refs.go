@@ -22,7 +22,7 @@ import (
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/winlayers"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -451,20 +451,6 @@ func (sr *immutableRef) Mount(ctx context.Context, readonly bool, s session.Grou
 
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-
-	if sr.cm.Snapshotter.Name() == "stargz" {
-		var (
-			m    snapshot.Mountable
-			rerr error
-		)
-		if err := sr.withRemoteSnapshotLabelsStargzMode(ctx, s, func() {
-			m, rerr = sr.mount(ctx, readonly)
-		}); err != nil {
-			return nil, err
-		}
-		return m, rerr
-	}
-
 	return sr.mount(ctx, readonly)
 }
 
@@ -484,63 +470,12 @@ func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr erro
 	}
 
 	if sr.cm.Snapshotter.Name() == "stargz" {
-		if err := sr.withRemoteSnapshotLabelsStargzMode(ctx, s, func() {
-			if rerr = sr.prepareRemoteSnapshotsStargzMode(ctx, s); rerr != nil {
-				return
-			}
-			rerr = sr.extract(ctx, sr.descHandlers, s)
-		}); err != nil {
+		if err := sr.prepareRemoteSnapshotsStargzMode(ctx, s); err != nil {
 			return err
 		}
-		return rerr
 	}
 
 	return sr.extract(ctx, sr.descHandlers, s)
-}
-
-func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, s session.Group, f func()) error {
-	dhs := sr.descHandlers
-	for _, r := range sr.parentRefChain() {
-		r := r
-		info, err := r.cm.Snapshotter.Stat(ctx, getSnapshotID(r.md))
-		if err != nil && !errdefs.IsNotFound(err) {
-			return err
-		} else if errdefs.IsNotFound(err) {
-			continue // This snpashot doesn't exist; skip
-		} else if _, ok := info.Labels["containerd.io/snapshot/remote"]; !ok {
-			continue // This isn't a remote snapshot; skip
-		}
-		desc, err := r.ociDesc()
-		if err != nil {
-			return err
-		}
-		dh := dhs[desc.Digest]
-		if dh == nil {
-			continue // no info passed; skip
-		}
-
-		// Append temporary labels (based on dh.SnapshotLabels) as hints for remote snapshots.
-		// For avoiding collosion among calls, keys of these tmp labels contain an unique ID.
-		flds, labels := makeTmpLabelsStargzMode(snapshots.FilterInheritedLabels(dh.SnapshotLabels), s)
-		info.Labels = labels
-		if _, err := r.cm.Snapshotter.Update(ctx, info, flds...); err != nil {
-			return errors.Wrapf(err, "failed to add tmp remote labels for remote snapshot")
-		}
-		defer func() {
-			for k := range info.Labels {
-				info.Labels[k] = "" // Remove labels appended in this call
-			}
-			if _, err := r.cm.Snapshotter.Update(ctx, info, flds...); err != nil {
-				logrus.Warn(errors.Wrapf(err, "failed to remove tmp remote labels"))
-			}
-		}()
-
-		continue
-	}
-
-	f()
-
-	return nil
 }
 
 func (sr *immutableRef) prepareRemoteSnapshotsStargzMode(ctx context.Context, s session.Group) error {
@@ -889,20 +824,6 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 func (sr *mutableRef) Mount(ctx context.Context, readonly bool, s session.Group) (snapshot.Mountable, error) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-
-	if sr.cm.Snapshotter.Name() == "stargz" && sr.parent != nil {
-		var (
-			m    snapshot.Mountable
-			rerr error
-		)
-		if err := sr.parent.withRemoteSnapshotLabelsStargzMode(ctx, s, func() {
-			m, rerr = sr.mount(ctx, readonly)
-		}); err != nil {
-			return nil, err
-		}
-		return m, rerr
-	}
-
 	return sr.mount(ctx, readonly)
 }
 
