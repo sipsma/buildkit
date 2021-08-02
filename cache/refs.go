@@ -35,7 +35,6 @@ type Ref interface {
 
 type ImmutableRef interface {
 	Ref
-	Parent() ImmutableRef
 	Clone() ImmutableRef
 
 	Extract(ctx context.Context, s session.Group) error // +progress
@@ -317,17 +316,6 @@ func (sr *immutableRef) clone(triggerLastUsed bool) ImmutableRef {
 	return ir2
 }
 
-func (sr *immutableRef) Parent() ImmutableRef {
-	p := sr.parent
-	if p == nil {
-		return nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.clone(true)
-}
-
 func (cr *cacheRecord) ociDesc() (ocispec.Descriptor, error) {
 	dgst := cr.getBlob()
 	if dgst == "" {
@@ -353,6 +341,10 @@ func (cr *cacheRecord) ociDesc() (ocispec.Descriptor, error) {
 			return ocispec.Descriptor{}, err
 		}
 		desc.Annotations["buildkit/createdat"] = string(createdAt)
+	}
+
+	if description := cr.GetDescription(); description != "" {
+		desc.Annotations["buildkit/description"] = description
 	}
 
 	return desc, nil
@@ -594,7 +586,7 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 		if cr.mountCache != nil {
 			return nil, nil
 		}
-	
+
 		eg, egctx := errgroup.WithContext(ctx)
 
 		if cr.parent != nil {
