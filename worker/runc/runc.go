@@ -99,8 +99,8 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 	for k, v := range labels {
 		xlabels[k] = v
 	}
-	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap)
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap, lm)
 
 	opt = base.WorkerOpt{
 		ID:                id,

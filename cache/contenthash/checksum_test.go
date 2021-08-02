@@ -21,7 +21,7 @@ import (
 	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/util/leaseutil"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
@@ -1038,9 +1038,11 @@ func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snap
 		snapshotterName: snapshotter,
 	})
 
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter(snapshotterName, containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter(snapshotterName)), nil),
-		LeaseManager:      leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
+		Snapshotter:       snapshot.FromContainerdSnapshotter(snapshotterName, containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter(snapshotterName)), nil, lm),
+		LeaseManager:      lm,
 		ContentStore:      mdb.ContentStore(),
 		GarbageCollect:    mdb.GarbageCollect,
 		MetadataStoreRoot: tmpdir,

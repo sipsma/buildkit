@@ -437,9 +437,11 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 		"native": snapshotter,
 	})
 
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
-		LeaseManager:      leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
+		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm),
+		LeaseManager:      lm,
 		ContentStore:      mdb.ContentStore(),
 		GarbageCollect:    mdb.GarbageCollect,
 		MetadataStoreRoot: tmpdir,

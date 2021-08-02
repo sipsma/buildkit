@@ -239,10 +239,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispec.Descriptor, 
 		}
 	}()
 
-	if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, l, leases.Resource{
-		ID:   snapshotID,
-		Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-	}); err != nil {
+	if err := cm.Snapshotter.AddLease(ctx, l.ID, snapshotID); err != nil {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
 	}
 
@@ -326,10 +323,7 @@ func (cm *cacheManager) init(ctx context.Context) error {
 					toRemove[md.ID()] = true
 					continue
 				}
-				if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: md.ID()}, leases.Resource{
-					ID:   emMd.ID(),
-					Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-				}); err != nil && !errors.Is(err, errdefs.ErrAlreadyExists) {
+				if err := cm.Snapshotter.AddLease(ctx, md.ID(), emMd.ID()); err != nil {
 					logrus.Debugf("failed to add snapshot %s to lease: %+v", emMd.ID(), err)
 					toRemove[md.ID()] = true
 					continue
@@ -479,22 +473,11 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 
 	rec.isFinalized = rec.getBlobOnly()
 	if !rec.isFinalized {
-		var info snapshots.Info
-		var err error
-		if info, err = rec.cm.Snapshotter.Stat(ctx, rec.getSnapshotID()); errdefs.IsNotFound(err) && rec.ID() != rec.getSnapshotID() {
-			// If there was a crash during a call to finalize, the snapshot ID could get out of sync, so check for a
-			// snapshot with the record's ID, which is what's switched to during finalize.
-			if info, err = rec.cm.Snapshotter.Stat(ctx, rec.ID()); err == nil {
-				rec.queueSnapshotID(rec.ID())
-				if err := rec.commitMetadata(); err != nil {
-					return nil, errors.Wrapf(err, "failed to correct snapshot id metadata for ref %s", rec.ID())
-				}
-			}
-		}
-		if err != nil {
+		if info, err := rec.cm.Snapshotter.Stat(ctx, rec.getSnapshotID()); err != nil {
 			return nil, errors.Wrapf(err, "failed to stat snapshot for ref %s", rec.ID())
+		} else {
+			rec.isFinalized = info.Kind == snapshots.KindCommitted
 		}
-		rec.isFinalized = info.Kind == snapshots.KindCommitted
 	}
 
 	cm.records[id] = rec
@@ -558,16 +541,12 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 	}()
 
 	snapshotID := identity.NewID()
-	opts = append(opts, withSnapshotID(snapshotID))
-	if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, l, leases.Resource{
-		ID:   snapshotID,
-		Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-	}); err != nil {
+	if err := cm.Snapshotter.AddLease(ctx, l.ID, snapshotID); err != nil {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", snapshotID)
 	}
 
 	if cm.Snapshotter.Name() == "stargz" && parent != nil {
-		if rerr := parent.withRemoteSnapshotLabelsStargzMode(ctx, sess, func() {
+		if rerr := parent.withRemoteSnapshotLabelsStargzMode(ctx, parent.descHandlers, sess, func() {
 			err = cm.Snapshotter.Prepare(ctx, snapshotID, parentSnapshotID)
 		}); rerr != nil {
 			return nil, rerr
@@ -576,7 +555,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		err = cm.Snapshotter.Prepare(ctx, snapshotID, parentSnapshotID)
 	}
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to prepare %s", id)
+		return nil, errors.Wrapf(err, "failed to prepare %s", parentSnapshotID)
 	}
 
 	md, _ := cm.getMetadata(id)
@@ -588,6 +567,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		immutableRefs: make(map[*immutableRef]struct{}),
 	}
 
+	opts = append(opts, withSnapshotID(snapshotID))
 	if err := initializeMetadata(rec.cacheMetadata, parentID, opts...); err != nil {
 		return nil, err
 	}
@@ -659,10 +639,7 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOp
 		}
 	}()
 
-	if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, l, leases.Resource{
-		ID:   snapshotID,
-		Type: "snapshots/" + cm.ManagerOpt.Snapshotter.Name(),
-	}); err != nil {
+	if err := cm.Snapshotter.AddLease(ctx, l.ID, snapshotID); err != nil {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", snapshotID)
 	}
 

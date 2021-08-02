@@ -107,12 +107,12 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		return nil, nil, err
 	}
 
-	lm := ctdmetadata.NewLeaseManager(mdb)
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		Snapshotter:       snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm),
 		ContentStore:      mdb.ContentStore(),
-		LeaseManager:      leaseutil.WithNamespace(lm, ns),
+		LeaseManager:      lm,
 		GarbageCollect:    mdb.GarbageCollect,
 		Applier:           apply.NewFileSystemApplier(mdb.ContentStore()),
 		MetadataStoreRoot: tmpdir,

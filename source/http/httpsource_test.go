@@ -19,7 +19,7 @@ import (
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/testutil/httpserver"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 )
@@ -341,9 +341,11 @@ func newHTTPSource(tmpdir string) (source.Source, error) {
 		"native": snapshotter,
 	})
 
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil),
-		LeaseManager:      leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit"),
+		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm),
+		LeaseManager:      lm,
 		ContentStore:      mdb.ContentStore(),
 		GarbageCollect:    mdb.GarbageCollect,
 		MetadataStoreRoot: tmpdir,

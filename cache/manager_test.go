@@ -111,12 +111,12 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		return nil, nil, err
 	}
 
-	lm := ctdmetadata.NewLeaseManager(mdb)
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
 
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		Snapshotter:       snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm),
 		ContentStore:      mdb.ContentStore(),
-		LeaseManager:      leaseutil.WithNamespace(lm, ns),
+		LeaseManager:      lm,
 		GarbageCollect:    mdb.GarbageCollect,
 		Applier:           apply.NewFileSystemApplier(mdb.ContentStore()),
 		MetadataStoreRoot: tmpdir,
@@ -627,7 +627,6 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc.MediaType, snapRef.getMediaType())
 	require.Equal(t, snapRef.getDiffID(), snapRef.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(desc.Digest+" "+snapRef.getDiffID())), snapRef.getBlobChainID())
-	require.Equal(t, snap.ID(), snapRef.getSnapshotID())
 	require.Equal(t, !snapRef.getBlobOnly(), true)
 
 	active, err = cm.New(ctx, snap, nil)
@@ -651,7 +650,6 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc2.MediaType, snapRef2.getMediaType())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef2.getDiffID())), snapRef2.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc2.Digest+" "+snapRef2.getDiffID())))), snapRef2.getBlobChainID())
-	require.Equal(t, snap2.ID(), snapRef2.getSnapshotID())
 	require.Equal(t, !snapRef2.getBlobOnly(), true)
 
 	b3, desc3, err := mapToBlob(map[string]string{"foo3": "bar3"}, true)
@@ -669,7 +667,6 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc3.MediaType, snapRef3.getMediaType())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef3.getDiffID())), snapRef3.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc3.Digest+" "+snapRef3.getDiffID())))), snapRef3.getBlobChainID())
-	require.Equal(t, string(snapRef3.getChainID()), snapRef3.getSnapshotID())
 	require.Equal(t, !snapRef3.getBlobOnly(), false)
 
 	// snap4 is same as snap2
@@ -715,7 +712,6 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc6.Digest, snapRef6.getBlob())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getChainID()+" "+snapRef6.getDiffID())), snapRef6.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getBlobChainID()+" "+digest.FromBytes([]byte(snapRef6.getBlob()+" "+snapRef6.getDiffID())))), snapRef6.getBlobChainID())
-	require.Equal(t, string(snapRef6.getChainID()), snapRef6.getSnapshotID())
 	require.Equal(t, !snapRef6.getBlobOnly(), false)
 
 	_, err = cm.GetByBlob(ctx, ocispec.Descriptor{
@@ -997,6 +993,7 @@ func TestLazyCommit(t *testing.T) {
 	snap2, err = cm.Get(ctx, snap.ID())
 	require.NoError(t, err)
 	snap2ID := snap2.ID()
+	snap2SnapshotID := snap2.(*immutableRef).getSnapshotID()
 
 	err = snap2.(*immutableRef).finalizeLocked(ctx)
 	require.NoError(t, err)
@@ -1048,7 +1045,7 @@ func TestLazyCommit(t *testing.T) {
 
 	require.Equal(t, "", snap3.(*immutableRef).getEqualMutable())
 	require.Equal(t, "foo", snap3.GetDescription())
-	require.Equal(t, snap2ID, snap3.(*immutableRef).getSnapshotID())
+	require.Equal(t, snap2SnapshotID, snap3.(*immutableRef).getSnapshotID())
 }
 
 func checkDiskUsage(ctx context.Context, t *testing.T, cm Manager, inuse, unused int) {
