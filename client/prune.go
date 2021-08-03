@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"io"
+	"strings"
 	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -42,7 +43,7 @@ func (c *Client) Prune(ctx context.Context, ch chan UsageInfo, opts ...PruneOpti
 				Mutable:     d.Mutable,
 				InUse:       d.InUse,
 				Size:        d.Size_,
-				Parent:      d.Parent,
+				Parents:     strings.Split(d.Parent, ","),
 				CreatedAt:   d.CreatedAt,
 				Description: d.Description,
 				UsageCount:  int(d.UsageCount),

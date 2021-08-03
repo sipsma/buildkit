@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,7 +110,7 @@ func (c *Controller) DiskUsage(ctx context.Context, r *controlapi.DiskUsageReque
 				Mutable:     r.Mutable,
 				InUse:       r.InUse,
 				Size_:       r.Size,
-				Parent:      r.Parent,
+				Parent:      strings.Join(r.Parents, ","),
 				UsageCount:  int64(r.UsageCount),
 				Description: r.Description,
 				CreatedAt:   r.CreatedAt,
@@ -177,7 +178,7 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 				Mutable:     r.Mutable,
 				InUse:       r.InUse,
 				Size_:       r.Size,
-				Parent:      r.Parent,
+				Parent:      strings.Join(r.Parents, ","),
 				UsageCount:  int64(r.UsageCount),
 				Description: r.Description,
 				CreatedAt:   r.CreatedAt,

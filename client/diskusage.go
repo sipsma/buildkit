@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -18,7 +19,7 @@ type UsageInfo struct {
 	CreatedAt   time.Time
 	LastUsedAt  *time.Time
 	UsageCount  int
-	Parent      string
+	Parents     []string
 	Description string
 	RecordType  UsageRecordType
 	Shared      bool
@@ -44,7 +45,7 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 			Mutable:     d.Mutable,
 			InUse:       d.InUse,
 			Size:        d.Size_,
-			Parent:      d.Parent,
+			Parents:     strings.Split(d.Parent, ","),
 			CreatedAt:   d.CreatedAt,
 			Description: d.Description,
 			UsageCount:  int(d.UsageCount),

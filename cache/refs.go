@@ -63,7 +63,7 @@ type cacheRecord struct {
 
 	mutable bool
 	refs    map[ref]struct{}
-	parent  *immutableRef
+	parentRefs
 	*cacheMetadata
 
 	// dead means record is marked as deleted
@@ -77,7 +77,7 @@ type cacheRecord struct {
 	equalMutable   *mutableRef
 	equalImmutable *immutableRef
 
-	parentChainCache []digest.Digest
+	layerDigestChainCache []digest.Digest
 }
 
 // hold ref lock before calling
@@ -102,24 +102,97 @@ func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) *mu
 	return ref
 }
 
-func (cr *cacheRecord) parentChain() []digest.Digest {
-	if cr.parentChainCache != nil {
-		return cr.parentChainCache
-	}
-	blob := cr.getBlob()
-	if blob == "" {
-		return nil
-	}
+type parentKind int
 
-	var parent []digest.Digest
-	if cr.parent != nil {
-		parent = cr.parent.parentChain()
+const (
+	None parentKind = iota
+	Layer
+	Merge
+)
+
+type parentRefs struct {
+	// layerParent and mergeParents are mutually exclusive, at most one at a time should be set non-nil
+	layerParent  *immutableRef
+	mergeParents []*immutableRef
+}
+
+func (p parentRefs) parentKind() parentKind {
+	if len(p.mergeParents) > 0 {
+		return Merge
 	}
-	pcc := make([]digest.Digest, len(parent)+1)
-	copy(pcc, parent)
-	pcc[len(parent)] = digest.Digest(blob)
-	cr.parentChainCache = pcc
-	return pcc
+	if p.layerParent != nil {
+		return Layer
+	}
+	return None
+}
+
+// caller must hold cacheManager.mu
+func (p parentRefs) release(ctx context.Context) error {
+	switch p.parentKind() {
+	case Layer:
+		p.layerParent.mu.Lock()
+		defer p.layerParent.mu.Unlock()
+		return p.layerParent.release(ctx)
+	case Merge:
+		for _, parent := range p.mergeParents {
+			parent.mu.Lock()
+			if err := parent.release(ctx); err != nil {
+				parent.mu.Unlock()
+				return err
+			}
+			parent.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+func (p parentRefs) clone() parentRefs {
+	switch p.parentKind() {
+	case Layer:
+		p.layerParent = p.layerParent.clone()
+	case Merge:
+		var newParents []*immutableRef
+		for _, p := range p.mergeParents {
+			newParents = append(newParents, p.clone())
+		}
+		p.mergeParents = newParents
+	}
+	return p
+}
+
+// order is from parent->child, cr will be at end of slice
+func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
+	switch cr.parentKind() {
+	case Merge:
+		for _, parent := range cr.mergeParents {
+			layers = append(layers, parent.layerChain()...)
+		}
+		return layers
+	case Layer:
+		layers = append(layers, cr.layerParent.layerChain()...)
+		fallthrough
+	case None:
+		layers = append(layers, cr)
+		return layers
+	}
+	return nil
+}
+
+// hold cacheRecord.mu lock before calling
+func (cr *cacheRecord) layerDigestChain() []digest.Digest {
+	if cr.layerDigestChainCache != nil {
+		return cr.layerDigestChainCache
+	}
+	var dgsts []digest.Digest
+	for _, layer := range cr.layerChain() {
+		dgst := layer.getBlob()
+		if dgst == "" {
+			return nil
+		}
+		dgsts = append(dgsts, dgst)
+	}
+	cr.layerDigestChainCache = dgsts
+	return dgsts
 }
 
 // hold ref lock before calling
@@ -127,13 +200,38 @@ func (cr *cacheRecord) isDead() bool {
 	return cr.dead || (cr.equalImmutable != nil && cr.equalImmutable.dead) || (cr.equalMutable != nil && cr.equalMutable.dead)
 }
 
-// order is from parent->child, cr will be at end of slice
-func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
-	if cr.parent != nil {
-		layers = append(layers, cr.parent.layerChain()...)
+var errSkipWalk = errors.New("skip")
+
+func (cr *cacheRecord) walkRecords(f func(*cacheRecord) error) error {
+	curs := []*cacheRecord{cr}
+	for len(curs) > 0 {
+		cur := curs[len(curs)-1]
+		curs = curs[:len(curs)-1]
+		if err := f(cur); err != nil {
+			if errors.Is(err, errSkipWalk) {
+				continue
+			}
+			return err
+		}
+		if cur.layerParent != nil {
+			curs = append(curs, cur.layerParent.cacheRecord)
+		}
+		for _, p := range cur.mergeParents {
+			curs = append(curs, p.cacheRecord)
+		}
 	}
-	layers = append(layers, cr)
-	return layers
+	return nil
+}
+
+func (cr *cacheRecord) walkUniqueRecords(f func(*cacheRecord) error) error {
+	memo := make(map[*cacheRecord]struct{})
+	return cr.walkRecords(func(cr *cacheRecord) error {
+		if _, ok := memo[cr]; ok {
+			return errSkipWalk
+		}
+		memo[cr] = struct{}{}
+		return f(cr)
+	})
 }
 
 func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
@@ -188,11 +286,9 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 			driverID = cr.equalMutable.getSnapshotID()
 		}
 		cr.mu.Unlock()
-		var usage snapshots.Usage
+		var totalSize int64
 		if !cr.getBlobOnly() {
-			var err error
-			usage, err = cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID)
-			if err != nil {
+			if usage, err := cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID); err != nil {
 				cr.mu.Lock()
 				isDead := cr.isDead()
 				cr.mu.Unlock()
@@ -202,12 +298,14 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 				if !errors.Is(err, errdefs.ErrNotFound) {
 					return s, errors.Wrapf(err, "failed to get usage for %s", cr.ID())
 				}
+			} else {
+				totalSize += usage.Size
 			}
 		}
 		if dgst := cr.getBlob(); dgst != "" {
 			info, err := cr.cm.ContentStore.Info(ctx, digest.Digest(dgst))
 			if err == nil {
-				usage.Size += info.Size
+				totalSize += info.Size
 			}
 			for k, v := range info.Labels {
 				// accumulate size of compression variant blobs
@@ -218,20 +316,20 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 							continue
 						}
 						if info, err := cr.cm.ContentStore.Info(ctx, cdgst); err == nil {
-							usage.Size += info.Size
+							totalSize += info.Size
 						}
 					}
 				}
 			}
 		}
 		cr.mu.Lock()
-		cr.queueSize(usage.Size)
+		cr.queueSize(totalSize)
 		if err := cr.commitMetadata(); err != nil {
 			cr.mu.Unlock()
 			return s, err
 		}
 		cr.mu.Unlock()
-		return usage.Size, nil
+		return totalSize, nil
 	})
 	if err != nil {
 		return 0, err
@@ -239,27 +337,9 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 	return s.(int64), nil
 }
 
-func (cr *cacheRecord) parentRef(hidden bool, descHandlers DescHandlers) *immutableRef {
-	p := cr.parent
-	if p == nil {
-		return nil
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.ref(hidden, descHandlers)
-}
-
 // call when holding the manager lock
 func (cr *cacheRecord) remove(ctx context.Context, removeSnapshot bool) error {
 	delete(cr.cm.records, cr.ID())
-	if cr.parent != nil {
-		cr.parent.mu.Lock()
-		err := cr.parent.release(ctx)
-		cr.parent.mu.Unlock()
-		if err != nil {
-			return err
-		}
-	}
 	if removeSnapshot {
 		if err := cr.cm.LeaseManager.Delete(ctx, leases.Lease{
 			ID: cr.ID(),
@@ -268,7 +348,10 @@ func (cr *cacheRecord) remove(ctx context.Context, removeSnapshot bool) error {
 		}
 	}
 	if err := cr.cm.MetadataStore.Clear(cr.ID()); err != nil {
-		return err
+		return errors.Wrapf(err, "failed to delete metadata of %s", cr.ID())
+	}
+	if err := cr.parentRefs.release(ctx); err != nil {
+		return errors.Wrapf(err, "failed to release parents of %s", cr.ID())
 	}
 	return nil
 }
@@ -286,6 +369,13 @@ type mutableRef struct {
 }
 
 func (sr *immutableRef) Clone() ImmutableRef {
+	sr.mu.Lock()
+	ref := sr.ref(false, sr.descHandlers)
+	sr.mu.Unlock()
+	return ref
+}
+
+func (sr *immutableRef) clone() *immutableRef {
 	sr.mu.Lock()
 	ref := sr.ref(false, sr.descHandlers)
 	sr.mu.Unlock()
@@ -587,8 +677,8 @@ func (cr *cacheRecord) prepareRemoteSnapshotsStargzMode(ctx context.Context, dhs
 				}
 			)
 			parentID := ""
-			if r.parent != nil {
-				parentID = r.parent.getSnapshotID()
+			if r.layerParent != nil {
+				parentID = r.layerParent.getSnapshotID()
 			}
 			if err := r.cm.Snapshotter.Prepare(ctx, key, parentID, opts...); err != nil {
 				if errdefs.IsAlreadyExists(err) {
@@ -647,13 +737,30 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 
 		eg, egctx := errgroup.WithContext(ctx)
 
-		if cr.parent != nil {
+		var parentSnapshotIDs []string
+		switch cr.parentKind() {
+		case Layer:
 			eg.Go(func() error {
-				if err := cr.parent.prepareMount(egctx, dhs, s); err != nil {
+				parentSnapshotIDs = append(parentSnapshotIDs, cr.layerParent.getSnapshotID())
+				if err := cr.layerParent.prepareMount(egctx, dhs, s); err != nil {
 					return err
 				}
 				return nil
 			})
+		case Merge:
+			for _, parent := range cr.mergeParents {
+				parent := parent
+				parentSnapshotIDs = append(parentSnapshotIDs, parent.getSnapshotID())
+				eg.Go(func() error {
+					if err := parent.prepareMount(egctx, dhs, s); err != nil {
+						return err
+					}
+					return nil
+				})
+			}
+		case None:
+			// "parent" is just an empty snapshot
+			parentSnapshotIDs = append(parentSnapshotIDs, "")
 		}
 
 		var dh *DescHandler
@@ -690,13 +797,13 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			}
 
 			var parentSnapshot string
-			if cr.parent != nil {
-				parentSnapshot = cr.parent.getSnapshotID()
+			if cr.layerParent != nil {
+				parentSnapshot = cr.layerParent.getSnapshotID()
 			}
 			tmpSnapshotID := identity.NewID()
 			if err := cr.cm.Snapshotter.Prepare(ctx, tmpSnapshotID, parentSnapshot); err != nil {
 				if !errors.Is(err, errdefs.ErrAlreadyExists) {
-					return nil, errors.Wrap(err, "failed to prepare snapshot for extraction")
+					return nil, errors.Wrap(err, "failed to prepare for extraction")
 				}
 			}
 
@@ -730,33 +837,41 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 		}
 
 		var mountSnapshotID string
-		if cr.mutable {
+		switch cr.parentKind() {
+		case Layer, None:
+			if cr.mutable {
+				mountSnapshotID = cr.getSnapshotID()
+			} else if cr.equalMutable != nil {
+				mountSnapshotID = cr.equalMutable.getSnapshotID()
+			} else {
+				mountSnapshotID = cr.viewSnapshotID()
+				if _, err := cr.cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+					l.ID = cr.viewLeaseID()
+					l.Labels = map[string]string{
+						"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+					}
+					return nil
+				}, leaseutil.MakeTemporary); err != nil && !errdefs.IsAlreadyExists(err) {
+					return nil, err
+				}
+				defer func() {
+					if rerr != nil {
+						cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.viewLeaseID()})
+					}
+				}()
+				if err := cr.cm.LeaseManager.AddResource(ctx, leases.Lease{ID: cr.viewLeaseID()}, leases.Resource{
+					ID:   cr.viewSnapshotID(),
+					Type: "snapshots/" + cr.cm.Snapshotter.Name(),
+				}); err != nil && !errdefs.IsAlreadyExists(err) {
+					return nil, err
+				}
+				if err := cr.cm.Snapshotter.View(ctx, cr.viewSnapshotID(), cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
+					return nil, err
+				}
+			}
+		case Merge:
 			mountSnapshotID = cr.getSnapshotID()
-		} else if cr.equalMutable != nil {
-			mountSnapshotID = cr.equalMutable.getSnapshotID()
-		} else {
-			mountSnapshotID = cr.viewSnapshotID()
-			if _, err := cr.cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
-				l.ID = cr.viewLeaseID()
-				l.Labels = map[string]string{
-					"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
-				}
-				return nil
-			}, leaseutil.MakeTemporary); err != nil && !errdefs.IsAlreadyExists(err) {
-				return nil, err
-			}
-			defer func() {
-				if rerr != nil {
-					cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.viewLeaseID()})
-				}
-			}()
-			if err := cr.cm.LeaseManager.AddResource(ctx, leases.Lease{ID: cr.viewLeaseID()}, leases.Resource{
-				ID:   cr.viewSnapshotID(),
-				Type: "snapshots/" + cr.cm.Snapshotter.Name(),
-			}); err != nil && !errdefs.IsAlreadyExists(err) {
-				return nil, err
-			}
-			if err := cr.cm.Snapshotter.View(ctx, cr.viewSnapshotID(), cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
+			if err := cr.cm.Snapshotter.Merge(ctx, cr.getSnapshotID(), parentSnapshotIDs); err != nil {
 				return nil, err
 			}
 		}
@@ -879,7 +994,7 @@ func (sr *mutableRef) shouldUpdateLastUsed() bool {
 	return sr.triggerLastUsed
 }
 
-func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
+func (sr *mutableRef) commit(ctx context.Context) (_ *immutableRef, rerr error) {
 	if !sr.mutable || len(sr.refs) == 0 {
 		return nil, errors.Wrapf(errInvalid, "invalid mutable ref %p", sr)
 	}
@@ -889,7 +1004,7 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 	rec := &cacheRecord{
 		mu:            sr.mu,
 		cm:            sr.cm,
-		parent:        sr.parentRef(false, sr.descHandlers),
+		parentRefs:    sr.parentRefs.clone(),
 		equalMutable:  sr,
 		refs:          make(map[ref]struct{}),
 		cacheMetadata: md,
@@ -901,11 +1016,7 @@ func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 		}
 	}
 
-	parentID := ""
-	if rec.parent != nil {
-		parentID = rec.parent.ID()
-	}
-	if err := initializeMetadata(rec.cacheMetadata, parentID); err != nil {
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs); err != nil {
 		return nil, err
 	}
 
