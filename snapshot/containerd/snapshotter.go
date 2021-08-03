@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 
+	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
@@ -11,8 +12,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-func NewSnapshotter(name string, snapshotter snapshots.Snapshotter, ns string, idmap *idtools.IdentityMapping) snapshot.Snapshotter {
-	return snapshot.FromContainerdSnapshotter(name, &nsSnapshotter{ns, snapshotter}, idmap)
+func NewSnapshotter(ctx context.Context, name string, snapshotter snapshots.Snapshotter, ns string, idmap *idtools.IdentityMapping, lm leases.Manager) snapshot.Snapshotter {
+	return snapshot.FromContainerdSnapshotter(ctx, name, &nsSnapshotter{ns, snapshotter}, idmap, lm)
 }
 
 func NSSnapshotter(ns string, snapshotter snapshots.Snapshotter) snapshots.Snapshotter {

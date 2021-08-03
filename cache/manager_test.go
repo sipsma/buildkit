@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/continuity/fs/fstest"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/klauspost/compress/zstd"
 	"github.com/moby/buildkit/cache/metadata"
@@ -125,8 +126,11 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		return nil, nil, err
 	}
 
-	store = containerdsnapshot.NewContentStore(mdb.ContentStore(), ns)
+	c := mdb.ContentStore()
+	store = containerdsnapshot.NewContentStore(c, ns)
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
+	applier := winlayers.NewFileSystemApplierWithWindows(store, apply.NewFileSystemApplier(store))
+	differ := winlayers.NewWalkingDiffWithWindows(store, walking.NewWalkingDiff(store))
 
 	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
 	if err != nil {
@@ -134,13 +138,13 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	}
 
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(ctx, opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm),
 		MetadataStore:  md,
 		ContentStore:   store,
 		LeaseManager:   lm,
 		GarbageCollect: mdb.GarbageCollect,
-		Applier:        winlayers.NewFileSystemApplierWithWindows(store, apply.NewFileSystemApplier(store)),
-		Differ:         winlayers.NewWalkingDiffWithWindows(store, walking.NewWalkingDiff(store)),
+		Applier:        applier,
+		Differ:         differ,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -1171,9 +1175,8 @@ func TestGetRemote(t *testing.T) {
 			eg.Go(func() error {
 				remote, err := ir.GetRemote(egctx, true, compressionType, true, nil)
 				require.NoError(t, err)
-				curRef := ir
-				for i := range remote.Descriptors {
-					desc := remote.Descriptors[len(remote.Descriptors)-1-i]
+				layerChain := ir.layerChain()
+				for i, desc := range remote.Descriptors {
 					switch compressionType {
 					case compression.Uncompressed:
 						require.Equal(t, ocispecs.MediaTypeImageLayer, desc.MediaType)
@@ -1190,6 +1193,7 @@ func TestGetRemote(t *testing.T) {
 					require.Contains(t, expectedContent, dgst, "for %v", compressionType)
 					checkDescriptor(ctx, t, co.cs, desc, compressionType)
 
+					curRef := layerChain[i]
 					if compressionType == compression.EStargz {
 						if digest.Digest(curRef.getBlob()) == desc.Digest {
 							esgzRefsMu.Lock()
@@ -1197,6 +1201,7 @@ func TestGetRemote(t *testing.T) {
 							esgzRefsMu.Unlock()
 						}
 					}
+
 					isLazy, err := curRef.isLazy(egctx)
 					require.NoError(t, err)
 					needs, err := needsConversion(desc.MediaType, compressionType)
@@ -1212,7 +1217,6 @@ func TestGetRemote(t *testing.T) {
 						checkDescriptor(ctx, t, co.cs, bDesc, compressionType)
 						require.Equal(t, desc.Digest, bDesc.Digest)
 					}
-					curRef = curRef.parent
 				}
 				return nil
 			})
@@ -1302,6 +1306,92 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	if compressionType == compression.EStargz {
 		require.Equal(t, c.size(), uncompressedSize)
 	}
+}
+
+func TestMergeOp(t *testing.T) {
+	// This just tests the basic Merge method and some of the logic with releasing merge refs.
+	// Tests for the fs merge logic are in client_test and snapshotter_test.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "cachemanager")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	defer cleanup()
+	cm := co.manager
+
+	var baseRefs []ImmutableRef
+	for i := 0; i < 6; i++ {
+		active, err := cm.New(ctx, nil, nil)
+		require.NoError(t, err)
+		m, err := active.Mount(ctx, false, nil)
+		require.NoError(t, err)
+		lm := snapshot.LocalMounter(m)
+		target, err := lm.Mount()
+		require.NoError(t, err)
+		err = fstest.Apply(fstest.CreateFile(strconv.Itoa(i), []byte(strconv.Itoa(i)), 0777)).Apply(target)
+		require.NoError(t, err)
+		err = lm.Unmount()
+		require.NoError(t, err)
+		snap, err := active.Commit(ctx)
+		require.NoError(t, err)
+		baseRefs = append(baseRefs, snap)
+		size, err := snap.(*immutableRef).size(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 8192, size)
+	}
+
+	merge1, err := cm.Merge(ctx, baseRefs[:3])
+	require.NoError(t, err)
+	_, err = merge1.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size1, err := merge1.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 8192, size1) // hardlinking means all but the first snapshot doesn't take up space
+	checkDiskUsage(ctx, t, cm, 7, 0)
+
+	merge2, err := cm.Merge(ctx, baseRefs[3:])
+	require.NoError(t, err)
+	_, err = merge2.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size2, err := merge2.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 8192, size2)
+	checkDiskUsage(ctx, t, cm, 8, 0)
+
+	for _, ref := range baseRefs {
+		require.NoError(t, ref.Release(ctx))
+	}
+	checkDiskUsage(ctx, t, cm, 8, 0)
+	// should still be able to use merges based on released refs
+
+	merge3, err := cm.Merge(ctx, []ImmutableRef{merge1, merge2})
+	require.NoError(t, err)
+	require.NoError(t, merge1.Release(ctx))
+	require.NoError(t, merge2.Release(ctx))
+	_, err = merge3.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	size3, err := merge3.(*immutableRef).size(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 8192, size3)
+	require.Len(t, merge3.(*immutableRef).mergeParents, 6)
+	checkDiskUsage(ctx, t, cm, 7, 2)
+
+	require.NoError(t, merge3.Release(ctx))
+	checkDiskUsage(ctx, t, cm, 0, 9)
+	err = cm.Prune(ctx, nil, client.PruneInfo{All: true})
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 0, 0)
 }
 
 func checkDiskUsage(ctx context.Context, t *testing.T, cm Manager, inuse, unused int) {
