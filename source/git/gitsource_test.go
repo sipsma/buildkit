@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/diff/apply"
+	"github.com/containerd/containerd/diff/walking"
 	ctdmetadata "github.com/containerd/containerd/metadata"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots"
@@ -20,6 +22,7 @@ import (
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/winlayers"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -438,11 +441,16 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	})
 
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+	c := mdb.ContentStore()
+	applier := winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c))
+	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter("native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm),
+		Snapshotter:       snapshot.FromContainerdSnapshotter(context.TODO(), "native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm, applier, differ),
 		LeaseManager:      lm,
-		ContentStore:      mdb.ContentStore(),
+		ContentStore:      c,
+		Applier:           applier,
+		Differ:            differ,
 		GarbageCollect:    mdb.GarbageCollect,
 		MetadataStoreRoot: tmpdir,
 	})

@@ -132,6 +132,7 @@ func TestIntegration(t *testing.T) {
 		testFileOpInputSwap,
 		testRelativeMountpoint,
 		testLocalSourceDiffer,
+		testMergeOp,
 	}, mirrors)
 
 	integration.Run(t, []integration.Test{
@@ -3526,6 +3527,140 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+}
+
+func testMergeOp(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	stateA := llb.Scratch().
+		File(llb.Mkfile("/foo", 0777, []byte("A"))).
+		File(llb.Mkfile("/a", 0777, []byte("A"))).
+		File(llb.Mkdir("/bar", 0700)).
+		File(llb.Mkfile("/bar/A", 0777, []byte("A")))
+	stateB := stateA.
+		File(llb.Rm("/foo")).
+		File(llb.Mkfile("/b", 0777, []byte("B"))).
+		File(llb.Mkfile("/bar/B", 0774, []byte("B")))
+	stateC := llb.Scratch().
+		File(llb.Mkfile("/foo", 0775, []byte("C"))).
+		File(llb.Mkfile("/c", 0777, []byte("C"))).
+		File(llb.Mkdir("/bar", 0777)).
+		File(llb.Mkfile("/bar/A", 0400, []byte("C"))) // overwrite /bar/A from stateA
+
+	mergeA := llb.Merge([]llb.State{llb.Image("busybox:latest"), stateB, stateC})
+	runA := mergeA.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		"test -f /a",
+		"test -f /b",
+		"test -f /c",
+
+		"test \"$(cat /foo)\" = C",
+		"test \"$(stat -c %a /foo)\" = 775",
+
+		"test -d /bar",
+		"test \"$(stat -c %a /bar)\" = 777",
+		"test \"$(cat /bar/A)\" = C",
+		"test \"$(stat -c %a /bar/A)\" = 400",
+		"test \"$(cat /bar/B)\" = B",
+		"test \"$(stat -c %a /bar/B)\" = 774",
+	}, " && ") + "'")).Root()
+	defA, err := runA.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defA, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	mergeB := llb.Merge([]llb.State{stateC, stateB, llb.Image("busybox:latest")})
+	runB := mergeB.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		"test -f /a",
+		"test -f /b",
+		"test -f /c",
+
+		"test ! -e /foo",
+
+		"test -d /bar",
+		"test \"$(stat -c %a /bar)\" = 700",
+		"test \"$(cat /bar/A)\" = A",
+		"test \"$(stat -c %a /bar/A)\" = 777",
+		"test \"$(cat /bar/B)\" = B",
+		"test \"$(stat -c %a /bar/B)\" = 774",
+	}, " && ") + "'")).Root()
+	defB, err := runB.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defB, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	stateD := llb.Image("busybox:latest").Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		"mkdir -m 0750 /bar",
+		"echo D > /bar/D",
+		"mkdir -m 770 /fs",
+	}, " && ") + "'")).Root()
+
+	mergeC := llb.Merge([]llb.State{mergeA, mergeB, stateD})
+	runC := mergeC.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		"test -f /a",
+		"test -f /b",
+		"test -f /c",
+
+		"test ! -e /foo",
+
+		"test -d /bar",
+		"test \"$(stat -c %a /bar)\" = 750",
+		"test \"$(cat /bar/A)\" = A",
+		"test \"$(stat -c %a /bar/A)\" = 777",
+		"test \"$(cat /bar/B)\" = B",
+		"test \"$(stat -c %a /bar/B)\" = 774",
+		"test \"$(cat /bar/D)\" = D",
+
+		"test -d /fs",
+		"test \"$(stat -c %a /fs)\" = 770",
+
+		// turn /a file into a dir, mv b and c into it
+		"rm /a",
+		"mkdir /a",
+		"mv /b /c /a/",
+
+		// remove+recreate /bar to make it opaque
+		"rm -rf /bar",
+		"mkdir -m 0777 /bar",
+		"echo D2 > /bar/D",
+
+		// turn /fs dir into a file
+		"rm -rf /fs",
+		"touch /fs",
+	}, " && ") + "'")).Root()
+	defC, err := runC.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defC, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	mergeD := llb.Merge([]llb.State{runC, llb.Image("busybox:latest")})
+	runD := mergeD.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		"test -d /a",
+		"test ! -e /b",
+		"test ! -e /c",
+		"test -f /a/b",
+		"test -f /a/c",
+
+		"test ! -e /foo",
+
+		"test -d /bar",
+		"test \"$(stat -c %a /bar)\" = 777",
+		"test \"$(cat /bar/D)\" = D2",
+
+		"test -f /fs",
+	}, " && ") + "'")).Root()
+	defD, err := runD.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), defD, SolveOpt{}, nil)
+	require.NoError(t, err)
 }
 
 func requiresLinux(t *testing.T) {

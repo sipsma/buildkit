@@ -9,7 +9,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/util/entitlements"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -308,6 +308,10 @@ func ValidateOp(op *pb.Op) error {
 	case *pb.Op_Build:
 		if op.Build == nil {
 			return errors.Errorf("invalid nil build op")
+		}
+	case *pb.Op_Merge:
+		if op.Merge == nil {
+			return errors.Errorf("invalid nil merge op")
 		}
 	}
 	return nil

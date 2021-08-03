@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/diff/apply"
+	"github.com/containerd/containerd/diff/walking"
 	"github.com/containerd/containerd/leases"
 	ctdmetadata "github.com/containerd/containerd/metadata"
 	"github.com/containerd/containerd/namespaces"
@@ -25,6 +26,7 @@ import (
 	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/winlayers"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -112,13 +114,17 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	}
 
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
+	c := mdb.ContentStore()
+	applier := winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c))
+	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
 
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:       snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm),
-		ContentStore:      mdb.ContentStore(),
+		Snapshotter:       snapshot.FromContainerdSnapshotter(ctx, opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm, applier, differ),
+		ContentStore:      c,
 		LeaseManager:      lm,
 		GarbageCollect:    mdb.GarbageCollect,
-		Applier:           apply.NewFileSystemApplier(mdb.ContentStore()),
+		Applier:           applier,
+		Differ:            differ,
 		MetadataStoreRoot: tmpdir,
 	})
 	if err != nil {

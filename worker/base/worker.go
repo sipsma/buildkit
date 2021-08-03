@@ -44,7 +44,7 @@ import (
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
 	"github.com/moby/buildkit/worker"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/semaphore"
@@ -260,6 +260,8 @@ func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *se
 			return ops.NewFileOp(v, op, w.CacheMgr, w.ParallelismSem, w)
 		case *pb.Op_Build:
 			return ops.NewBuildOp(v, op, s, w)
+		case *pb.Op_Merge:
+			return ops.NewMergeOp(v, op, w)
 		default:
 			return nil, errors.Errorf("no support for %T", op)
 		}

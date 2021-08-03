@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 
+	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
@@ -13,17 +14,23 @@ import (
 )
 
 func NewSnapshotter(
+	ctx context.Context,
 	name string,
 	snapshotter snapshots.Snapshotter,
 	ns string,
 	idmap *idtools.IdentityMapping,
 	leaseManager leases.Manager,
+	applier diff.Applier,
+	differ diff.Comparer,
 ) snapshot.Snapshotter {
 	return snapshot.FromContainerdSnapshotter(
+		ctx,
 		name,
 		&nsSnapshotter{ns, snapshotter},
 		idmap,
 		leaseManager,
+		applier,
+		differ,
 	)
 }
 

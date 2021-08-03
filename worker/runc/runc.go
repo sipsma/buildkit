@@ -31,7 +31,7 @@ type SnapshotterFactory struct {
 }
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket string) (base.WorkerOpt, error) {
+func NewWorkerOpt(ctx context.Context, root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *idtools.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, parallelismSem *semaphore.Weighted, traceSocket string) (base.WorkerOpt, error) {
 	var opt base.WorkerOpt
 	name := "runc-" + snFactory.Name
 	root = filepath.Join(root, name)
@@ -100,7 +100,9 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		xlabels[k] = v
 	}
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
-	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap, lm)
+	applier := winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c))
+	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
+	snap := containerdsnapshot.NewSnapshotter(ctx, snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap, lm, applier, differ)
 
 	opt = base.WorkerOpt{
 		ID:                id,
@@ -108,8 +110,8 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		Executor:          exe,
 		Snapshotter:       snap,
 		ContentStore:      c,
-		Applier:           winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c)),
-		Differ:            winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c)),
+		Applier:           applier,
+		Differ:            differ,
 		ImageStore:        nil, // explicitly
 		Platforms:         []specs.Platform{platforms.Normalize(platforms.DefaultSpec())},
 		IdentityMapping:   idmap,

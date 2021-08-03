@@ -20,6 +20,7 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/winlayers"
 	"github.com/opencontainers/go-digest"
+	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -51,10 +52,10 @@ type Mountable interface {
 }
 
 type cacheRecord struct {
-	cm     *cacheManager
-	mu     sync.Mutex
-	sizeG  flightcontrol.Group
-	parent *immutableRef
+	cm    *cacheManager
+	mu    sync.Mutex
+	sizeG flightcontrol.Group
+	parentRefs
 	*cacheMetadata
 
 	// immutableRefs keeps track of each ref pointing to this cacheRecord that can't change the underlying snapshot
@@ -77,7 +78,7 @@ type cacheRecord struct {
 
 	mountCache snapshot.Mountable
 
-	parentChainCache []digest.Digest
+	layerDigestChainCache []digest.Digest
 }
 
 type immutableRef struct {
@@ -96,6 +97,97 @@ type mutableRef struct {
 
 var _ MutableRef = &mutableRef{}
 
+type parentKind int
+
+const (
+	None parentKind = iota
+	Layer
+	Merge
+)
+
+type parentRefs struct {
+	// layerParent and mergeParents are mutually exclusive, at most one at a time should be set non-nil
+	layerParent  *immutableRef
+	mergeParents []*immutableRef
+}
+
+func (p parentRefs) parentKind() parentKind {
+	if len(p.mergeParents) > 0 {
+		return Merge
+	}
+	if p.layerParent != nil {
+		return Layer
+	}
+	return None
+}
+
+// caller must hold cacheManager.mu
+func (p parentRefs) release(ctx context.Context) error {
+	switch p.parentKind() {
+	case Layer:
+		p.layerParent.mu.Lock()
+		defer p.layerParent.mu.Unlock()
+		return p.layerParent.release(ctx)
+	case Merge:
+		for _, parent := range p.mergeParents {
+			parent.mu.Lock()
+			if err := parent.release(ctx); err != nil {
+				parent.mu.Unlock()
+				return err
+			}
+			parent.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+func (p parentRefs) clone() parentRefs {
+	switch p.parentKind() {
+	case Layer:
+		p.layerParent = p.layerParent.clone(false)
+	case Merge:
+		var newParents []*immutableRef
+		for _, p := range p.mergeParents {
+			newParents = append(newParents, p.clone(false))
+		}
+		p.mergeParents = newParents
+	}
+	return p
+}
+
+func (p parentRefs) mergeDigest() digest.Digest {
+	switch p.parentKind() {
+	case Merge:
+		var mergeDigests []digest.Digest
+		for _, parent := range p.mergeParents {
+			if chainID := parent.getChainID(); chainID != "" {
+				mergeDigests = append(mergeDigests, chainID)
+			} else {
+				mergeDigests = append(mergeDigests, digest.Digest(parent.ID()))
+			}
+		}
+		return imagespecidentity.ChainID(mergeDigests)
+	default:
+		return ""
+	}
+}
+
+func (p parentRefs) areFinalized() bool {
+	switch p.parentKind() {
+	case Layer:
+		return p.layerParent.isFinalized
+	case Merge:
+		for _, p := range p.mergeParents {
+			if !p.isFinalized {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
 // hold cacheRecord.mu before calling
 func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*immutableRef, error) {
 	if cr.mutableRef != nil {
@@ -108,6 +200,7 @@ func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers) (*im
 		descHandlers:    descHandlers,
 	}
 	cr.immutableRefs[r] = struct{}{}
+
 	return r, nil
 }
 
@@ -141,33 +234,73 @@ func (cr *cacheRecord) refCount() int {
 	return count
 }
 
-func (cr *cacheRecord) parentChain() []digest.Digest {
-	if cr.parentChainCache != nil {
-		return cr.parentChainCache
-	}
-	blob := cr.getBlob()
-	if blob == "" {
-		return nil
-	}
-
-	var parent []digest.Digest
-	if cr.parent != nil {
-		parent = cr.parent.parentChain()
-	}
-	pcc := make([]digest.Digest, len(parent)+1)
-	copy(pcc, parent)
-	pcc[len(parent)] = digest.Digest(blob)
-	cr.parentChainCache = pcc
-	return pcc
-}
-
 // order is from parent->child, cr will be at end of slice
 func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
-	if cr.parent != nil {
-		layers = append(layers, cr.parent.layerChain()...)
+	switch cr.parentKind() {
+	case Merge:
+		for _, parent := range cr.mergeParents {
+			layers = append(layers, parent.layerChain()...)
+		}
+		return layers
+	case Layer:
+		layers = append(layers, cr.layerParent.layerChain()...)
+		fallthrough
+	case None:
+		layers = append(layers, cr)
+		return layers
 	}
-	layers = append(layers, cr)
-	return layers
+	return nil
+}
+
+// hold cacheRecord.mu lock before calling
+func (cr *cacheRecord) layerDigestChain() []digest.Digest {
+	if cr.layerDigestChainCache != nil {
+		return cr.layerDigestChainCache
+	}
+	var dgsts []digest.Digest
+	for _, layer := range cr.layerChain() {
+		dgst := layer.getBlob()
+		if dgst == "" {
+			return nil
+		}
+		dgsts = append(dgsts, dgst)
+	}
+	cr.layerDigestChainCache = dgsts
+	return dgsts
+}
+
+var skipWalk = errors.New("skip")
+
+func (cr *cacheRecord) walkRecords(f func(*cacheRecord) error) error {
+	curs := []*cacheRecord{cr}
+	for len(curs) > 0 {
+		cur := curs[len(curs)-1]
+		curs = curs[:len(curs)-1]
+		if err := f(cur); err != nil {
+			if errors.Is(err, skipWalk) {
+				continue
+			}
+			return err
+		}
+		if cur.layerParent != nil {
+			curs = append(curs, cur.layerParent.cacheRecord)
+		}
+		for _, p := range cur.mergeParents {
+			curs = append(curs, p.cacheRecord)
+		}
+	}
+	return nil
+}
+
+func (cr *cacheRecord) walkUniqueRecords(f func(*cacheRecord) error) error {
+	memo := make(map[*cacheRecord]struct{})
+	return cr.walkRecords(func(cr *cacheRecord) error {
+		if _, ok := memo[cr]; ok {
+			return skipWalk
+		}
+		memo[cr] = struct{}{}
+		return f(cr)
+	})
 }
 
 func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
@@ -207,11 +340,9 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 		}
 		driverID := cr.getSnapshotID()
 		cr.mu.Unlock()
-		var usage snapshots.Usage
+		var totalSize int64
 		if !cr.getBlobOnly() {
-			var err error
-			usage, err = cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID)
-			if err != nil {
+			if usage, err := cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID); err != nil {
 				cr.mu.Lock()
 				isDead := cr.dead
 				cr.mu.Unlock()
@@ -221,12 +352,14 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 				if !errors.Is(err, errdefs.ErrNotFound) {
 					return s, errors.Wrapf(err, "failed to get usage for %s", cr.ID())
 				}
+			} else {
+				totalSize += usage.Size
 			}
 		}
 		if dgst := cr.getBlob(); dgst != "" {
 			info, err := cr.cm.ContentStore.Info(ctx, digest.Digest(dgst))
 			if err == nil {
-				usage.Size += info.Size
+				totalSize += info.Size
 			}
 			for k, v := range info.Labels {
 				// accumulate size of compression variant blobs
@@ -237,20 +370,20 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 							continue
 						}
 						if info, err := cr.cm.ContentStore.Info(ctx, cdgst); err == nil {
-							usage.Size += info.Size
+							totalSize += info.Size
 						}
 					}
 				}
 			}
 		}
 		cr.mu.Lock()
-		cr.queueSize(usage.Size)
+		cr.queueSize(totalSize)
 		if err := cr.commitMetadata(); err != nil {
 			cr.mu.Unlock()
 			return s, err
 		}
 		cr.mu.Unlock()
-		return usage.Size, nil
+		return totalSize, nil
 	})
 	if err != nil {
 		return 0, err
@@ -261,14 +394,6 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 // call when holding the manager lock
 func (cr *cacheRecord) remove(ctx context.Context) error {
 	delete(cr.cm.records, cr.ID())
-	if cr.parent != nil {
-		cr.parent.mu.Lock()
-		err := cr.parent.release(ctx)
-		cr.parent.mu.Unlock()
-		if err != nil {
-			return err
-		}
-	}
 	if err := cr.cm.Snapshotter.RemoveLease(context.TODO(), cr.ID(), cr.getSnapshotID()); err != nil {
 		return errors.Wrapf(err, "failed to remove snapshot lease for %s", cr.ID())
 	}
@@ -278,22 +403,21 @@ func (cr *cacheRecord) remove(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to delete lease for %s", cr.ID())
 	}
 	if err := cr.cm.store.Clear(cr.ID()); err != nil {
-		return err
+		return errors.Wrapf(err, "failed to delete metadata of %s", cr.ID())
+	}
+	if err := cr.parentRefs.release(ctx); err != nil {
+		return errors.Wrapf(err, "failed to release parents of %s", cr.ID())
 	}
 	return nil
 }
 
-// hold cacheRecord.mu lock before calling
+// hold cacheRecord.mu and cacheManager.mu locks before calling
 func (cr *cacheRecord) release(ctx context.Context, forceKeep bool) error {
 	if cr.refCount() > 0 {
 		return nil
 	}
 
-	if cr.HasCachePolicyRetain() {
-		return nil
-	}
-
-	if forceKeep {
+	if forceKeep || cr.HasCachePolicyRetain() {
 		return nil
 	}
 	return cr.remove(ctx)
@@ -306,7 +430,7 @@ func (sr *immutableRef) Clone() ImmutableRef {
 }
 
 // hold cacheRecord.mu lock before calling
-func (sr *immutableRef) clone(triggerLastUsed bool) ImmutableRef {
+func (sr *immutableRef) clone(triggerLastUsed bool) *immutableRef {
 	ir2 := &immutableRef{
 		cacheRecord:     sr.cacheRecord,
 		triggerLastUsed: triggerLastUsed,
@@ -529,8 +653,8 @@ func (cr *cacheRecord) prepareRemoteSnapshotsStargzMode(ctx context.Context, dhs
 				}
 			)
 			parentID := ""
-			if r.parent != nil {
-				parentID = r.parent.getSnapshotID()
+			if r.layerParent != nil {
+				parentID = r.layerParent.getSnapshotID()
 			}
 			if err := r.cm.Snapshotter.Prepare(ctx, key, parentID, opts...); err != nil {
 				if errdefs.IsAlreadyExists(err) {
@@ -589,13 +713,30 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 
 		eg, egctx := errgroup.WithContext(ctx)
 
-		if cr.parent != nil {
+		var parentSnapshotIDs []string
+		switch cr.parentKind() {
+		case Layer:
 			eg.Go(func() error {
-				if err := cr.parent.prepareMount(egctx, dhs, s); err != nil {
+				parentSnapshotIDs = append(parentSnapshotIDs, cr.layerParent.getSnapshotID())
+				if err := cr.layerParent.prepareMount(egctx, dhs, s); err != nil {
 					return err
 				}
 				return nil
 			})
+		case Merge:
+			for _, parent := range cr.mergeParents {
+				parent := parent
+				parentSnapshotIDs = append(parentSnapshotIDs, parent.getSnapshotID())
+				eg.Go(func() error {
+					if err := parent.prepareMount(egctx, dhs, s); err != nil {
+						return err
+					}
+					return nil
+				})
+			}
+		case None:
+			// "parent" is just an empty snapshot
+			parentSnapshotIDs = append(parentSnapshotIDs, "")
 		}
 
 		var dh *DescHandler
@@ -631,11 +772,7 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 				defer statusDone()
 			}
 
-			var parentSnapshot string
-			if cr.parent != nil {
-				parentSnapshot = cr.parent.getSnapshotID()
-			}
-			if err := cr.cm.Snapshotter.Prepare(ctx, cr.getSnapshotID(), parentSnapshot); err != nil {
+			if err := cr.cm.Snapshotter.Prepare(ctx, cr.getSnapshotID(), parentSnapshotIDs[0]); err != nil {
 				return nil, err
 			}
 
@@ -664,6 +801,12 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			cr.queueBlobOnly(false)
 			cr.queueSize(sizeUnknown)
 			if err := cr.commitMetadata(); err != nil {
+				return nil, err
+			}
+		}
+
+		if cr.parentKind() == Merge {
+			if err := cr.cm.Snapshotter.Merge(ctx, cr.getSnapshotID(), parentSnapshotIDs); err != nil {
 				return nil, err
 			}
 		}
@@ -728,9 +871,29 @@ func (sr *immutableRef) finalize(ctx context.Context) error {
 		return errors.Wrap(ErrLocked, "cannot finalize record with open mutable ref")
 	}
 
-	if err := sr.cm.Snapshotter.Commit(ctx, sr.getSnapshotID()); err != nil {
-		sr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: sr.ID()})
-		return errors.Wrapf(err, "failed to commit %s", sr.getSnapshotID())
+	switch sr.parentKind() {
+	case Layer:
+		if err := sr.layerParent.finalizeLocked(ctx); err != nil {
+			return errors.Wrapf(err, "failed to finalize parent ref %q", sr.layerParent.ID())
+		}
+		fallthrough
+	case None:
+		if err := sr.cm.Snapshotter.Commit(ctx, sr.getSnapshotID()); err != nil {
+			sr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: sr.ID()})
+			return errors.Wrapf(err, "failed to commit %s", sr.getSnapshotID())
+		}
+	case Merge:
+		for _, parent := range sr.mergeParents {
+			if err := parent.finalizeLocked(ctx); err != nil {
+				return errors.Wrapf(err, "failed to finalize parent ref %q of merge ref", parent.ID())
+			}
+		}
+		mergeDigest := sr.mergeDigest()
+		sr.queueMergeDigest(mergeDigest)
+		if err := sr.commitMetadata(); err != nil {
+			return errors.Wrapf(err, "failed to commit merge digest")
+		}
+		// TODO(sipsma) optimize by re-using an equal merge ref if multiple are equal after calculating the merge digest
 	}
 
 	sr.isFinalized = true
