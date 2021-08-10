@@ -167,8 +167,32 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 	if err != nil {
 		return err
 	}
+
 	if currentDescr.Digest != "" {
 		if err := sr.setBlob(baseCtx, currentDescr); err != nil {
+			return err
+		}
+	}
+
+	// TODO: backport this to the main mergeop-impl branch
+	if sr.parentKind() == Merge {
+		var chainIDs []digest.Digest
+		var blobChainIDs []digest.Digest
+		for _, p := range sr.mergeParents {
+			parentChainID := p.getChainID()
+			parentBlobChainID := p.getBlobChainID()
+			if parentChainID == "" || parentBlobChainID == "" {
+				return errors.Errorf("failed to set blob for reference with non-addressable merge parent")
+			}
+			chainIDs = append(chainIDs, parentChainID)
+			blobChainIDs = append(blobChainIDs, parentBlobChainID)
+		}
+		chainID := imagespecidentity.ChainID(chainIDs)
+		blobChainID := imagespecidentity.ChainID(blobChainIDs)
+
+		sr.queueChainID(chainID)
+		sr.queueBlobChainID(blobChainID)
+		if err := sr.commitMetadata(); err != nil {
 			return err
 		}
 	}
@@ -209,7 +233,7 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 			parentChainID := p.getChainID()
 			parentBlobChainID := p.getBlobChainID()
 			if parentChainID == "" || parentBlobChainID == "" {
-				return errors.Errorf("failed to set blob for reference with non-addressable parent")
+				return errors.Errorf("failed to set blob for reference with non-addressable merge parent")
 			}
 			chainIDs = append(chainIDs, parentChainID)
 			blobChainIDs = append(blobChainIDs, parentBlobChainID)
@@ -218,7 +242,7 @@ func (sr *immutableRef) setBlob(ctx context.Context, desc ocispec.Descriptor) er
 		parentChainID := sr.layerParent.getChainID()
 		parentBlobChainID := sr.layerParent.getBlobChainID()
 		if parentChainID == "" || parentBlobChainID == "" {
-			return errors.Errorf("failed to set blob for reference with non-addressable parent")
+			return errors.Errorf("failed to set blob for reference with non-addressable layer parent")
 		}
 		chainIDs = append(chainIDs, parentChainID)
 		blobChainIDs = append(blobChainIDs, parentBlobChainID)

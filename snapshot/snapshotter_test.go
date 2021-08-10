@@ -424,4 +424,5 @@ func TestDeduplicateMounts(t *testing.T) {
 * e2e test: assert on dir+file times
 * hardlinks in inefficient cases
 * sockets+fifos
+* e2e test involving mounts
  */

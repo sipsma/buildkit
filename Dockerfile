@@ -12,7 +12,7 @@ ARG CNI_VERSION=v0.9.1
 ARG SHADOW_VERSION=4.8.1
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.5.0
 
-ARG ALPINE_VERSION=3.14
+ARG ALPINE_VERSION=3.13
 
 # git stage is used for checking out remote repository sources
 FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS git
@@ -21,7 +21,7 @@ RUN apk add --no-cache git
 # xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx@sha256:1e96844fadaa2f9aea021b2b05299bc02fe4c39a92d8e735b93e8e2b15610128 AS xx
 
-FROM --platform=$BUILDPLATFORM golang:1.16-alpine AS golatest
+FROM --platform=$BUILDPLATFORM golang:1.16-alpine3.13 AS golatest
 
 FROM golatest AS go-linux
 FROM golatest AS go-darwin
