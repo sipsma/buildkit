@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package snapshot
@@ -100,9 +101,6 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 	snapshotter := FromContainerdSnapshotter(ctx, snapshotterName, mdb.Snapshotter(snapshotterName), nil, lm, false).(*fromContainerd)
 	if noHardlink {
 		snapshotter.useHardlinks = false
-	}
-	if snapshotterName == "overlayfs" {
-		snapshotter.userxattr = true
 	}
 
 	leaseID := identity.NewID()

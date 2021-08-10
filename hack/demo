@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+
+set -e
+
+if [[ ! -z "$RUN_THE_DEMO" ]]; then
+  cat > /etc/registry.conf <<EOF
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+  cache:
+    blobdescriptor: inmemory
+  filesystem:
+    rootdirectory: /var/lib/registry
+http:
+  addr: 127.0.0.1:5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+EOF
+  nohup registry serve /etc/registry.conf 2>&1 >/var/log/registry.log &
+  nohup buildkitd --allow-insecure-entitlement network.host 2>&1 >/var/log/buildkitd.log &
+  go run cmd/demo/main.go || cat /var/log/buildkitd.log
+  exit 0
+fi
+
+function clean() {
+  docker rmi $(cat $iidfile)
+}
+
+iidfile=$(mktemp -t docker-iidfile.XXXXXXXXXX)
+DOCKER_BUILDKIT=1 docker build --iidfile $iidfile --target dev-env .
+
+trap clean EXIT
+SSH=
+if [ -n "$MOUNT_SSH_AUTH_SOCK" ]; then
+  SSH="-v $SSH_AUTH_SOCK:$SSH_AUTH_SOCK -e SSH_AUTH_SOCK"
+fi
+docker run $SSH -it --privileged -v democache:/var/lib/buildkit -v /tmp --net=host -e BUILDKIT_REGISTRY_MIRROR_DIR=/root/.cache/registry -e RUN_THE_DEMO=yah --rm $(cat $iidfile) hack/demo

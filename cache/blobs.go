@@ -290,7 +290,7 @@ func (sr *immutableRef) setChains(ctx context.Context) error {
 			parentChainID := p.getChainID()
 			parentBlobChainID := p.getBlobChainID()
 			if parentChainID == "" || parentBlobChainID == "" {
-				return errors.Errorf("failed to set blob for reference with non-addressable parent")
+				return errors.Errorf("failed to set blob for reference with non-addressable merge parent")
 			}
 			chainIDs = append(chainIDs, parentChainID)
 			blobChainIDs = append(blobChainIDs, parentBlobChainID)
@@ -299,7 +299,7 @@ func (sr *immutableRef) setChains(ctx context.Context) error {
 		parentChainID := sr.layerParent.getChainID()
 		parentBlobChainID := sr.layerParent.getBlobChainID()
 		if parentChainID == "" || parentBlobChainID == "" {
-			return errors.Errorf("failed to set blob for reference with non-addressable parent")
+			return errors.Errorf("failed to set blob for reference with non-addressable layer parent")
 		}
 		chainIDs = append(chainIDs, parentChainID)
 		blobChainIDs = append(blobChainIDs, parentBlobChainID)
