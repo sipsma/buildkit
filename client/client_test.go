@@ -3601,14 +3601,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	_, err = c.Solve(sb.Context(), defA, SolveOpt{}, pw.Status())
-	time.Sleep(5 * time.Second)
 	require.NoError(t, err)
-
-	// TODO:
-	// TODO:
-	// TODO:
-	// TODO:
-	t.FailNow()
 
 	mergeB := llb.Merge([]llb.State{stateC, stateB, llb.Image("busybox:latest")})
 	runB := mergeB.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
