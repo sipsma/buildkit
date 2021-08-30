@@ -1,4 +1,10 @@
-package client
+package client_test
+
+// TODO: ^^^^^^^^^
+// TODO: ^^^^^^^^^
+// TODO: ^^^^^^^^^
+// TODO: ^^^^^^^^^
+// TODO: ^^^^^^^^^
 
 import (
 	"bytes"
@@ -28,6 +34,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh/agent"
+
+	. "github.com/moby/buildkit/client"
 )
 
 func TestClientGatewayIntegration(t *testing.T) {
@@ -35,8 +43,6 @@ func TestClientGatewayIntegration(t *testing.T) {
 		testClientGatewaySolve,
 		testClientGatewayFailedSolve,
 		testClientGatewayEmptySolve,
-		testNoBuildID,
-		testUnknownBuildID,
 		testClientGatewayContainerExecPipe,
 		testClientGatewayContainerCancelOnRelease,
 		testClientGatewayContainerPID1Fail,
@@ -190,36 +196,6 @@ func testClientGatewayEmptySolve(t *testing.T, sb integration.Sandbox) {
 
 	_, err = c.Build(ctx, SolveOpt{}, "", b, nil)
 	require.NoError(t, err)
-}
-
-func testNoBuildID(t *testing.T, sb integration.Sandbox) {
-	requiresLinux(t)
-
-	ctx := sb.Context()
-
-	c, err := New(ctx, sb.Address())
-	require.NoError(t, err)
-	defer c.Close()
-
-	g := gatewayapi.NewLLBBridgeClient(c.conn)
-	_, err = g.Ping(ctx, &gatewayapi.PingRequest{})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no buildid found in context")
-}
-
-func testUnknownBuildID(t *testing.T, sb integration.Sandbox) {
-	requiresLinux(t)
-
-	ctx := sb.Context()
-
-	c, err := New(ctx, sb.Address())
-	require.NoError(t, err)
-	defer c.Close()
-
-	g := c.gatewayClientForBuild(t.Name() + identity.NewID())
-	_, err = g.Ping(ctx, &gatewayapi.PingRequest{})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no such job")
 }
 
 // testClientGatewayContainerCancelOnRelease is testing that all running

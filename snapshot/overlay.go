@@ -125,6 +125,12 @@ func fixOpaqueDirs(ctx context.Context, mounts []mount.Mount, userxattr bool) er
 				return nil
 			}
 			if _, err := unix.Lgetxattr(path, opaqueXattrName, make([]byte, 1)); err == nil {
+				// TODO:
+				// TODO:
+				// TODO:
+				// TODO:
+				bklog.G(ctx).Debugf("found xattr %s on path %s", opaqueXattrName, path)
+
 				relPath, err := filepath.Rel(fixupDir, path)
 				if err != nil {
 					return err
@@ -135,6 +141,24 @@ func fixOpaqueDirs(ctx context.Context, mounts []mount.Mount, userxattr bool) er
 					}
 				}
 				return fs.SkipDir // subdirs of an opaque dir can't also be opaque
+			} else if filepath.Base(path) == "bar" {
+				// TODO:
+				// TODO:
+				// TODO:
+				// TODO:
+				dirents, err := os.ReadDir(path)
+				if err != nil {
+					bklog.G(ctx).Errorf("failed to readdir %s: %v", path, err)
+				} else {
+					for _, de := range dirents {
+						info, err := de.Info()
+						if err != nil {
+							bklog.G(ctx).Debugf("get info fail on %s: %v", path, err)
+						}
+						bklog.G(ctx).Debugf("listdir on %s: %+v %s", path, info, info.Mode())
+					}
+				}
+
 			}
 			return nil
 		})

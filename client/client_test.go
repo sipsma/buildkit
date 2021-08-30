@@ -1,4 +1,9 @@
-package client
+package client_test
+
+// TODO: ^^^^^^^^^^
+// TODO:
+// TODO:
+// TODO:
 
 import (
 	"archive/tar"
@@ -40,6 +45,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/progress/progresswriter"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/httpserver"
@@ -49,6 +55,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/sync/errgroup"
+
+	. "github.com/moby/buildkit/client"
 )
 
 func init() {
@@ -3560,8 +3568,21 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 		File(llb.Mkdir("/bar", 0777)).
 		File(llb.Mkfile("/bar/A", 0400, []byte("C"))) // overwrite /bar/A from stateA
 
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	pw, err := progresswriter.NewPrinter(sb.Context(), os.Stdout, "plain")
+	require.NoError(t, err)
+
 	mergeA := llb.Merge([]llb.State{llb.Image("busybox:latest"), stateB, stateC})
 	runA := mergeA.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		"ls -la /*",
+
 		"test -f /a",
 		"test -f /b",
 		"test -f /c",
@@ -3579,8 +3600,15 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	defA, err := runA.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	_, err = c.Solve(sb.Context(), defA, SolveOpt{}, nil)
+	_, err = c.Solve(sb.Context(), defA, SolveOpt{}, pw.Status())
+	time.Sleep(5 * time.Second)
 	require.NoError(t, err)
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	t.FailNow()
 
 	mergeB := llb.Merge([]llb.State{stateC, stateB, llb.Image("busybox:latest")})
 	runB := mergeB.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{

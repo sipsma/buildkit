@@ -87,12 +87,7 @@ jobs:
           - ./client ./cmd/buildctl ./worker/containerd ./solver ./frontend
           - ./frontend/dockerfile
         worker:
-          - containerd
-          - containerd-1.4
-          - containerd-snapshotter-stargz
-          - oci
           - oci-rootless
-          - oci-snapshotter-stargz
         typ:
           - integration
           - dockerfile
@@ -136,7 +131,7 @@ jobs:
         run: |
           export TESTFLAGS="-v --parallel=6 --timeout=20m"
           if [ -n "${{ matrix.worker }}" ]; then
-            export TESTFLAGS="${TESTFLAGS} --run=//worker=${{ matrix.worker }}$"
+            export TESTFLAGS="${TESTFLAGS} -v --run=/TestMergeOp/worker=${{ matrix.worker }}$"
           fi
           ./hack/test ${{ matrix.typ }}
           mv ./coverage/coverage.txt ./coverage/coverage-${{ github.job }}-$(echo "${{ matrix.pkg }}-${{ matrix.skip-integration-tests }}-${{ matrix.typ }}-${{ matrix.worker }}" | tr -dc '[:alnum:]-\n\r' | tr '[:upper:]' '[:lower:]').txt
