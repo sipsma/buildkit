@@ -121,7 +121,7 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	}
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil, lm, false),
 		MetadataStore:  md,
 		ContentStore:   c,
 		Applier:        applier,

@@ -60,21 +60,30 @@ func FromContainerdSnapshotter(
 	s snapshots.Snapshotter,
 	idmap *idtools.IdentityMapping,
 	lm leases.Manager,
+	rootless bool,
 ) Snapshotter {
-	var useOverlay bool
+	var useOverlayMerge bool
 	for _, sn := range overlayMergeSnapshotters {
 		if name == sn {
-			useOverlay = true
+			useOverlayMerge = true
 			break
 		}
 	}
 	var userxattr bool
-	if useOverlay {
+	if useOverlayMerge {
 		var err error
 		userxattr, err = needsUserXAttr(ctx, s, lm)
 		if err != nil {
 			bklog.G(ctx).Errorf("failed to check userxattr, defaulting to %t: %v", userxattr, err)
 		}
+	}
+
+	if rootless && useOverlayMerge && !userxattr {
+		// This can only happen on pre-5.11 kernels that are patched to allow overlay mounts from non-root
+		// user namespaces without support for userxattr. These kernels are problematic because they use
+		// privileged xattrs to track opacity but such xattrs are not visible inside the user namespace.
+		// Therefore, we disable overlay-based merges in this case and fallback to copy-based merges.
+		useOverlayMerge = false
 	}
 
 	var useHardlinks bool
@@ -86,26 +95,26 @@ func FromContainerdSnapshotter(
 	}
 
 	return &fromContainerd{
-		name:         name,
-		snapshotter:  s,
-		idmap:        idmap,
-		useOverlay:   useOverlay,
-		userxattr:    userxattr,
-		useHardlinks: useHardlinks,
-		lm:           lm,
+		name:            name,
+		snapshotter:     s,
+		idmap:           idmap,
+		useOverlayMerge: useOverlayMerge,
+		userxattr:       userxattr,
+		useHardlinks:    useHardlinks,
+		lm:              lm,
 	}
 }
 
 type fromContainerd struct {
-	name         string
-	snapshotter  snapshots.Snapshotter
-	idmap        *idtools.IdentityMapping
-	useOverlay   bool
-	userxattr    bool
-	useHardlinks bool
-	lm           leases.Manager
-	mergeG       flightcontrol.Group
-	checkOpaqueG flightcontrol.Group
+	name            string
+	snapshotter     snapshots.Snapshotter
+	idmap           *idtools.IdentityMapping
+	useOverlayMerge bool
+	userxattr       bool
+	useHardlinks    bool
+	lm              leases.Manager
+	mergeG          flightcontrol.Group
+	checkOpaqueG    flightcontrol.Group
 }
 
 func (sn *fromContainerd) Name() string {
@@ -150,7 +159,7 @@ func (sn *fromContainerd) Usage(ctx context.Context, key string) (snapshots.Usag
 }
 
 func (sn *fromContainerd) Mounts(ctx context.Context, key string) (_ Mountable, rerr error) {
-	if !sn.useOverlay {
+	if !sn.useOverlayMerge {
 		mounts, err := sn.snapshotter.Mounts(ctx, key)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get mounts")
@@ -281,7 +290,7 @@ func (sn *fromContainerd) Prepare(ctx context.Context, key string, parent string
 		}
 	}
 
-	if !sn.useOverlay {
+	if !sn.useOverlayMerge {
 		if isMergeView(parentInfo) {
 			// if parent is a merge view, use the underlying committed snapshot as the parent to prepare from
 			parent = parentInfo.Parent
@@ -390,7 +399,7 @@ func (sn *fromContainerd) view(ctx context.Context, key string, parents []string
 		return err
 	}
 
-	if !sn.useOverlay {
+	if !sn.useOverlayMerge {
 		mergedID, err := sn.diffApplyMerge(ctx, mergeKeys)
 		if err != nil {
 			return err

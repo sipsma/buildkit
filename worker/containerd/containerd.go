@@ -102,7 +102,7 @@ func newContainerd(ctx context.Context, root string, client *containerd.Client, 
 
 	applier := winlayers.NewFileSystemApplierWithWindows(cs, df)
 	differ := winlayers.NewWalkingDiffWithWindows(cs, df)
-	snap := containerdsnapshot.NewSnapshotter(ctx, snapshotterName, client.SnapshotService(snapshotterName), ns, nil, lm)
+	snap := containerdsnapshot.NewSnapshotter(ctx, snapshotterName, client.SnapshotService(snapshotterName), ns, nil, lm, false)
 
 	if err := cache.MigrateV2(
 		context.TODO(),
