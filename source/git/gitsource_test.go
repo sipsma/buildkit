@@ -449,7 +449,7 @@ func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), "native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), "native", containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter("native")), nil, lm, false),
 		MetadataStore:  md,
 		LeaseManager:   lm,
 		ContentStore:   c,

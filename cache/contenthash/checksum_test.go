@@ -1186,7 +1186,7 @@ func setupCacheManager(t *testing.T, tmpdir string, snapshotterName string, snap
 	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), snapshotterName, containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter(snapshotterName)), nil, lm),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(context.TODO(), snapshotterName, containerdsnapshot.NSSnapshotter("buildkit", mdb.Snapshotter(snapshotterName)), nil, lm, false),
 		MetadataStore:  md,
 		LeaseManager:   lm,
 		ContentStore:   c,

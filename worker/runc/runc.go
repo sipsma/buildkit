@@ -104,7 +104,7 @@ func NewWorkerOpt(ctx context.Context, root string, snFactory SnapshotterFactory
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
 	applier := winlayers.NewFileSystemApplierWithWindows(c, apply.NewFileSystemApplier(c))
 	differ := winlayers.NewWalkingDiffWithWindows(c, walking.NewWalkingDiff(c))
-	snap := containerdsnapshot.NewSnapshotter(ctx, snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap, lm)
+	snap := containerdsnapshot.NewSnapshotter(ctx, snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap, lm, rootless)
 
 	if err := cache.MigrateV2(
 		context.TODO(),

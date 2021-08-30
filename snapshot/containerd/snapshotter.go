@@ -12,8 +12,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-func NewSnapshotter(ctx context.Context, name string, snapshotter snapshots.Snapshotter, ns string, idmap *idtools.IdentityMapping, lm leases.Manager) snapshot.Snapshotter {
-	return snapshot.FromContainerdSnapshotter(ctx, name, &nsSnapshotter{ns, snapshotter}, idmap, lm)
+func NewSnapshotter(ctx context.Context, name string, snapshotter snapshots.Snapshotter, ns string, idmap *idtools.IdentityMapping, lm leases.Manager, rootless bool) snapshot.Snapshotter {
+	return snapshot.FromContainerdSnapshotter(ctx, name, &nsSnapshotter{ns, snapshotter}, idmap, lm, rootless)
 }
 
 func NSSnapshotter(ns string, snapshotter snapshots.Snapshotter) snapshots.Snapshotter {
