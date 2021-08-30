@@ -95,7 +95,7 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 	}
 
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
-	snapshotter := FromContainerdSnapshotter(ctx, snapshotterName, mdb.Snapshotter(snapshotterName), nil, lm).(*fromContainerd)
+	snapshotter := FromContainerdSnapshotter(ctx, snapshotterName, mdb.Snapshotter(snapshotterName), nil, lm, false).(*fromContainerd)
 	if noHardlink {
 		snapshotter.useHardlinks = false
 	}
