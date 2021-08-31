@@ -1309,6 +1309,10 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 }
 
 func TestMergeOp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented merge-op support on Windows")
+	}
+
 	// This just tests the basic Merge method and some of the logic with releasing merge refs.
 	// Tests for the fs merge logic are in client_test and snapshotter_test.
 	t.Parallel()

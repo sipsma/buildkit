@@ -362,7 +362,7 @@ func (sn *fromContainerd) view(ctx context.Context, key string, parents []string
 		}
 		info, err := sn.Stat(ctx, p)
 		if err != nil {
-			return errors.Wrapf(err, "failed to stat parent during merge of %s", key)
+			return errors.Wrap(err, "failed to stat parent while creating view")
 		}
 		filteredParents = append(filteredParents, info)
 		switch info.Kind {
