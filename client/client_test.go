@@ -132,6 +132,7 @@ func TestIntegration(t *testing.T) {
 		testRelativeMountpoint,
 		testLocalSourceDiffer,
 		testMergeOp,
+		testPerf, // TODO:
 	}, mirrors)
 
 	integration.Run(t, []integration.Test{
@@ -3535,6 +3536,61 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+}
+
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+func testPerf(t *testing.T, sb integration.Sandbox) {
+	skipDockerd(t, sb)
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	pkgs := []string{
+		"linux-lts-dev",
+		"firefox",
+		"containerd",
+		"automake",
+		"coreutils",
+		"python3",
+		"x11vnc",
+	}
+
+	state := llb.Image("alpine:latest").Run(llb.Args([]string{"sh", "-e", "-c", strings.Join([]string{
+		"apk update",
+		"apk add alpine-conf",
+		"setup-apkcache /var/cache/apk",
+		"apk add " + strings.Join(pkgs, " "),
+		"apk del -r " + strings.Join(pkgs, " "),
+	}, " && ")})).Root()
+
+	def, err := state.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	for _, pkg := range pkgs {
+		state = state.Run(llb.Args([]string{"sh", "-e", "-c", strings.Join([]string{
+			"apk add --no-network " + pkg,
+		}, " && ")})).Root()
+	}
+
+	start := time.Now()
+	defer func() {
+		stop := time.Now()
+		t.Logf("time: %s", stop.Sub(start))
+	}()
+
+	def, err = state.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.NoError(t, err)
 }
 
 func testMergeOp(t *testing.T, sb integration.Sandbox) {
