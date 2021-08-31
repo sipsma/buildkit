@@ -217,7 +217,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 		}
 	}()
 
-	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+	if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
 	}); err != nil && !errdefs.IsAlreadyExists(err) {
@@ -511,7 +511,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 	}()
 
 	snapshotID := id
-	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+	if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
 	}); err != nil && !errdefs.IsAlreadyExists(err) {

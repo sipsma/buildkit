@@ -160,6 +160,20 @@ func (p parentRefs) clone() parentRefs {
 	return p
 }
 
+func (p parentRefs) parentSnapshotIDs() []string {
+	switch p.parentKind() {
+	case Layer:
+		return []string{p.layerParent.getSnapshotID()}
+	case Merge:
+		var snapshots []string
+		for _, p := range p.mergeParents {
+			snapshots = append(snapshots, p.getSnapshotID())
+		}
+		return snapshots
+	}
+	return nil
+}
+
 // order is from parent->child, cr will be at end of slice
 func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
 	switch cr.parentKind() {
@@ -734,105 +748,104 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 		if cr.mountCache != nil {
 			return nil, nil
 		}
+		snapshotID := cr.getSnapshotID()
+		if _, err := cr.cm.Snapshotter.Stat(ctx, snapshotID); err != nil {
+			if !errdefs.IsNotFound(err) {
+				return nil, err
+			}
+			eg, egctx := errgroup.WithContext(ctx)
 
-		eg, egctx := errgroup.WithContext(ctx)
-
-		var parentSnapshotIDs []string
-		switch cr.parentKind() {
-		case Layer:
-			eg.Go(func() error {
-				parentSnapshotIDs = append(parentSnapshotIDs, cr.layerParent.getSnapshotID())
-				if err := cr.layerParent.prepareMount(egctx, dhs, s); err != nil {
-					return err
-				}
-				return nil
-			})
-		case Merge:
-			for _, parent := range cr.mergeParents {
-				parent := parent
-				parentSnapshotIDs = append(parentSnapshotIDs, parent.getSnapshotID())
+			switch cr.parentKind() {
+			case Layer:
 				eg.Go(func() error {
-					if err := parent.prepareMount(egctx, dhs, s); err != nil {
+					if err := cr.layerParent.prepareMount(egctx, dhs, s); err != nil {
 						return err
 					}
 					return nil
 				})
-			}
-		case None:
-			// "parent" is just an empty snapshot
-			parentSnapshotIDs = append(parentSnapshotIDs, "")
-		}
-
-		var dh *DescHandler
-		var desc ocispecs.Descriptor
-		if cr.getBlobOnly() {
-			var err error
-			desc, err = cr.ociDesc(ctx, dhs)
-			if err != nil {
-				return nil, err
-			}
-			dh = dhs[desc.Digest]
-
-			eg.Go(func() error {
-				// unlazies if needed, otherwise a no-op
-				return lazyRefProvider{
-					rec:     cr,
-					desc:    desc,
-					dh:      dh,
-					session: s,
-				}.Unlazy(egctx)
-			})
-		}
-
-		if err := eg.Wait(); err != nil {
-			return nil, err
-		}
-
-		if cr.getBlobOnly() {
-			if dh != nil && dh.Progress != nil {
-				_, stopProgress := dh.Progress.Start(ctx)
-				defer stopProgress(rerr)
-				statusDone := dh.Progress.Status("extracting "+desc.Digest.String(), "extracting")
-				defer statusDone()
-			}
-
-			var parentSnapshot string
-			if cr.layerParent != nil {
-				parentSnapshot = cr.layerParent.getSnapshotID()
-			}
-			tmpSnapshotID := identity.NewID()
-			if err := cr.cm.Snapshotter.Prepare(ctx, tmpSnapshotID, parentSnapshot); err != nil {
-				if !errors.Is(err, errdefs.ErrAlreadyExists) {
-					return nil, errors.Wrap(err, "failed to prepare for extraction")
+			case Merge:
+				for _, parent := range cr.mergeParents {
+					parent := parent
+					eg.Go(func() error {
+						if err := parent.prepareMount(egctx, dhs, s); err != nil {
+							return err
+						}
+						return nil
+					})
 				}
 			}
 
-			mountable, err := cr.cm.Snapshotter.Mounts(ctx, tmpSnapshotID)
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to get mountable for extraction")
-			}
-			mounts, unmount, err := mountable.Mount()
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to get mounts for extraction")
-			}
-			_, err = cr.cm.Applier.Apply(ctx, desc, mounts)
-			if err != nil {
-				unmount()
-				return nil, errors.Wrap(err, "failed to apply blob extraction")
+			var dh *DescHandler
+			var desc ocispecs.Descriptor
+			if cr.getBlobOnly() {
+				var err error
+				desc, err = cr.ociDesc(ctx, dhs)
+				if err != nil {
+					return nil, err
+				}
+				dh = dhs[desc.Digest]
+
+				eg.Go(func() error {
+					// unlazies if needed, otherwise a no-op
+					return lazyRefProvider{
+						rec:     cr,
+						desc:    desc,
+						dh:      dh,
+						session: s,
+					}.Unlazy(egctx)
+				})
 			}
 
-			if err := unmount(); err != nil {
-				return nil, errors.Wrap(err, "failed to unmount extraction target")
-			}
-			if err := cr.cm.Snapshotter.Commit(ctx, cr.getSnapshotID(), tmpSnapshotID); err != nil {
-				if !errors.Is(err, errdefs.ErrAlreadyExists) {
-					return nil, errors.Wrap(err, "failed to commit extraction")
-				}
-			}
-			cr.queueBlobOnly(false)
-			cr.queueSize(sizeUnknown)
-			if err := cr.commitMetadata(); err != nil {
+			if err := eg.Wait(); err != nil {
 				return nil, err
+			}
+
+			if cr.getBlobOnly() {
+				if dh != nil && dh.Progress != nil {
+					_, stopProgress := dh.Progress.Start(ctx)
+					defer stopProgress(rerr)
+					statusDone := dh.Progress.Status("extracting "+desc.Digest.String(), "extracting")
+					defer statusDone()
+				}
+
+				var parentSnapshot string
+				if cr.layerParent != nil {
+					parentSnapshot = cr.layerParent.getSnapshotID()
+				}
+				tmpSnapshotID := identity.NewID()
+				if err := cr.cm.Snapshotter.Prepare(ctx, tmpSnapshotID, parentSnapshot); err != nil {
+					if !errors.Is(err, errdefs.ErrAlreadyExists) {
+						return nil, errors.Wrap(err, "failed to prepare for extraction")
+					}
+				}
+
+				mountable, err := cr.cm.Snapshotter.Mounts(ctx, tmpSnapshotID)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to get mountable for extraction")
+				}
+				mounts, unmount, err := mountable.Mount()
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to get mounts for extraction")
+				}
+				_, err = cr.cm.Applier.Apply(ctx, desc, mounts)
+				if err != nil {
+					unmount()
+					return nil, errors.Wrap(err, "failed to apply blob extraction")
+				}
+
+				if err := unmount(); err != nil {
+					return nil, errors.Wrap(err, "failed to unmount extraction target")
+				}
+				if err := cr.cm.Snapshotter.Commit(ctx, snapshotID, tmpSnapshotID); err != nil {
+					if !errors.Is(err, errdefs.ErrAlreadyExists) {
+						return nil, errors.Wrap(err, "failed to commit extraction")
+					}
+				}
+				cr.queueBlobOnly(false)
+				cr.queueSize(sizeUnknown)
+				if err := cr.commitMetadata(); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -840,7 +853,7 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 		switch cr.parentKind() {
 		case Layer, None:
 			if cr.mutable {
-				mountSnapshotID = cr.getSnapshotID()
+				mountSnapshotID = snapshotID
 			} else if cr.equalMutable != nil {
 				mountSnapshotID = cr.equalMutable.getSnapshotID()
 			} else {
@@ -865,13 +878,13 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 				}); err != nil && !errdefs.IsAlreadyExists(err) {
 					return nil, err
 				}
-				if err := cr.cm.Snapshotter.View(ctx, cr.viewSnapshotID(), cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
+				if err := cr.cm.Snapshotter.View(ctx, mountSnapshotID, snapshotID); err != nil && !errdefs.IsAlreadyExists(err) {
 					return nil, err
 				}
 			}
 		case Merge:
-			mountSnapshotID = cr.getSnapshotID()
-			if err := cr.cm.Snapshotter.Merge(ctx, cr.getSnapshotID(), parentSnapshotIDs); err != nil {
+			mountSnapshotID = snapshotID
+			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, cr.parentSnapshotIDs()); err != nil {
 				return nil, err
 			}
 		}
