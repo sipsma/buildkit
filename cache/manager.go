@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -677,6 +678,8 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		}
 	}()
 
+	// Merges use View snapshots, which will be created w/ ID set to snapshotID and
+	// held for the duration of this lease.
 	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
@@ -911,11 +914,11 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 		switch cr.parentKind() {
 		case Layer:
-			c.Parent = cr.layerParent.ID()
+			c.Parents = []string{cr.layerParent.ID()}
 		case Merge:
-			c.MergeParents = make([]string, len(cr.mergeParents))
+			c.Parents = make([]string, len(cr.mergeParents))
 			for i, p := range cr.mergeParents {
-				c.MergeParents[i] = p.ID()
+				c.Parents[i] = p.ID()
 			}
 		}
 		if c.Size == sizeUnknown && cr.equalImmutable != nil {
@@ -968,8 +971,7 @@ func (cm *cacheManager) markShared(m map[string]*cacheUsageInfo) error {
 			}
 			if v, ok := m[id]; ok {
 				v.shared = true
-				markAllParentsShared(v.parent)
-				markAllParentsShared(v.mergeParents...)
+				markAllParentsShared(v.parents...)
 			}
 		}
 	}
@@ -986,19 +988,18 @@ func (cm *cacheManager) markShared(m map[string]*cacheUsageInfo) error {
 }
 
 type cacheUsageInfo struct {
-	refs         int
-	parent       string
-	size         int64
-	mutable      bool
-	createdAt    time.Time
-	usageCount   int
-	lastUsedAt   *time.Time
-	description  string
-	doubleRef    bool
-	recordType   client.UsageRecordType
-	shared       bool
-	parentChain  []digest.Digest
-	mergeParents []string
+	refs        int
+	parents     []string
+	size        int64
+	mutable     bool
+	createdAt   time.Time
+	usageCount  int
+	lastUsedAt  *time.Time
+	description string
+	doubleRef   bool
+	recordType  client.UsageRecordType
+	shared      bool
+	parentChain []digest.Digest
 }
 
 func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo) ([]*client.UsageInfo, error) {
@@ -1039,11 +1040,11 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 
 		switch cr.parentKind() {
 		case Layer:
-			c.parent = cr.layerParent.ID()
+			c.parents = []string{cr.layerParent.ID()}
 		case Merge:
-			c.mergeParents = make([]string, len(cr.mergeParents))
+			c.parents = make([]string, len(cr.mergeParents))
 			for i, p := range cr.mergeParents {
-				c.mergeParents[i] = p.ID()
+				c.parents[i] = p.ID()
 			}
 		}
 		if cr.mutable && c.refs > 0 {
@@ -1062,19 +1063,12 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 		for id := range rescan {
 			v := m[id]
 			if v.refs == 0 {
-				fixDoubleRef := func(parent string) {
-					if parent == "" {
-						return
-					}
-					m[parent].refs--
+				for _, p := range v.parents {
+					m[p].refs--
 					if v.doubleRef {
-						m[parent].refs--
+						m[p].refs--
 					}
-					rescan[parent] = struct{}{}
-				}
-				fixDoubleRef(v.parent)
-				for _, p := range v.mergeParents {
-					fixDoubleRef(p)
+					rescan[p] = struct{}{}
 				}
 			}
 			delete(rescan, id)
@@ -1088,18 +1082,17 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 	var du []*client.UsageInfo
 	for id, cr := range m {
 		c := &client.UsageInfo{
-			ID:           id,
-			Mutable:      cr.mutable,
-			InUse:        cr.refs > 0,
-			Size:         cr.size,
-			Parent:       cr.parent,
-			CreatedAt:    cr.createdAt,
-			Description:  cr.description,
-			LastUsedAt:   cr.lastUsedAt,
-			UsageCount:   cr.usageCount,
-			RecordType:   cr.recordType,
-			Shared:       cr.shared,
-			MergeParents: cr.mergeParents,
+			ID:          id,
+			Mutable:     cr.mutable,
+			InUse:       cr.refs > 0,
+			Size:        cr.size,
+			Parents:     cr.parents,
+			CreatedAt:   cr.createdAt,
+			Description: cr.description,
+			LastUsedAt:  cr.lastUsedAt,
+			UsageCount:  cr.usageCount,
+			RecordType:  cr.recordType,
+			Shared:      cr.shared,
 		}
 		if filter.Match(adaptUsageInfo(c)) {
 			du = append(du, c)
@@ -1256,8 +1249,8 @@ func adaptUsageInfo(info *client.UsageInfo) filters.Adaptor {
 		switch fieldpath[0] {
 		case "id":
 			return info.ID, info.ID != ""
-		case "parent":
-			return info.Parent, info.Parent != ""
+		case "parents":
+			return strings.Join(info.Parents, ";"), len(info.Parents) > 0
 		case "description":
 			return info.Description, info.Description != ""
 		case "inuse":

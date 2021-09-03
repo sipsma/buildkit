@@ -62,11 +62,8 @@ func printKV(w io.Writer, k string, v interface{}) {
 func printVerbose(tw *tabwriter.Writer, du []*client.UsageInfo) {
 	for _, di := range du {
 		printKV(tw, "ID", di.ID)
-		if di.Parent != "" {
-			printKV(tw, "Parent", di.Parent)
-		}
-		if len(di.MergeParents) > 0 {
-			printKV(tw, "Merge Parents", strings.Join(di.MergeParents, " "))
+		if len(di.Parents) > 0 {
+			printKV(tw, "Parents", strings.Join(di.Parents, ";"))
 		}
 		printKV(tw, "Created at", di.CreatedAt)
 		printKV(tw, "Mutable", di.Mutable)

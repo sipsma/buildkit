@@ -38,18 +38,17 @@ func (c *Client) Prune(ctx context.Context, ch chan UsageInfo, opts ...PruneOpti
 		}
 		if ch != nil {
 			ch <- UsageInfo{
-				ID:           d.ID,
-				Mutable:      d.Mutable,
-				InUse:        d.InUse,
-				Size:         d.Size_,
-				Parent:       d.Parent,
-				CreatedAt:    d.CreatedAt,
-				Description:  d.Description,
-				UsageCount:   int(d.UsageCount),
-				LastUsedAt:   d.LastUsedAt,
-				RecordType:   UsageRecordType(d.RecordType),
-				Shared:       d.Shared,
-				MergeParents: d.MergeParents,
+				ID:          d.ID,
+				Mutable:     d.Mutable,
+				InUse:       d.InUse,
+				Size:        d.Size_,
+				Parents:     d.Parents,
+				CreatedAt:   d.CreatedAt,
+				Description: d.Description,
+				UsageCount:  int(d.UsageCount),
+				LastUsedAt:  d.LastUsedAt,
+				RecordType:  UsageRecordType(d.RecordType),
+				Shared:      d.Shared,
 			}
 		}
 	}

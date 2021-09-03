@@ -156,17 +156,25 @@ func getOverlayUpperdir(lower, upper []mount.Mount) (string, error) {
 		}
 
 		// Get layer directories of upper snapshot
+		var upperlayers []string
 		upperM := upper[0]
-		if upperM.Type != "overlay" {
+		switch upperM.Type {
+		case "bind":
+			upperlayers = []string{upperM.Source}
+		case "overlay":
+			var err error
+			upperlayers, err = getOverlayLayers(upperM)
+			if err != nil {
+				return "", err
+			}
+		default:
 			return "", errors.Errorf("upper snapshot isn't overlay mounted (type = %q)", upperM.Type)
 		}
-		upperlayers, err := getOverlayLayers(upperM)
-		if err != nil {
-			return "", err
-		}
 
-		// Check if the diff directory can be determined
-		if len(upperlayers) != len(lowerlayers)+1 {
+		// Check if the diff directory can be determined. You can end up with equal upper and lower layers
+		// when an empty layer is created and optimized out of a mount by snapshotter code. Check for that
+		// case plus the more common one of upper having one extra layer on top of lower.
+		if len(upperlayers) != len(lowerlayers)+1 && len(upperlayers) != len(lowerlayers) {
 			return "", errors.Errorf("cannot determine diff of more than one upper directories")
 		}
 		for i := 0; i < len(lowerlayers); i++ {
@@ -174,12 +182,13 @@ func getOverlayUpperdir(lower, upper []mount.Mount) (string, error) {
 				return "", errors.Errorf("layer %d must be common between upper and lower snapshots", i)
 			}
 		}
-		upperdir = upperlayers[len(upperlayers)-1] // get the topmost layer that indicates diff
+		if len(upperlayers) != len(lowerlayers) {
+			// Set an upperdir if there is a diff. If upper and lower were equal mounts, then there
+			// is no diff and an empty archive should be created, return "" as upperdir.
+			upperdir = upperlayers[len(upperlayers)-1] // get the topmost layer that indicates diff
+		}
 	} else {
 		return "", errors.Errorf("multiple mount configurations are not supported")
-	}
-	if upperdir == "" {
-		return "", errors.Errorf("cannot determine upperdir from mount option")
 	}
 	return upperdir, nil
 }
@@ -197,7 +206,7 @@ func getOverlayLayers(m mount.Mount) ([]string, error) {
 			for i, j := 0, len(l)-1; i < j; i, j = i+1, j-1 {
 				l[i], l[j] = l[j], l[i] // make l[0] = bottommost
 			}
-		} else if strings.HasPrefix(o, "workdir=") || o == "index=off" || o == "userxattr" {
+		} else if strings.HasPrefix(o, "workdir=") || o == "index=off" || o == "metacopy=off" || o == "userxattr" {
 			// these options are possible to specfied by the snapshotter but not indicate dir locations.
 			continue
 		} else {
@@ -215,6 +224,11 @@ func getOverlayLayers(m mount.Mount) ([]string, error) {
 // writeOverlayUpperdir writes a layer tar archive into the specified writer, based on
 // the diff information stored in the upperdir.
 func writeOverlayUpperdir(ctx context.Context, w io.Writer, upperdir string, lower []mount.Mount) error {
+	if upperdir == "" {
+		// create an empty archive if the diff is empty
+		return archive.NewChangeWriter(w, "").Close()
+	}
+
 	emptyLower, err := ioutil.TempDir("", "buildkit") // empty directory used for the lower of diff view
 	if err != nil {
 		return errors.Wrapf(err, "failed to create temp dir")
