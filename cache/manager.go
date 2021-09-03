@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -611,11 +610,14 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		if p, ok := inputParent.(*immutableRef); ok {
 			parent = p
 		} else {
+			// inputParent implements ImmutableRef but isn't our internal struct, get an instance of the internal struct
+			// by calling Get on its ID.
 			p, err := cm.Get(ctx, inputParent.ID(), append(opts, NoUpdateLastUsed)...)
 			if err != nil {
 				return nil, err
 			}
 			parent = p.(*immutableRef)
+			defer parent.Release(context.TODO())
 		}
 		switch parent.parentKind() {
 		case Merge:
@@ -909,10 +911,11 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 		switch cr.parentKind() {
 		case Layer:
-			c.Parents = append(c.Parents, cr.layerParent.ID())
+			c.Parent = cr.layerParent.ID()
 		case Merge:
-			for _, p := range cr.mergeParents {
-				c.Parents = append(c.Parents, p.ID())
+			c.MergeParents = make([]string, len(cr.mergeParents))
+			for i, p := range cr.mergeParents {
+				c.MergeParents[i] = p.ID()
 			}
 		}
 		if c.Size == sizeUnknown && cr.equalImmutable != nil {
@@ -960,9 +963,13 @@ func (cm *cacheManager) markShared(m map[string]*cacheUsageInfo) error {
 	var markAllParentsShared func(...string)
 	markAllParentsShared = func(ids ...string) {
 		for _, id := range ids {
+			if id == "" {
+				continue
+			}
 			if v, ok := m[id]; ok {
 				v.shared = true
-				markAllParentsShared(v.parents...)
+				markAllParentsShared(v.parent)
+				markAllParentsShared(v.mergeParents...)
 			}
 		}
 	}
@@ -979,18 +986,19 @@ func (cm *cacheManager) markShared(m map[string]*cacheUsageInfo) error {
 }
 
 type cacheUsageInfo struct {
-	refs        int
-	parents     []string
-	size        int64
-	mutable     bool
-	createdAt   time.Time
-	usageCount  int
-	lastUsedAt  *time.Time
-	description string
-	doubleRef   bool
-	recordType  client.UsageRecordType
-	shared      bool
-	parentChain []digest.Digest
+	refs         int
+	parent       string
+	size         int64
+	mutable      bool
+	createdAt    time.Time
+	usageCount   int
+	lastUsedAt   *time.Time
+	description  string
+	doubleRef    bool
+	recordType   client.UsageRecordType
+	shared       bool
+	parentChain  []digest.Digest
+	mergeParents []string
 }
 
 func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo) ([]*client.UsageInfo, error) {
@@ -1031,10 +1039,11 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 
 		switch cr.parentKind() {
 		case Layer:
-			c.parents = append(c.parents, cr.layerParent.ID())
+			c.parent = cr.layerParent.ID()
 		case Merge:
-			for _, p := range cr.mergeParents {
-				c.parents = append(c.parents, p.ID())
+			c.mergeParents = make([]string, len(cr.mergeParents))
+			for i, p := range cr.mergeParents {
+				c.mergeParents[i] = p.ID()
 			}
 		}
 		if cr.mutable && c.refs > 0 {
@@ -1053,12 +1062,19 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 		for id := range rescan {
 			v := m[id]
 			if v.refs == 0 {
-				for _, p := range v.parents {
-					m[p].refs--
-					if v.doubleRef {
-						m[p].refs--
+				fixDoubleRef := func(parent string) {
+					if parent == "" {
+						return
 					}
-					rescan[p] = struct{}{}
+					m[parent].refs--
+					if v.doubleRef {
+						m[parent].refs--
+					}
+					rescan[parent] = struct{}{}
+				}
+				fixDoubleRef(v.parent)
+				for _, p := range v.mergeParents {
+					fixDoubleRef(p)
 				}
 			}
 			delete(rescan, id)
@@ -1072,17 +1088,18 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 	var du []*client.UsageInfo
 	for id, cr := range m {
 		c := &client.UsageInfo{
-			ID:          id,
-			Mutable:     cr.mutable,
-			InUse:       cr.refs > 0,
-			Size:        cr.size,
-			Parents:     cr.parents,
-			CreatedAt:   cr.createdAt,
-			Description: cr.description,
-			LastUsedAt:  cr.lastUsedAt,
-			UsageCount:  cr.usageCount,
-			RecordType:  cr.recordType,
-			Shared:      cr.shared,
+			ID:           id,
+			Mutable:      cr.mutable,
+			InUse:        cr.refs > 0,
+			Size:         cr.size,
+			Parent:       cr.parent,
+			CreatedAt:    cr.createdAt,
+			Description:  cr.description,
+			LastUsedAt:   cr.lastUsedAt,
+			UsageCount:   cr.usageCount,
+			RecordType:   cr.recordType,
+			Shared:       cr.shared,
+			MergeParents: cr.mergeParents,
 		}
 		if filter.Match(adaptUsageInfo(c)) {
 			du = append(du, c)
@@ -1240,7 +1257,7 @@ func adaptUsageInfo(info *client.UsageInfo) filters.Adaptor {
 		case "id":
 			return info.ID, info.ID != ""
 		case "parent":
-			return strings.Join(info.Parents, ","), len(info.Parents) > 0
+			return info.Parent, info.Parent != ""
 		case "description":
 			return info.Description, info.Description != ""
 		case "inuse":

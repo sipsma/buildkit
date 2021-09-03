@@ -344,7 +344,7 @@ func TestNativeHardlinks(t *testing.T) {
 			mergeDir := getBindDir(ctx, t, sn, mergeSnap.Name)
 
 			stat1 := syscallStat(t, filepath.Join(mergeDir, "1"))
-			require.EqualValues(t, 1, stat1.Nlink)
+			require.EqualValues(t, 2, stat1.Nlink)
 			stat1Ino := stat1.Ino
 
 			stat2 := syscallStat(t, filepath.Join(mergeDir, "2"))
@@ -468,9 +468,9 @@ func TestUsage(t *testing.T) {
 				require.EqualValues(t, 0, mergeSnap.Inodes)
 				require.EqualValues(t, 0, mergeSnap.Size)
 			case "native":
-				// /, /foo, and /foo/1 were created/copied. Others should be hard-linked
-				require.EqualValues(t, 3, mergeSnap.Inodes)
-				require.EqualValues(t, 3*direntByteSize, mergeSnap.Size)
+				// / and /foo were created/copied. Others should be hard-linked
+				require.EqualValues(t, 2, mergeSnap.Inodes)
+				require.EqualValues(t, 2*direntByteSize, mergeSnap.Size)
 			case "native-nohardlink":
 				require.EqualValues(t, 6, mergeSnap.Inodes)
 				require.EqualValues(t, 5*direntByteSize, mergeSnap.Size)

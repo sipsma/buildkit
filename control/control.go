@@ -2,7 +2,6 @@ package control
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -106,17 +105,18 @@ func (c *Controller) DiskUsage(ctx context.Context, r *controlapi.DiskUsageReque
 		for _, r := range du {
 			resp.Record = append(resp.Record, &controlapi.UsageRecord{
 				// TODO: add worker info
-				ID:          r.ID,
-				Mutable:     r.Mutable,
-				InUse:       r.InUse,
-				Size_:       r.Size,
-				Parent:      strings.Join(r.Parents, ","),
-				UsageCount:  int64(r.UsageCount),
-				Description: r.Description,
-				CreatedAt:   r.CreatedAt,
-				LastUsedAt:  r.LastUsedAt,
-				RecordType:  string(r.RecordType),
-				Shared:      r.Shared,
+				ID:           r.ID,
+				Mutable:      r.Mutable,
+				InUse:        r.InUse,
+				Size_:        r.Size,
+				Parent:       r.Parent,
+				UsageCount:   int64(r.UsageCount),
+				Description:  r.Description,
+				CreatedAt:    r.CreatedAt,
+				LastUsedAt:   r.LastUsedAt,
+				RecordType:   string(r.RecordType),
+				Shared:       r.Shared,
+				MergeParents: r.MergeParents,
 			})
 		}
 	}
@@ -174,17 +174,18 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 			didPrune = true
 			if err := stream.Send(&controlapi.UsageRecord{
 				// TODO: add worker info
-				ID:          r.ID,
-				Mutable:     r.Mutable,
-				InUse:       r.InUse,
-				Size_:       r.Size,
-				Parent:      strings.Join(r.Parents, ","),
-				UsageCount:  int64(r.UsageCount),
-				Description: r.Description,
-				CreatedAt:   r.CreatedAt,
-				LastUsedAt:  r.LastUsedAt,
-				RecordType:  string(r.RecordType),
-				Shared:      r.Shared,
+				ID:           r.ID,
+				Mutable:      r.Mutable,
+				InUse:        r.InUse,
+				Size_:        r.Size,
+				Parent:       r.Parent,
+				UsageCount:   int64(r.UsageCount),
+				Description:  r.Description,
+				CreatedAt:    r.CreatedAt,
+				LastUsedAt:   r.LastUsedAt,
+				RecordType:   string(r.RecordType),
+				Shared:       r.Shared,
+				MergeParents: r.MergeParents,
 			}); err != nil {
 				return err
 			}

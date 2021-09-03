@@ -1361,7 +1361,7 @@ func TestMergeOp(t *testing.T) {
 	require.NoError(t, err)
 	size1, err := merge1.(*immutableRef).size(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 8192, size1) // hardlinking means all but the first snapshot doesn't take up space
+	require.EqualValues(t, 4096, size1) // hardlinking means all but the first snapshot doesn't take up space
 	checkDiskUsage(ctx, t, cm, 7, 0)
 
 	merge2, err := cm.Merge(ctx, baseRefs[3:])
@@ -1370,7 +1370,7 @@ func TestMergeOp(t *testing.T) {
 	require.NoError(t, err)
 	size2, err := merge2.(*immutableRef).size(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 8192, size2)
+	require.EqualValues(t, 4096, size2)
 	checkDiskUsage(ctx, t, cm, 8, 0)
 
 	for _, ref := range baseRefs {
@@ -1387,7 +1387,7 @@ func TestMergeOp(t *testing.T) {
 	require.NoError(t, err)
 	size3, err := merge3.(*immutableRef).size(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 8192, size3)
+	require.EqualValues(t, 4096, size3)
 	require.Len(t, merge3.(*immutableRef).mergeParents, 6)
 	checkDiskUsage(ctx, t, cm, 7, 2)
 

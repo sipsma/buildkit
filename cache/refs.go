@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
@@ -110,8 +111,10 @@ const (
 	Merge
 )
 
+// parentRefs is a disjoint union type that holds either a single layerParent for this record, a list
+// of parents if this is a merged record or all nil fields if this record has no parents. At most one
+// field should be non-nil at a time.
 type parentRefs struct {
-	// layerParent and mergeParents are mutually exclusive, at most one at a time should be set non-nil
 	layerParent  *immutableRef
 	mergeParents []*immutableRef
 }
@@ -127,23 +130,27 @@ func (p parentRefs) parentKind() parentKind {
 }
 
 // caller must hold cacheManager.mu
-func (p parentRefs) release(ctx context.Context) error {
+func (p parentRefs) release(ctx context.Context) (rerr error) {
 	switch p.parentKind() {
 	case Layer:
 		p.layerParent.mu.Lock()
 		defer p.layerParent.mu.Unlock()
 		return p.layerParent.release(ctx)
 	case Merge:
-		for _, parent := range p.mergeParents {
+		for i, parent := range p.mergeParents {
+			if parent == nil {
+				continue
+			}
 			parent.mu.Lock()
 			if err := parent.release(ctx); err != nil {
-				parent.mu.Unlock()
-				return err
+				rerr = multierror.Append(rerr, err).ErrorOrNil()
+			} else {
+				p.mergeParents[i] = nil
 			}
 			parent.mu.Unlock()
 		}
 	}
-	return nil
+	return rerr
 }
 
 func (p parentRefs) clone() parentRefs {
@@ -151,9 +158,9 @@ func (p parentRefs) clone() parentRefs {
 	case Layer:
 		p.layerParent = p.layerParent.clone()
 	case Merge:
-		var newParents []*immutableRef
-		for _, p := range p.mergeParents {
-			newParents = append(newParents, p.clone())
+		newParents := make([]*immutableRef, len(p.mergeParents))
+		for i, p := range p.mergeParents {
+			newParents[i] = p.clone()
 		}
 		p.mergeParents = newParents
 	}
@@ -165,9 +172,9 @@ func (p parentRefs) parentSnapshotIDs() []string {
 	case Layer:
 		return []string{p.layerParent.getSnapshotID()}
 	case Merge:
-		var snapshots []string
-		for _, p := range p.mergeParents {
-			snapshots = append(snapshots, p.getSnapshotID())
+		snapshots := make([]string, len(p.mergeParents))
+		for i, p := range p.mergeParents {
+			snapshots[i] = p.getSnapshotID()
 		}
 		return snapshots
 	}
@@ -197,13 +204,14 @@ func (cr *cacheRecord) layerDigestChain() []digest.Digest {
 	if cr.layerDigestChainCache != nil {
 		return cr.layerDigestChainCache
 	}
-	var dgsts []digest.Digest
-	for _, layer := range cr.layerChain() {
+	layerChain := cr.layerChain()
+	dgsts := make([]digest.Digest, len(layerChain))
+	for i, layer := range layerChain {
 		dgst := layer.getBlob()
 		if dgst == "" {
 			return nil
 		}
-		dgsts = append(dgsts, dgst)
+		dgsts[i] = dgst
 	}
 	cr.layerDigestChainCache = dgsts
 	return dgsts
@@ -216,6 +224,11 @@ func (cr *cacheRecord) isDead() bool {
 
 var errSkipWalk = errors.New("skip")
 
+// walkRecords calls the provided func on cr and each of its ancestors, counting both layer
+// and merge parents. It starts at cr and does a depth-first walk to parents. It will visit
+// a record and its parents multiple times if encountered more than once. It will only skip
+// visiting parents of a record if errSkipWalk is returned. If any other error is returned,
+// the walk will stop and return the error to the caller.
 func (cr *cacheRecord) walkRecords(f func(*cacheRecord) error) error {
 	curs := []*cacheRecord{cr}
 	for len(curs) > 0 {
@@ -227,16 +240,19 @@ func (cr *cacheRecord) walkRecords(f func(*cacheRecord) error) error {
 			}
 			return err
 		}
-		if cur.layerParent != nil {
+		switch cur.parentKind() {
+		case Layer:
 			curs = append(curs, cur.layerParent.cacheRecord)
-		}
-		for _, p := range cur.mergeParents {
-			curs = append(curs, p.cacheRecord)
+		case Merge:
+			for _, p := range cur.mergeParents {
+				curs = append(curs, p.cacheRecord)
+			}
 		}
 	}
 	return nil
 }
 
+// walkUniqueRecords calls walkRecords but skips a record if it's already been visited.
 func (cr *cacheRecord) walkUniqueRecords(f func(*cacheRecord) error) error {
 	memo := make(map[*cacheRecord]struct{})
 	return cr.walkRecords(func(cr *cacheRecord) error {
@@ -300,9 +316,11 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 			driverID = cr.equalMutable.getSnapshotID()
 		}
 		cr.mu.Unlock()
-		var totalSize int64
+		var usage snapshots.Usage
 		if !cr.getBlobOnly() {
-			if usage, err := cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID); err != nil {
+			var err error
+			usage, err = cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID)
+			if err != nil {
 				cr.mu.Lock()
 				isDead := cr.isDead()
 				cr.mu.Unlock()
@@ -312,14 +330,12 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 				if !errors.Is(err, errdefs.ErrNotFound) {
 					return s, errors.Wrapf(err, "failed to get usage for %s", cr.ID())
 				}
-			} else {
-				totalSize += usage.Size
 			}
 		}
 		if dgst := cr.getBlob(); dgst != "" {
 			info, err := cr.cm.ContentStore.Info(ctx, digest.Digest(dgst))
 			if err == nil {
-				totalSize += info.Size
+				usage.Size += info.Size
 			}
 			for k, v := range info.Labels {
 				// accumulate size of compression variant blobs
@@ -330,20 +346,20 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 							continue
 						}
 						if info, err := cr.cm.ContentStore.Info(ctx, cdgst); err == nil {
-							totalSize += info.Size
+							usage.Size += info.Size
 						}
 					}
 				}
 			}
 		}
 		cr.mu.Lock()
-		cr.queueSize(totalSize)
+		cr.queueSize(usage.Size)
 		if err := cr.commitMetadata(); err != nil {
 			cr.mu.Unlock()
 			return s, err
 		}
 		cr.mu.Unlock()
-		return totalSize, nil
+		return usage.Size, nil
 	})
 	if err != nil {
 		return 0, err

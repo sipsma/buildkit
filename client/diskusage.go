@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"sort"
-	"strings"
 	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -16,13 +15,14 @@ type UsageInfo struct {
 	InUse   bool
 	Size    int64
 
-	CreatedAt   time.Time
-	LastUsedAt  *time.Time
-	UsageCount  int
-	Parents     []string
-	Description string
-	RecordType  UsageRecordType
-	Shared      bool
+	CreatedAt    time.Time
+	LastUsedAt   *time.Time
+	UsageCount   int
+	Parent       string
+	Description  string
+	RecordType   UsageRecordType
+	Shared       bool
+	MergeParents []string
 }
 
 func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*UsageInfo, error) {
@@ -41,17 +41,18 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 
 	for _, d := range resp.Record {
 		du = append(du, &UsageInfo{
-			ID:          d.ID,
-			Mutable:     d.Mutable,
-			InUse:       d.InUse,
-			Size:        d.Size_,
-			Parents:     strings.Split(d.Parent, ","),
-			CreatedAt:   d.CreatedAt,
-			Description: d.Description,
-			UsageCount:  int(d.UsageCount),
-			LastUsedAt:  d.LastUsedAt,
-			RecordType:  UsageRecordType(d.RecordType),
-			Shared:      d.Shared,
+			ID:           d.ID,
+			Mutable:      d.Mutable,
+			InUse:        d.InUse,
+			Size:         d.Size_,
+			Parent:       d.Parent,
+			CreatedAt:    d.CreatedAt,
+			Description:  d.Description,
+			UsageCount:   int(d.UsageCount),
+			LastUsedAt:   d.LastUsedAt,
+			RecordType:   UsageRecordType(d.RecordType),
+			Shared:       d.Shared,
+			MergeParents: d.MergeParents,
 		})
 	}
 
