@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/mount"
@@ -46,4 +47,20 @@ func withTempMount(ctx context.Context, mounts []mount.Mount, f func(root string
 		}
 	}
 	return mount.WithTempMount(ctx, mounts, f)
+}
+
+// TODO: make this not ugly, dedupe with other code
+func withApplyMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	if len(mounts) == 1 {
+		mnt := mounts[0]
+		if mnt.Type == "overlay" {
+			for _, opt := range mnt.Options {
+				if strings.HasPrefix(opt, "upperdir=") {
+					upperdir := strings.SplitN(opt, "=", 2)[1]
+					return f(upperdir)
+				}
+			}
+		}
+	}
+	return withTempMount(ctx, mounts, f)
 }

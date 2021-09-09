@@ -1,22 +1,23 @@
+//go:build linux
 // +build linux
 
 package snapshot
 
 import (
+	"bytes"
 	"context"
-	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
+	"syscall"
 
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
-	"github.com/hashicorp/go-multierror"
+	"github.com/containerd/continuity/devices"
+	"github.com/containerd/continuity/fs"
+	"github.com/containerd/continuity/sysx"
 	"github.com/moby/buildkit/identity"
-	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
@@ -55,320 +56,204 @@ func needsUserXAttr(ctx context.Context, sn snapshots.Snapshotter, lm leases.Man
 	return userxattr, nil
 }
 
-// fixOpaqueDirs finds directories that have been marked opaque despite no dirents being located under them
-// in lower dirs. This happens due to a opportunistic kernel optimization, but we don't it because it causes
-// merges to have unnecessary opaque conflicts.
-func fixOpaqueDirs(ctx context.Context, mounts []mount.Mount, userxattr bool) error {
-	if len(mounts) != 1 {
-		return errors.New("fixing opaque dirs only supports single mount lists")
-	}
-	m := mounts[0]
-	// make a copy of options so modifications to it don't affect passed parameter
-	m.Options = append([]string{}, m.Options...)
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO: all of the below is just copy pasted from the cache package to avoid an import loop, should obviously be deduped in a nicer way
+// There's also some small changes, namely to make sure that opaque dirs are first deleted and then recreated
 
-	var fixupDir string    // the dir we will check for unneeded opaques
-	var lowerdirs []string // the extracted lowerdirs that will be checked to see if a given opaque is needed or not
-	for i, opt := range m.Options {
-		if v := strings.SplitN(opt, "lowerdir=", 2); len(v) == 2 && v[0] == "" {
-			lowerdirs = strings.Split(v[1], ":")
-			if len(lowerdirs) < 2 {
-				return errors.New("invalid mount for fixing opaque dirs")
-			}
-			fixupDir = lowerdirs[0]
-			var emptyLowerdir string
-			var filteredLowerdirs []string
-			for _, lower := range lowerdirs[1:] {
-				if dirents, err := os.ReadDir(lower); err != nil {
-					return errors.Wrap(err, "failed to read dirents of lowerdir while fixing opaque dirs")
-				} else if len(dirents) == 0 {
-					emptyLowerdir = lower
-					continue
-				}
-				filteredLowerdirs = append(filteredLowerdirs, lower)
-			}
-			if len(filteredLowerdirs) == 0 {
-				filteredLowerdirs = []string{emptyLowerdir}
-			}
-			lowerdirs = filteredLowerdirs
-			m.Options[i] = "lowerdir=" + strings.Join(lowerdirs, ":")
-			continue
+// overlayChanges is continuty's `fs.Change`-like method but leverages overlayfs's
+// "upperdir" for computing the diff. "upperdirView" is overlayfs mounted view of
+// the upperdir that doesn't contain whiteouts. This is used for computing
+// changes under opaque directories.
+func overlayChanges(ctx context.Context, changeFn fs.ChangeFunc, upperdir, upperdirView, base string) error {
+	return filepath.Walk(upperdir, func(path string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-		if strings.HasPrefix(opt, "upperdir=") {
-			return errors.New("fixing opaque dirs only supports read-only overlays")
+
+		// Rebase path
+		path, err = filepath.Rel(upperdir, path)
+		if err != nil {
+			return err
 		}
-		if opt == "bind" || opt == "rbind" {
-			// if the provided mount is a bind or rbind, it can't have opaque dirs
-			// TODO:(sipsma) this will no longer be true once diffop is in place
+		path = filepath.Join(string(os.PathSeparator), path)
+
+		// Skip root
+		if path == string(os.PathSeparator) {
 			return nil
 		}
-	}
-	if len(lowerdirs) == 1 {
-		m = mount.Mount{
-			Type:    "rbind",
-			Source:  lowerdirs[0],
-			Options: []string{"rbind", "ro"},
+
+		// Check if this is a deleted entry
+		isDelete, skip, err := checkDelete(upperdir, path, base, f)
+		if err != nil {
+			return err
+		} else if skip {
+			return nil
 		}
-	}
 
-	var opaqueXattrName string
-	if userxattr {
-		opaqueXattrName = userOpaqueXattr
-	} else {
-		opaqueXattrName = trustedOpaqueXattr
-	}
-
-	return withTempMount(ctx, []mount.Mount{m}, func(lowerdir string) error {
-		return filepath.WalkDir(fixupDir, func(path string, info fs.DirEntry, err error) error {
+		var kind fs.ChangeKind
+		var skipRecord bool
+		var isOpaque bool
+		if isDelete {
+			// This is a deleted entry.
+			kind = fs.ChangeKindDelete
+			f = nil
+		} else if baseF, err := os.Lstat(filepath.Join(base, path)); err == nil {
+			// File exists in the base layer. Thus this is modified.
+			kind = fs.ChangeKindModify
+			isOpaque, err = checkOpaque(upperdir, path, base, f)
 			if err != nil {
 				return err
 			}
-			if !info.IsDir() {
-				return nil
+			// Avoid including directory that hasn't been modified. If /foo/bar/baz is modified,
+			// then /foo will apper here even if it's not been modified because it's the parent of bar.
+			if same, err := sameDir(baseF, f, filepath.Join(base, path), filepath.Join(upperdirView, path)); same {
+				skipRecord = true // Both are the same, don't record the change
+			} else if err != nil {
+				return err
 			}
-			if _, err := unix.Lgetxattr(path, opaqueXattrName, make([]byte, 1)); err == nil {
-				relPath, err := filepath.Rel(fixupDir, path)
-				if err != nil {
+		} else if os.IsNotExist(err) {
+			// File doesn't exist in the base layer. Thus this is added.
+			kind = fs.ChangeKindAdd
+		} else if err != nil {
+			return err
+		}
+
+		if isOpaque {
+			if err := changeFn(fs.ChangeKindDelete, path, nil, nil); err != nil {
+				return err
+			}
+		}
+		if !skipRecord {
+			if err := changeFn(kind, path, f, nil); err != nil {
+				return err
+			}
+		}
+
+		if f != nil {
+			if isOpaque {
+				// This is an opaque directory. Start a new walking differ to get adds/deletes of
+				// this directory. We use "upperdirView" directory which doesn't contain whiteouts.
+				if err := fs.Changes(ctx, filepath.Join(base, path), filepath.Join(upperdirView, path),
+					func(k fs.ChangeKind, p string, f os.FileInfo, err error) error {
+						return changeFn(k, filepath.Join(path, p), f, err) // rebase path to be based on the opaque dir
+					},
+				); err != nil {
 					return err
 				}
-				if _, err := os.Lstat(filepath.Join(lowerdir, relPath)); os.IsNotExist(err) {
-					if err := unix.Lremovexattr(path, opaqueXattrName); err != nil {
-						return err
-					}
-				}
-				return fs.SkipDir // subdirs of an opaque dir can't also be opaque
+				return filepath.SkipDir // We completed this directory. Do not walk files under this directory anymore.
 			}
-			return nil
-		})
+		}
+		return nil
 	})
 }
 
-func (m mergedOverlay) Mount() (rmnts []mount.Mount, _ func() error, rerr error) {
-	type overlay struct {
-		lowerdirs []string
-		upperdir  string
-		workdir   string
-		options   []string
-	}
-
-	merge := func(a, b *overlay, retainUpper bool) (*overlay, error) {
-		if a == nil {
-			return nil, errors.New("invalid nil mount")
-		}
-		if b == nil {
-			return nil, errors.New("invalid nil mount")
-		}
-
-		c := &overlay{}
-		if !retainUpper && b.upperdir != "" {
-			c.lowerdirs = []string{b.upperdir}
-		}
-		c.lowerdirs = append(c.lowerdirs, b.lowerdirs...)
-		c.lowerdirs = append(c.lowerdirs, a.lowerdirs...)
-
-		c.upperdir = a.upperdir
-		c.workdir = a.workdir
-		if retainUpper && b.upperdir != "" {
-			if c.upperdir != "" {
-				return nil, fmt.Errorf("cannot merge overlays with multiple upper dirs")
+// checkDelete checks if the specified file is a whiteout
+func checkDelete(upperdir string, path string, base string, f os.FileInfo) (delete, skip bool, _ error) {
+	if f.Mode()&os.ModeCharDevice != 0 {
+		if _, ok := f.Sys().(*syscall.Stat_t); ok {
+			maj, min, err := devices.DeviceInfo(f)
+			if err != nil {
+				return false, false, errors.Wrapf(err, "failed to get device info")
 			}
-			c.upperdir = b.upperdir
-			c.workdir = b.workdir
-		}
-
-		// TODO:(sipsma) optimize by de-duplicating options between mounts (most snapshotters don't return extra mount
-		// options here, but if they did and the were duped, they would cause the 1-page size limit to be hit faster)
-		c.options = append(c.options, b.options...)
-
-		return c, nil
-	}
-
-	parse := func(mnt mount.Mount) (*overlay, error) {
-		if mnt.Type != "overlay" && mnt.Type != "bind" {
-			return nil, MergeNotSupportedError{Err: fmt.Errorf("invalid mount type: %s", mnt.Type)}
-		}
-
-		mm := &overlay{}
-		var isReadonly bool
-		for _, opt := range mnt.Options {
-			kv := strings.SplitN(opt, "=", 2)
-			if len(kv) == 1 {
-				kv = append(kv, "")
-			}
-			switch k, v := kv[0], kv[1]; k {
-			case "lowerdir":
-				mm.lowerdirs = strings.Split(v, ":")
-			case "upperdir":
-				mm.upperdir = v
-			case "workdir":
-				mm.workdir = v
-			case "index":
-				if v != "off" {
-					return nil, fmt.Errorf("overlay index option must be set to off")
+			if maj == 0 && min == 0 {
+				// This file is a whiteout (char 0/0) that indicates this is deleted from the base
+				if _, err := os.Lstat(filepath.Join(base, path)); err != nil {
+					if !os.IsNotExist(err) {
+						return false, false, errors.Wrapf(err, "failed to lstat")
+					}
+					// This file doesn't exist even in the base dir.
+					// We don't need whiteout. Just skip this file.
+					return false, true, nil
 				}
-			case "metacopy":
-				if v != "off" {
-					return nil, fmt.Errorf("overlay metacopy option must be set to off")
-				}
-			case "userxattr":
-				if !m.userxattr {
-					return nil, fmt.Errorf("conflicting userxattr options")
-				}
-			case "bind", "rbind":
-				mm.upperdir = mnt.Source
-				// Note: In the obscure case where a snapshotter returns "rbind" and actually expects submounts to be
-				// included with the bind, they will not be included if we return an overlay mount. This is due to the
-				// fact that the kernel overlay implementation doesn't include submounts of lower/upper dirs when
-				// constructing overlay mounts. As of this writing, there doesn't appear to be any such snapshotters
-				// among the ones I'm aware of.
-			case "ro":
-				isReadonly = true
-			case "rw":
-				isReadonly = false
-			case "remount":
-				return nil, fmt.Errorf("cannot create mount with remount option set")
-			default:
-				mm.options = append(mm.options, opt)
+				return true, false, nil
 			}
 		}
-
-		// if we encountered a (r)bind option and then later an "ro" option, then we need to ensure we set the bind source
-		// as a read-only lowerdir, not upperdir
-		if isReadonly && mm.upperdir != "" {
-			mm.lowerdirs = append([]string{mm.upperdir}, mm.lowerdirs...)
-			mm.upperdir = ""
-			mm.workdir = ""
-		}
-
-		return mm, nil
 	}
-
-	if len(m.parents) == 0 {
-		return nil, nil, fmt.Errorf("invalid merge mount with no parents")
-	}
-
-	cleanupFuncs := []func() error{m.cleanup}
-	doCleanup := func() error {
-		var err error
-		for i := range cleanupFuncs {
-			f := cleanupFuncs[len(cleanupFuncs)-1-i]
-			if f != nil {
-				err = multierror.Append(err, f()).ErrorOrNil()
-			}
-		}
-		return err
-	}
-	defer func() {
-		if rerr != nil {
-			if err := doCleanup(); err != nil {
-				bklog.G(context.TODO()).Errorf("failed to cleanup mount: %v", err)
-			}
-		}
-	}()
-
-	mm := &overlay{}
-	for i, parent := range m.parents {
-		newMM, err := parse(parent)
-		if err != nil {
-			return nil, nil, err
-		}
-		mm, err = merge(mm, newMM, i == len(m.parents)-1) // retain the upperdir only of the last parent
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// De-dupe lowerdirs; if a lower appears more than once, then remove all occurrences besides the first one. This
-	// is necessary for recent kernel overlay implementations that will return ELOOP if a lowerdir is repeated.
-	// Additionally, if a lowerdir has no contents, leave it out as it can't have any impact on the overlay mount
-	// except for bringing it closer to the max number of lowerdirs.
-	var filteredLowers []string
-	memo := map[string]struct{}{}
-	if mm.upperdir != "" {
-		// also dedupe any occurrences of the upperdir from lowerdirs
-		memo[mm.upperdir] = struct{}{}
-	}
-	var emptyLowerdir string
-	for _, lower := range mm.lowerdirs {
-		if _, ok := memo[lower]; ok {
-			continue
-		}
-		memo[lower] = struct{}{}
-		if dirents, err := os.ReadDir(lower); err != nil {
-			return nil, nil, errors.Wrap(err, "failed to read dirents of lowerdir during merge")
-		} else if len(dirents) == 0 {
-			emptyLowerdir = lower
-			continue
-		}
-		filteredLowers = append(filteredLowers, lower)
-	}
-	mm.lowerdirs = filteredLowers
-	if len(mm.lowerdirs) == 0 && mm.upperdir == "" && emptyLowerdir != "" {
-		// If every lowerdir was empty and thus filtered out, we could end up with no lowerdirs or
-		// an upperdir. Just use one of the empty lowerdirs in that case.
-		mm.lowerdirs = []string{emptyLowerdir}
-	}
-
-	// single read-only layer, return a ro bind mount
-	if mm.upperdir == "" && len(mm.lowerdirs) == 1 {
-		return []mount.Mount{{
-			Type:   "bind",
-			Source: mm.lowerdirs[0],
-			Options: append(mm.options,
-				"rbind",
-				"ro",
-			),
-		}}, doCleanup, nil
-	}
-
-	// single read-write layer, return a rw bind mount
-	if mm.upperdir != "" && len(mm.lowerdirs) == 0 {
-		return []mount.Mount{{
-			Type:   "bind",
-			Source: mm.upperdir,
-			Options: append(mm.options,
-				"rbind",
-				"rw",
-			),
-		}}, doCleanup, nil
-	}
-
-	// multiple layers, return an overlay mount
-	if mm.upperdir != "" && mm.workdir == "" {
-		return nil, nil, fmt.Errorf("invalid empty workdir when upperdir set")
-	}
-
-	if _, err := os.Stat("/sys/module/overlay/parameters/index"); err == nil {
-		mm.options = append(mm.options, "index=off")
-	}
-	if _, err := os.Stat("/sys/module/overlay/parameters/metacopy"); err == nil {
-		mm.options = append(mm.options, "metacopy=off")
-	}
-
-	if m.userxattr {
-		mm.options = append(mm.options, "userxattr")
-	}
-
-	mm.options = append(mm.options, fmt.Sprintf("lowerdir=%s", strings.Join(mm.lowerdirs, ":")))
-	if mm.upperdir != "" {
-		mm.options = append(mm.options, fmt.Sprintf("upperdir=%s", mm.upperdir))
-		mm.options = append(mm.options, fmt.Sprintf("workdir=%s", mm.workdir))
-	}
-
-	return []mount.Mount{{
-		Type:    "overlay",
-		Source:  "overlay",
-		Options: mm.options,
-	}}, doCleanup, nil
+	return false, false, nil
 }
 
-type MergeNotSupportedError struct {
-	Err error
+// checkDelete checks if the specified file is an opaque directory
+func checkOpaque(upperdir string, path string, base string, f os.FileInfo) (isOpaque bool, _ error) {
+	if f.IsDir() {
+		for _, oKey := range []string{"trusted.overlay.opaque", "user.overlay.opaque"} {
+			opaque, err := sysx.LGetxattr(filepath.Join(upperdir, path), oKey)
+			if err != nil && err != unix.ENODATA && err != unix.ENOTSUP {
+				return false, errors.Wrapf(err, "failed to retrieve %s attr", oKey)
+			} else if len(opaque) == 1 && opaque[0] == 'y' {
+				// This is an opaque whiteout directory.
+				if _, err := os.Lstat(filepath.Join(base, path)); err != nil {
+					if !os.IsNotExist(err) {
+						return false, errors.Wrapf(err, "failed to lstat")
+					}
+					// This file doesn't exist even in the base dir. We don't need treat this as an opaque.
+					return false, nil
+				}
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
-func (e MergeNotSupportedError) Error() string {
-	return fmt.Sprintf("merging snapshots is not supported: %v", e.Err)
+// sameDir performs continity-compatible comparison of directories.
+// https://github.com/containerd/continuity/blob/v0.1.0/fs/path.go#L91-L133
+// This doesn't compare files because it requires to compare their contents.
+// This is what we want to avoid by this overlayfs-specialized differ.
+func sameDir(f1, f2 os.FileInfo, f1fullPath, f2fullPath string) (bool, error) {
+	if !f1.IsDir() || !f2.IsDir() {
+		return false, nil
+	}
+
+	if os.SameFile(f1, f2) {
+		return true, nil
+	}
+
+	equalStat, err := compareSysStat(f1.Sys(), f2.Sys())
+	if err != nil || !equalStat {
+		return equalStat, err
+	}
+
+	if eq, err := compareCapabilities(f1fullPath, f2fullPath); err != nil || !eq {
+		return eq, err
+	}
+
+	return true, nil
 }
 
-func (e MergeNotSupportedError) Unwrap() error {
-	return e.Err
+// Ported from continuity project
+// https://github.com/containerd/continuity/blob/v0.1.0/fs/diff_unix.go#L43-L54
+// Copyright The containerd Authors.
+func compareSysStat(s1, s2 interface{}) (bool, error) {
+	ls1, ok := s1.(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+	ls2, ok := s2.(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+
+	return ls1.Mode == ls2.Mode && ls1.Uid == ls2.Uid && ls1.Gid == ls2.Gid && ls1.Rdev == ls2.Rdev, nil
+}
+
+// Ported from continuity project
+// https://github.com/containerd/continuity/blob/v0.1.0/fs/diff_unix.go#L56-L66
+// Copyright The containerd Authors.
+func compareCapabilities(p1, p2 string) (bool, error) {
+	c1, err := sysx.LGetxattr(p1, "security.capability")
+	if err != nil && err != sysx.ENODATA {
+		return false, errors.Wrapf(err, "failed to get xattr for %s", p1)
+	}
+	c2, err := sysx.LGetxattr(p2, "security.capability")
+	if err != nil && err != sysx.ENODATA {
+		return false, errors.Wrapf(err, "failed to get xattr for %s", p2)
+	}
+	return bytes.Equal(c1, c2), nil
 }

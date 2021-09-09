@@ -365,69 +365,6 @@ func TestNativeHardlinks(t *testing.T) {
 	}
 }
 
-func TestFixOpaqueDirs(t *testing.T) {
-	for _, snName := range []string{"overlayfs"} {
-		snName := snName
-		t.Run(snName, func(t *testing.T) {
-			t.Parallel()
-
-			ctx, sn, cleanup, err := newSnapshotter(context.Background(), snName)
-			require.NoError(t, err)
-			defer cleanup()
-
-			baseSnap := committedKey(ctx, t, sn, identity.NewID(), "",
-				fstest.CreateDir("bar", 0777),
-				fstest.CreateDir("qaz", 0777),
-			)
-			child1Snap := committedKey(ctx, t, sn, identity.NewID(), baseSnap.Name,
-				fstest.CreateDir("bar", 0777),
-				fstest.SetXAttr("bar", userOpaqueXattr, "y"),
-				fstest.CreateDir("qaz", 0777),
-				fstest.CreateDir("foo", 0777),
-				fstest.SetXAttr("foo", userOpaqueXattr, "y"),
-				fstest.CreateFile("foo/1", []byte("1"), 0777),
-			)
-			child2Snap := committedKey(ctx, t, sn, identity.NewID(), baseSnap.Name,
-				fstest.CreateDir("bar", 0777),
-				fstest.SetXAttr("bar", userOpaqueXattr, "y"),
-				fstest.CreateDir("qaz", 0777),
-				fstest.SetXAttr("qaz", userOpaqueXattr, "y"),
-				fstest.CreateDir("foo", 0777),
-				fstest.SetXAttr("foo", userOpaqueXattr, "y"),
-				fstest.CreateFile("foo/2", []byte("2"), 0777),
-			)
-			mergeSnap := mergeKey(ctx, t, sn, identity.NewID(), []string{child1Snap.Name, child2Snap.Name})
-			lowerdirs, _, _ := getOverlayDirs(ctx, t, sn, mergeSnap.Name)
-			require.Len(t, lowerdirs, 3)
-
-			requireIsOpaque(t, filepath.Join(lowerdirs[0], "bar"))
-			requireIsOpaque(t, filepath.Join(lowerdirs[0], "qaz"))
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[0], "foo"))
-			require.FileExists(t, filepath.Join(lowerdirs[0], "foo", "2"))
-
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[1], "bar"))
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[1], "qaz"))
-
-			requireIsOpaque(t, filepath.Join(lowerdirs[2], "bar"))
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[2], "qaz"))
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[2], "foo"))
-			require.FileExists(t, filepath.Join(lowerdirs[2], "foo", "1"))
-
-			activeSnap := activeKey(ctx, t, sn, identity.NewID(), mergeSnap.Name,
-				fstest.CreateDir("brandnew", 0777),
-				fstest.SetXAttr("brandnew", userOpaqueXattr, "y"),
-			)
-			activeDir := getRWDir(ctx, t, sn, activeSnap.Name)
-			requireIsOpaque(t, filepath.Join(activeDir, "brandnew"))
-
-			commitSnap := commitActiveKey(ctx, t, sn, identity.NewID(), activeSnap.Name)
-			lowerdirs, _, _ = getOverlayDirs(ctx, t, sn, commitSnap.Name)
-			require.Len(t, lowerdirs, 4)
-			requireIsNotOpaque(t, filepath.Join(lowerdirs[0], "brandnew"))
-		})
-	}
-}
-
 func TestUsage(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
 		snName := snName
@@ -464,10 +401,7 @@ func TestUsage(t *testing.T) {
 
 			mergeSnap := mergeKey(ctx, t, sn, identity.NewID(), []string{base1Snap.Name, base2Snap.Name, base3Snap.Name})
 			switch snName {
-			case "overlayfs":
-				require.EqualValues(t, 0, mergeSnap.Inodes)
-				require.EqualValues(t, 0, mergeSnap.Size)
-			case "native":
+			case "overlayfs", "native":
 				// / and /foo were created/copied. Others should be hard-linked
 				require.EqualValues(t, 2, mergeSnap.Inodes)
 				require.EqualValues(t, 2*direntByteSize, mergeSnap.Size)

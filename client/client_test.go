@@ -3800,7 +3800,11 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	_, err = c.Solve(sb.Context(), defC, SolveOpt{}, nil)
 	require.NoError(t, err)
 
-	mergeD := llb.Merge([]llb.State{runC, llb.Image("busybox:latest")})
+	anotherBar := llb.Scratch().
+		File(llb.Mkdir("/bar", 0777)).
+		File(llb.Mkfile("/bar/E", 0777, nil))
+
+	mergeD := llb.Merge([]llb.State{anotherBar, runC, llb.Image("busybox:latest")})
 	runD := mergeD.Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
 		"test -d /a",
 		"test ! -e /b",
@@ -3813,6 +3817,9 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 		"test -d /bar",
 		"test \"$(stat -c %a /bar)\" = 777",
 		"test \"$(cat /bar/D)\" = D2",
+		"test ! -e /bar/A",
+		"test ! -e /bar/B",
+		"test ! -e /bar/E",
 
 		"test -f /fs",
 	}, " && ") + "'")).Root()
