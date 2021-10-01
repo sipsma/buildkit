@@ -334,10 +334,10 @@ For the native snapshotter case (remember that the native snapshotter implements
    1. `RUN /blah`
       1. The merge needs to be unlazied now, which requires creating a new empty snapshot and then hardlinking all the inputs in.
       1. So the overall work is:
-         * `hardlink(ubuntu, /, /) + hardlink(fooCopy) + hardlink(barCopy) + run(/blah)`
+         * `hardlink(ubuntu, /, /) + hardlink(foo, /a, /b) + hardlink(bar, /c, /d) + run(/blah)`
    1. Summing up the total work done:
       * `copy(foo, /a, /b) + copy(bar, /c, /d) + hardlink(ubuntu, /, /) + hardlink(foo, /a, /b) + hardlink(bar, /c, /d) + run(/blah)`
-1. Subtracting the amount of work required today from the amount of work required with the new idea you get:
+1. Subtracting the amount of work required required for the new idea from the amount of work required today you get:
    * `copy(ubuntu, /, /)`
    * `+ copy(prevLayer1, /, /)`
    * `+ copy(prevLayer2, /, /)`
@@ -353,7 +353,7 @@ For the overlay snapshotter case:
       1. So the overall work is:
          * `copy(foo, /a, /b)`
    1. `COPY --from=bar /c /d`
-      1. The snapshotter creates a new layer on top of the previous and copies foo into that as specified
+      1. The snapshotter creates a new layer on top of the previous and copies bar into that as specified
       1. So the overall work is:
          * `copy(bar, /c, /d)`
    1. `RUN /blah`
@@ -381,5 +381,5 @@ For the overlay snapshotter case:
       * `copy(foo, /a, /b) + copy(bar, /c, /d) + run(/blah)`
 1. Overall, the amount of work done between these two examples is the same. However, there are still benefits in this case in terms of caching:
    1. The examples from previous sections still apply ("`COPY --from` works by allowing rebases without pulling base image" and "`COPY --from` pulls cache from dest layer without requiring cache for the origin stage")
-   1. Additionally, because copies are now made on top of scratch and then merged to a different parent independently, if you later did a build with a different set of merge inputs but the same copy input, no additional work would be needed for all those other merges.
+   1. Additionally, because copies are now made on top of scratch and then merged to a different parent independently, if you later did a build with a different set of merge inputs but the same copy input, no redundant work would be needed for all those other merges.
 1. Note that the issue around unnecessary opaque dirs should not actually be an issue here at all because each COPY is made to scratch, which means that its a single layer snapshot, which in turn means it will just be a bind mount and thus not have unneeded opaques. The opaque issue only matters to cases where you have non-base merge inputs that are multi-layered.
