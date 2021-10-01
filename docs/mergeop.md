@@ -362,7 +362,7 @@ For the overlay snapshotter case:
          * `run(/blah)`
    1. Summing up the total work done:
       * `copy(foo, /a, /b) + copy(bar, /c, /d) + run(/blah)`
-1. This is what happens today:
+1. This is what happens w/ the merge optimization:
    1. `COPY --from=foo /a /b`
       1. This becomes `Merge(ubuntu, Scratch.Copy(foo, /a, /b))`.
       1. Merge is lazy, so no work happens there, but copy is done as previously, so it is done right away.
