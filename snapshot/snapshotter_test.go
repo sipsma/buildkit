@@ -118,6 +118,158 @@ func newSnapshotter(ctx context.Context, snapshotterName string) (_ context.Cont
 	return ctx, snapshotter, cleanup, nil
 }
 
+func TestDiff(t *testing.T) {
+	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
+		snName := snName
+		t.Run(snName, func(t *testing.T) {
+			t.Parallel()
+			if snName == "overlayfs" {
+				requireRoot(t)
+			}
+
+			ctx, sn, cleanup, err := newSnapshotter(context.Background(), snName)
+			require.NoError(t, err)
+			defer cleanup()
+
+			// TODO: incorporate this use case from Aaron into the rest of the test
+			testBase := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("source", nil, 0777),
+				fstest.CreateDir("bin", 0755),
+				fstest.Link("/source", "bin/foo"),
+			)
+			testBaseRun1 := committedKey(ctx, t, sn, identity.NewID(), testBase.Name,
+				fstest.CreateFile("bar", nil, 0644),
+			)
+			testBaseRun2 := committedKey(ctx, t, sn, identity.NewID(), testBaseRun1.Name,
+				fstest.Remove("bin/foo"),
+			)
+			testDiff := diffKey(ctx, t, sn, identity.NewID(), testBase.Name, testBaseRun2.Name)
+
+			requireContents(ctx, t, sn, testDiff.Name,
+				fstest.CreateFile("bar", nil, 0644),
+			)
+			testBase2 := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("source", nil, 0777),
+				fstest.CreateDir("bin", 0755),
+				fstest.Symlink("/source", "bin/foo"),
+			)
+			testMerge := diffMergeKey(ctx, t, sn, identity.NewID(), []Diff{
+				{"", testBase2.Name},
+				{testBase.Name, testBaseRun2.Name},
+			})
+			requireContents(ctx, t, sn, testMerge.Name,
+				fstest.CreateFile("bar", nil, 0644),
+				fstest.CreateFile("source", nil, 0777),
+				fstest.CreateDir("bin", 0755),
+			)
+
+			ts := time.Unix(0, 0)
+			base := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("foo", []byte("foo"), 0777),
+				fstest.Lchtimes("foo", ts, ts.Add(2*time.Second)),
+
+				fstest.CreateDir("dir", 0700),
+				fstest.CreateFile("dir/base", []byte("base"), 0777),
+				fstest.Lchtimes("dir/base", ts, ts.Add(6*time.Second)),
+				fstest.Lchtimes("dir", ts, ts.Add(6*time.Second)),
+
+				fstest.CreateFile("twin1", []byte("twin1"), 0777),
+				fstest.CreateFile("twin2", []byte("twin2"), 0777),
+				fstest.Lchtimes("twin1", ts, ts.Add(8*time.Second)),
+				fstest.Lchtimes("twin2", ts, ts.Add(8*time.Second)),
+			)
+			baseRun := committedKey(ctx, t, sn, identity.NewID(), base.Name,
+				fstest.Remove("foo"),
+
+				fstest.RemoveAll("dir"),
+
+				fstest.Rename("twin1", "tmp"),
+				fstest.Rename("twin2", "twin1"),
+				fstest.Rename("tmp", "twin2"),
+
+				fstest.CreateFile("bar", []byte("bar"), 0444),
+				fstest.Lchtimes("bar", ts, ts.Add(4*time.Second)),
+			)
+
+			baseRunDiff := diffKey(ctx, t, sn, identity.NewID(), base.Name, baseRun.Name)
+			requireContents(ctx, t, sn, baseRunDiff.Name,
+				fstest.CreateFile("twin1", []byte("twin2"), 0777),
+				fstest.CreateFile("twin2", []byte("twin1"), 0777),
+
+				fstest.CreateFile("bar", []byte("bar"), 0444),
+			)
+			withMount(ctx, t, sn, baseRunDiff.Name, func(root string) {
+				requireMtime(t, filepath.Join(root, "twin1"), ts.Add(8*time.Second))
+				requireMtime(t, filepath.Join(root, "twin2"), ts.Add(8*time.Second))
+				requireMtime(t, filepath.Join(root, "bar"), ts.Add(4*time.Second))
+			})
+
+			base2 := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("foo", []byte("foo"), 0664),
+				fstest.CreateDir("dir", 0700),
+				fstest.CreateFile("dir/base2", []byte("base2"), 0764),
+
+				fstest.CreateDir("newdir", 0750),
+			)
+
+			rebaseMerge := diffMergeKey(ctx, t, sn, identity.NewID(), []Diff{
+				{"", base2.Name},
+				{base.Name, baseRun.Name},
+			})
+			requireContents(ctx, t, sn, rebaseMerge.Name,
+				fstest.CreateFile("twin1", []byte("twin2"), 0777),
+				fstest.CreateFile("twin2", []byte("twin1"), 0777),
+
+				fstest.CreateFile("bar", []byte("bar"), 0444),
+
+				fstest.CreateDir("newdir", 0750),
+			)
+
+			base3 := committedKey(ctx, t, sn, identity.NewID(), "",
+				fstest.CreateFile("foo", []byte("foo"), 0664),
+				fstest.CreateDir("dir", 0700),
+				fstest.CreateFile("dir/base3", []byte("base3"), 0764),
+			)
+			rebaseMerge2 := diffMergeKey(ctx, t, sn, identity.NewID(), []Diff{
+				{"", base3.Name},
+				{"", base2.Name},
+				{base.Name, baseRun.Name},
+			})
+			requireContents(ctx, t, sn, rebaseMerge2.Name,
+				fstest.CreateFile("twin1", []byte("twin2"), 0777),
+				fstest.CreateFile("twin2", []byte("twin1"), 0777),
+				fstest.CreateFile("bar", []byte("bar"), 0444),
+				fstest.CreateDir("newdir", 0750),
+			)
+
+			swapRun := committedKey(ctx, t, sn, identity.NewID(), rebaseMerge2.Name,
+				fstest.Rename("twin1", "twin2"),
+				fstest.Rename("twin2", "twin1"),
+
+				fstest.CreateFile("newdir/shortlived", nil, 0444),
+				fstest.Remove("newdir/shortlived"),
+			)
+			swapRunDiff := diffKey(ctx, t, sn, identity.NewID(), rebaseMerge2.Name, swapRun.Name)
+			// should be no diff besides a delete of twin2, which doesn't appear when mounted
+			requireContents(ctx, t, sn, swapRunDiff.Name)
+
+			// TODO: fix this, it's different now that you changed how diff works
+			emptyBase := committedKey(ctx, t, sn, identity.NewID(), "")
+			deleteOnlyUpperDiff := diffKey(ctx, t, sn, identity.NewID(), emptyBase.Name, swapRunDiff.Name)
+			// diff should not contain anything, even the delete present in swapRunDiff because the delete
+			// has no effect on emptyBase. We verify the delete doesn't exist in the merge below
+			requireContents(ctx, t, sn, deleteOnlyUpperDiff.Name)
+			requireContents(ctx, t, sn, diffMergeKey(ctx, t, sn, identity.NewID(), []Diff{{"", base.Name}, {emptyBase.Name, swapRunDiff.Name}}).Name,
+				fstest.CreateFile("foo", []byte("foo"), 0777),
+				fstest.CreateDir("dir", 0700),
+				fstest.CreateFile("dir/base", []byte("base"), 0777),
+				fstest.CreateFile("twin1", []byte("twin1"), 0777),
+				fstest.CreateFile("twin2", []byte("twin2"), 0777),
+			)
+		})
+	}
+}
+
 func TestMerge(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
 		snName := snName
@@ -236,7 +388,11 @@ func TestMerge(t *testing.T) {
 				fstest.Link("symlink", "hardsymlink"),
 			)
 
-			mergeC := mergeKey(ctx, t, sn, identity.NewID(), []string{mergeA.Name, mergeB.Name, snapD.Name})
+			mergeC := mergeKey(ctx, t, sn, identity.NewID(), []string{
+				snapB.Name, snapC.Name,
+				snapC.Name, snapB.Name,
+				snapD.Name,
+			})
 			requireContents(ctx, t, sn, mergeC.Name,
 				fstest.CreateFile("a", []byte("A"), 0777),
 				fstest.CreateFile("b", []byte("B"), 0777),
@@ -441,7 +597,9 @@ func activeKey(
 	if len(files) > 0 {
 		mnts, cleanup := getMounts(ctx, t, sn, key)
 		defer cleanup()
-		require.NoError(t, withTempMount(ctx, mnts, fstest.Apply(files...).Apply))
+		require.NoError(t, withTempMount(ctx, mnts, func(root string, isDirect bool) error {
+			return fstest.Apply(files...).Apply(root)
+		}))
 	}
 
 	return getInfo(ctx, t, sn, key)
@@ -491,6 +649,33 @@ func mergeKey(
 	return getInfo(ctx, t, sn, key)
 }
 
+func diffMergeKey(
+	ctx context.Context,
+	t *testing.T,
+	sn *mergeSnapshotter,
+	key string,
+	diffs []Diff,
+) snapshotInfo {
+	t.Helper()
+	err := sn.Merge(ctx, key, diffs)
+	require.NoError(t, err)
+	return getInfo(ctx, t, sn, key)
+}
+
+func diffKey(
+	ctx context.Context,
+	t *testing.T,
+	sn *mergeSnapshotter,
+	key string,
+	lower string,
+	upper string,
+) snapshotInfo {
+	t.Helper()
+	err := sn.Merge(ctx, key, []Diff{{Lower: lower, Upper: upper}})
+	require.NoError(t, err)
+	return getInfo(ctx, t, sn, key)
+}
+
 func getMounts(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key string) ([]mount.Mount, func() error) {
 	t.Helper()
 
@@ -512,7 +697,7 @@ func withMount(ctx context.Context, t *testing.T, sn *mergeSnapshotter, key stri
 	t.Helper()
 	mounts, cleanup := getMounts(ctx, t, sn, key)
 	defer cleanup()
-	withTempMount(ctx, mounts, func(root string) error {
+	withTempMount(ctx, mounts, func(root string, isDirect bool) error {
 		f(root)
 		return nil
 	})

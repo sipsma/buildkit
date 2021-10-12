@@ -414,7 +414,7 @@ func collectAndCheckChanges(base, upperdir string, expected []TestChange) error 
 				Source:   filepath.Join(upperViewRoot, p),
 			})
 			return nil
-		}, upperdir, upperViewRoot, base); err != nil {
+		}, upperdir, upperViewRoot, base, false); err != nil {
 			return err
 		}
 		if err := checkChanges(upperViewRoot, changes, expected); err != nil {

@@ -71,17 +71,19 @@ func (m *MergeOp) Inputs() []Output {
 }
 
 func Merge(inputs []State, opts ...ConstraintsOpt) State {
-	// filter out any scratch inputs, which have no effect when merged
+	// Filter out any scratch inputs, which have no effect when merged.
 	var filteredInputs []State
 	for _, input := range inputs {
 		if input.Output() != nil {
 			filteredInputs = append(filteredInputs, input)
 		}
 	}
+
 	if len(filteredInputs) == 0 {
 		// a merge of only scratch results in scratch
 		return Scratch()
 	}
+
 	if len(filteredInputs) == 1 {
 		// a merge of a single non-empty input results in that non-empty input
 		return filteredInputs[0]

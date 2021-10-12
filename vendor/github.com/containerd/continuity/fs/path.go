@@ -20,9 +20,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -94,22 +97,43 @@ func sameFile(f1, f2 *currentPath) (bool, error) {
 
 	equalStat, err := compareSysStat(f1.f.Sys(), f2.f.Sys())
 	if err != nil || !equalStat {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		fmt.Printf("unequal stat: %+v %+v\n", f1, f2)
 		return equalStat, err
 	}
 
 	if eq, err := compareCapabilities(f1.fullPath, f2.fullPath); err != nil || !eq {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		fmt.Printf("unequal caps: %+v %+v\n", f1, f2)
 		return eq, err
 	}
 
 	// If not a directory also check size, modtime, and content
 	if !f1.f.IsDir() {
 		if f1.f.Size() != f2.f.Size() {
+			// TODO:
+			// TODO:
+			// TODO:
+			// TODO:
+			fmt.Printf("unequal size: %+v %+v\n", f1, f2)
 			return false, nil
 		}
 		t1 := f1.f.ModTime()
 		t2 := f2.f.ModTime()
 
 		if t1.Unix() != t2.Unix() {
+			// TODO:
+			// TODO:
+			// TODO:
+			// TODO:
+			fmt.Printf("unequal time: %+v %+v\n", f1, f2)
+
 			return false, nil
 		}
 
@@ -122,8 +146,28 @@ func sameFile(f1, f2 *currentPath) (bool, error) {
 			if f1.f.Size() == 0 { // if file sizes are zero length, the files are the same by definition
 				return true, nil
 			}
+			// TODO:
+			// TODO:
+			// TODO:
+			// TODO:
+			fmt.Printf("comparing file content: %+v %+v\n", f1, f2)
 			return compareFileContent(f1.fullPath, f2.fullPath)
 		} else if t1.Nanosecond() != t2.Nanosecond() {
+			// TODO:
+			// TODO:
+			// TODO:
+			// TODO:
+			var statx1 unix.Statx_t
+			err := unix.Statx(unix.AT_FDCWD, f1.fullPath, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_FORCE_SYNC, unix.STATX_ALL, &statx1)
+			if err != nil {
+				return false, err
+			}
+			var statx2 unix.Statx_t
+			err = unix.Statx(unix.AT_FDCWD, f2.fullPath, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_FORCE_SYNC, unix.STATX_ALL, &statx2)
+			if err != nil {
+				return false, err
+			}
+			fmt.Printf("unequal nanoseconds: %+v %+v %d %d\n", statx1, statx2, t1.Nanosecond(), t2.Nanosecond())
 			return false, nil
 		}
 	}

@@ -47,27 +47,49 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
-	return computeBlobChain(ctx, sr, createIfNeeded, compressionType, forceCompression, s)
+	// neededLayers keeps track of which layers should actually be included in the blob chain.
+	// This is required for diff refs, which only include a slice of layers from their parent
+	// refs rather than every single layer present among their ancestors.
+	neededLayers := make(map[string]struct{})
+	for _, layer := range sr.layerChain() {
+		neededLayers[layer.ID()] = struct{}{}
+	}
+
+	return computeBlobChain(ctx, sr, createIfNeeded, compressionType, forceCompression, s, neededLayers)
 }
 
 type compressor func(dest io.Writer, requiredMediaType string) (io.WriteCloser, error)
 
-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group) error {
+func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, compressionType compression.Type, forceCompression bool, s session.Group, neededLayers map[string]struct{}) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	switch sr.parentKind() {
 	case Merge:
 		for _, parent := range sr.mergeParents {
 			parent := parent
 			eg.Go(func() error {
-				return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s)
+				return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
+			})
+		}
+	case Diff:
+		for _, parent := range sr.diffParents {
+			if parent == nil {
+				continue
+			}
+			if _, ok := neededLayers[parent.ID()]; !ok {
+				continue
+			}
+			parent := parent
+			eg.Go(func() error {
+				return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
 			})
 		}
 	case Layer:
 		eg.Go(func() error {
-			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, compressionType, forceCompression, s)
+			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
 		})
-		fallthrough
-	case None:
+	}
+
+	if _, ok := neededLayers[sr.ID()]; ok {
 		eg.Go(func() error {
 			_, err := g.Do(ctx, fmt.Sprintf("%s-%t", sr.ID(), createIfNeeded), func(ctx context.Context) (interface{}, error) {
 				if sr.getBlob() != "" {
@@ -95,9 +117,16 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					return nil, errors.Errorf("unknown layer compression type: %q", compressionType)
 				}
 
+				var lowerRef *immutableRef
+				switch sr.parentKind() {
+				case Layer:
+					lowerRef = sr.layerParent
+				case Diff:
+					lowerRef = sr.diffParents.lower()
+				}
 				var lower []mount.Mount
-				if sr.layerParent != nil {
-					m, err := sr.layerParent.Mount(ctx, true, s)
+				if lowerRef != nil {
+					m, err := lowerRef.Mount(ctx, true, s)
 					if err != nil {
 						return nil, err
 					}
@@ -110,18 +139,32 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 						defer release()
 					}
 				}
-				m, err := sr.Mount(ctx, true, s)
-				if err != nil {
-					return nil, err
+
+				var upperRef *immutableRef
+				switch sr.parentKind() {
+				case Diff:
+					upperRef = sr.diffParents.upper()
+				default:
+					upperRef = sr
 				}
-				upper, release, err := m.Mount()
-				if err != nil {
-					return nil, err
+				var upper []mount.Mount
+				if upperRef != nil {
+					m, err := upperRef.Mount(ctx, true, s)
+					if err != nil {
+						return nil, err
+					}
+					var release func() error
+					upper, release, err = m.Mount()
+					if err != nil {
+						return nil, err
+					}
+					if release != nil {
+						defer release()
+					}
 				}
-				if release != nil {
-					defer release()
-				}
+
 				var desc ocispecs.Descriptor
+				var err error
 
 				// Determine differ and error/log handling according to the platform, envvar and the snapshotter.
 				var enableOverlay, fallback, logWarnOnErr bool
@@ -137,7 +180,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					case "overlayfs", "stargz":
 						// overlayfs-based snapshotters should support overlay diff. so print warn log on failure.
 						logWarnOnErr = true
-					case "fuse-overlayfs":
+					case "fuse-overlayfs", "native":
 						// not supported with fuse-overlayfs snapshotter which doesn't provide overlayfs mounts.
 						// TODO: add support for fuse-overlayfs
 						enableOverlay = false
@@ -215,12 +258,13 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 			}
 			return nil
 		})
+
 	}
 
 	if err := eg.Wait(); err != nil {
 		return err
 	}
-	return sr.setChains(ctx)
+	return sr.setChains(ctx, neededLayers)
 }
 
 // setBlob associates a blob with the cache record.
@@ -274,58 +318,81 @@ func (sr *immutableRef) setBlob(ctx context.Context, compressionType compression
 	return nil
 }
 
-func (sr *immutableRef) setChains(ctx context.Context) error {
+func (cr *cacheRecord) setChains(ctx context.Context, neededLayers map[string]struct{}) error {
 	if _, ok := leases.FromContext(ctx); !ok {
 		return errors.Errorf("missing lease requirement for setChains")
 	}
 
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
 
-	if sr.getChainID() != "" {
+	if cr.getChainID() != "" {
 		return nil
 	}
 
 	var chainIDs []digest.Digest
 	var blobChainIDs []digest.Digest
-
-	// Blobs should be set the actual layers in the ref's chain, no
-	// any merge refs.
-	layerChain := sr.layerChain()
-	var layerParent *cacheRecord
-	switch sr.parentKind() {
-	case Merge:
-		layerParent = layerChain[len(layerChain)-1]
+	switch cr.parentKind() {
 	case Layer:
-		// skip the last layer in the chain, which is this ref itself
-		layerParent = layerChain[len(layerChain)-2]
-	}
-	if layerParent != nil {
-		if parentChainID := layerParent.getChainID(); parentChainID != "" {
-			chainIDs = append(chainIDs, parentChainID)
-		} else {
-			return errors.Errorf("failed to set chain for reference with non-addressable parent")
+		if _, ok := neededLayers[cr.layerParent.ID()]; ok {
+			if parentChainID := cr.layerParent.getChainID(); parentChainID != "" {
+				chainIDs = append(chainIDs, parentChainID)
+			} else {
+				return errors.Errorf("failed to set chain for reference with non-addressable parent %q", cr.layerParent.GetDescription())
+			}
+			if parentBlobChainID := cr.layerParent.getBlobChainID(); parentBlobChainID != "" {
+				blobChainIDs = append(blobChainIDs, parentBlobChainID)
+			} else {
+				return errors.Errorf("failed to set blobchain for reference with non-addressable parent %q", cr.layerParent.GetDescription())
+			}
 		}
-		if parentBlobChainID := layerParent.getBlobChainID(); parentBlobChainID != "" {
-			blobChainIDs = append(blobChainIDs, parentBlobChainID)
-		} else {
-			return errors.Errorf("failed to set blobchain for reference with non-addressable parent")
+		fallthrough
+	case None:
+		if _, ok := neededLayers[cr.ID()]; !ok {
+			return nil
 		}
-	}
-
-	switch sr.parentKind() {
-	case Layer, None:
-		diffID := digest.Digest(sr.getDiffID())
+		diffID := digest.Digest(cr.getDiffID())
 		chainIDs = append(chainIDs, diffID)
-		blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(sr.getBlob()), diffID}))
+		blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.getBlob()), diffID}))
+	case Merge:
+		layerChain := cr.layerChain()
+		for i, layer := range layerChain {
+			if _, ok := neededLayers[layer.ID()]; !ok {
+				// TODO: ugly, needed because you can recurse to a merge input that isn't used i.e. Diff(Merge(a,b), c) where c's layerparent is Merge(a,b)
+				return nil
+			}
+			if layer.getChainID() != "" {
+				chainIDs = append(chainIDs, layer.getChainID())
+				blobChainIDs = append(blobChainIDs, layer.getBlobChainID())
+			} else {
+				return errors.Errorf("failed to set chain for merge reference with non-addressable parent %q", layer.GetDescription())
+			}
+			if i > 0 && i < len(layerChain)-1 {
+				chainIDs[0] = imagespecidentity.ChainID(chainIDs)
+				chainIDs = chainIDs[:1]
+				blobChainIDs[0] = imagespecidentity.ChainID(blobChainIDs)
+				blobChainIDs = blobChainIDs[:1]
+			}
+		}
+	case Diff:
+		// TODO: ugly
+		if cr.layerChain()[0].ID() == cr.ID() {
+			diffID := digest.Digest(cr.getDiffID())
+			chainIDs = append(chainIDs, diffID)
+			blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.getBlob()), diffID}))
+		} else {
+			diffID := digest.Digest(cr.diffParents.upper().getDiffID())
+			chainIDs = append(chainIDs, diffID)
+			blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.diffParents.upper().getBlob()), diffID}))
+		}
 	}
 
 	chainID := imagespecidentity.ChainID(chainIDs)
 	blobChainID := imagespecidentity.ChainID(blobChainIDs)
 
-	sr.queueChainID(chainID)
-	sr.queueBlobChainID(blobChainID)
-	if err := sr.commitMetadata(); err != nil {
+	cr.queueChainID(chainID)
+	cr.queueBlobChainID(blobChainID)
+	if err := cr.commitMetadata(); err != nil {
 		return err
 	}
 	return nil

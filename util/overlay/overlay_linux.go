@@ -19,6 +19,7 @@ import (
 	"github.com/containerd/continuity/devices"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/continuity/sysx"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
@@ -45,7 +46,7 @@ func GetUpperdir(lower, upper []mount.Mount) (string, error) {
 		case "overlay":
 			// lower snapshot is an overlay mount of multiple layers
 			var err error
-			lowerlayers, err = getOverlayLayers(lowerM)
+			lowerlayers, err = GetOverlayLayers(lowerM)
 			if err != nil {
 				return "", err
 			}
@@ -58,7 +59,7 @@ func GetUpperdir(lower, upper []mount.Mount) (string, error) {
 		if upperM.Type != "overlay" {
 			return "", errors.Errorf("upper snapshot isn't overlay mounted (type = %q)", upperM.Type)
 		}
-		upperlayers, err := getOverlayLayers(upperM)
+		upperlayers, err := GetOverlayLayers(upperM)
 		if err != nil {
 			return "", err
 		}
@@ -82,8 +83,8 @@ func GetUpperdir(lower, upper []mount.Mount) (string, error) {
 	return upperdir, nil
 }
 
-// getOverlayLayers returns all layer directories of an overlayfs mount.
-func getOverlayLayers(m mount.Mount) ([]string, error) {
+// GetOverlayLayers returns all layer directories of an overlayfs mount.
+func GetOverlayLayers(m mount.Mount) ([]string, error) {
 	var u string
 	var uFound bool
 	var l []string // l[0] = bottommost
@@ -128,11 +129,12 @@ func WriteUpperdir(ctx context.Context, w io.Writer, upperdir string, lower []mo
 	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
 		return mount.WithTempMount(ctx, upperView, func(upperViewRoot string) error {
 			cw := archive.NewChangeWriter(w, upperViewRoot)
-			if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot); err != nil {
+			// TODO: if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot, false); err != nil {
+			if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot, true); err != nil {
 				if err2 := cw.Close(); err2 != nil {
-					return errors.Wrapf(err, "failed torecord upperdir changes (close error: %v)", err2)
+					return errors.Wrapf(err, "failed to record upperdir changes (close error: %v)", err2)
 				}
-				return errors.Wrapf(err, "failed torecord upperdir changes")
+				return errors.Wrapf(err, "failed to record upperdir changes")
 			}
 			return cw.Close()
 		})
@@ -143,7 +145,7 @@ func WriteUpperdir(ctx context.Context, w io.Writer, upperdir string, lower []mo
 // "upperdir" for computing the diff. "upperdirView" is overlayfs mounted view of
 // the upperdir that doesn't contain whiteouts. This is used for computing
 // changes under opaque directories.
-func Changes(ctx context.Context, changeFn fs.ChangeFunc, upperdir, upperdirView, base string) error {
+func Changes(ctx context.Context, changeFn fs.ChangeFunc, upperdir, upperdirView, base string, checkSameFile bool) error {
 	return filepath.Walk(upperdir, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -181,7 +183,7 @@ func Changes(ctx context.Context, changeFn fs.ChangeFunc, upperdir, upperdirView
 			kind = fs.ChangeKindModify
 			// Avoid including directory that hasn't been modified. If /foo/bar/baz is modified,
 			// then /foo will apper here even if it's not been modified because it's the parent of bar.
-			if same, err := sameDir(baseF, f, filepath.Join(base, path), filepath.Join(upperdirView, path)); same {
+			if same, err := sameDirent(baseF, f, filepath.Join(base, path), filepath.Join(upperdirView, path), checkSameFile); same {
 				skipRecord = true // Both are the same, don't record the change
 			} else if err != nil {
 				return err
@@ -267,12 +269,13 @@ func checkOpaque(upperdir string, path string, base string, f os.FileInfo) (isOp
 	return false, nil
 }
 
-// sameDir performs continity-compatible comparison of directories.
+// sameDirent performs continity-compatible comparison of directories and optionally files.
 // https://github.com/containerd/continuity/blob/v0.1.0/fs/path.go#L91-L133
-// This doesn't compare files because it requires to compare their contents.
-// This is what we want to avoid by this overlayfs-specialized differ.
-func sameDir(f1, f2 os.FileInfo, f1fullPath, f2fullPath string) (bool, error) {
-	if !f1.IsDir() || !f2.IsDir() {
+// This doesn't compare files by default because it requires to compare their contents.
+// This is what we want to avoid by this overlayfs-specialized differ while exporting.
+// Other use-cases, such as DiffOp, require comparing file contents in some cases though.
+func sameDirent(f1, f2 os.FileInfo, f1fullPath, f2fullPath string, checkSameFile bool) (bool, error) {
+	if !checkSameFile && (!f1.IsDir() || !f2.IsDir()) {
 		return false, nil
 	}
 
@@ -282,11 +285,51 @@ func sameDir(f1, f2 os.FileInfo, f1fullPath, f2fullPath string) (bool, error) {
 
 	equalStat, err := compareSysStat(f1.Sys(), f2.Sys())
 	if err != nil || !equalStat {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		bklog.G(context.TODO()).Debugf("stat mismatch: %s %s", f1fullPath, f2fullPath)
 		return equalStat, err
 	}
 
 	if eq, err := compareCapabilities(f1fullPath, f2fullPath); err != nil || !eq {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		bklog.G(context.TODO()).Debugf("capabilities mismatch: %s %s", f1fullPath, f2fullPath)
 		return eq, err
+	}
+
+	if !checkSameFile {
+		return true, nil
+	}
+
+	if !f1.IsDir() {
+		if f1.Size() != f2.Size() {
+			return false, nil
+		}
+		t1 := f1.ModTime()
+		t2 := f2.ModTime()
+
+		if t1.Unix() != t2.Unix() {
+			return false, nil
+		}
+
+		// If the timestamp may have been truncated in both of the
+		// files, check content of file to determine difference
+		if t1.Nanosecond() == 0 && t2.Nanosecond() == 0 {
+			if (f1.Mode() & os.ModeSymlink) == os.ModeSymlink {
+				return compareSymlinkTarget(f1fullPath, f2fullPath)
+			}
+			if f1.Size() == 0 {
+				return true, nil
+			}
+			return compareFileContent(f1fullPath, f2fullPath)
+		} else if t1.Nanosecond() != t2.Nanosecond() {
+			return false, nil
+		}
 	}
 
 	return true, nil
@@ -321,4 +364,56 @@ func compareCapabilities(p1, p2 string) (bool, error) {
 		return false, errors.Wrapf(err, "failed to get xattr for %s", p2)
 	}
 	return bytes.Equal(c1, c2), nil
+}
+
+// Ported from continuity project
+// https://github.com/containerd/continuity/blob/bce1c3f9669b6f3e7f6656ee715b0b4d75fa64a6/fs/path.go#L135
+// Copyright The containerd Authors.
+func compareSymlinkTarget(p1, p2 string) (bool, error) {
+	t1, err := os.Readlink(p1)
+	if err != nil {
+		return false, err
+	}
+	t2, err := os.Readlink(p2)
+	if err != nil {
+		return false, err
+	}
+	return t1 == t2, nil
+}
+
+const compareChuckSize = 32 * 1024
+
+// Ported from continuity project
+// https://github.com/containerd/continuity/blob/bce1c3f9669b6f3e7f6656ee715b0b4d75fa64a6/fs/path.go#L151
+// Copyright The containerd Authors.
+func compareFileContent(p1, p2 string) (bool, error) {
+	f1, err := os.Open(p1)
+	if err != nil {
+		return false, err
+	}
+	defer f1.Close()
+	f2, err := os.Open(p2)
+	if err != nil {
+		return false, err
+	}
+	defer f2.Close()
+
+	b1 := make([]byte, compareChuckSize)
+	b2 := make([]byte, compareChuckSize)
+	for {
+		n1, err1 := f1.Read(b1)
+		if err1 != nil && err1 != io.EOF {
+			return false, err1
+		}
+		n2, err2 := f2.Read(b2)
+		if err2 != nil && err2 != io.EOF {
+			return false, err2
+		}
+		if n1 != n2 || !bytes.Equal(b1[:n1], b2[:n2]) {
+			return false, nil
+		}
+		if err1 == io.EOF && err2 == io.EOF {
+			return true, nil
+		}
+	}
 }
