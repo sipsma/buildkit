@@ -320,7 +320,7 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 		var usage snapshots.Usage
 		if !cr.getBlobOnly() {
 			var err error
-			usage, err = cr.cm.ManagerOpt.Snapshotter.Usage(ctx, driverID)
+			usage, err = cr.cm.Snapshotter.Usage(ctx, driverID)
 			if err != nil {
 				cr.mu.Lock()
 				isDead := cr.isDead()
@@ -495,7 +495,7 @@ func (cr *cacheRecord) getCompressionBlob(ctx context.Context, compressionType c
 
 func (cr *cacheRecord) addCompressionBlob(ctx context.Context, desc ocispecs.Descriptor, compressionType compression.Type) error {
 	cs := cr.cm.ContentStore
-	if err := cr.cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: cr.ID()}, leases.Resource{
+	if err := cr.cm.LeaseManager.AddResource(ctx, leases.Lease{ID: cr.ID()}, leases.Resource{
 		ID:   desc.Digest.String(),
 		Type: "content",
 	}); err != nil {
@@ -990,7 +990,7 @@ func (cr *cacheRecord) finalize(ctx context.Context) error {
 		return nil
 	}
 
-	_, err := cr.cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+	_, err := cr.cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 		l.ID = cr.ID()
 		l.Labels = map[string]string{
 			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),

@@ -76,10 +76,16 @@ type ExternalRefChecker interface {
 }
 
 type cacheManager struct {
-	records map[string]*cacheRecord
-	mu      sync.Mutex
-	ManagerOpt
-	Snapshotter snapshot.MergeSnapshotter
+	records         map[string]*cacheRecord
+	mu              sync.Mutex
+	Snapshotter     snapshot.MergeSnapshotter
+	ContentStore    content.Store
+	LeaseManager    leases.Manager
+	PruneRefChecker ExternalRefCheckerFunc
+	GarbageCollect  func(ctx context.Context) (gc.Stats, error)
+	Applier         diff.Applier
+	Differ          diff.Comparer
+	MetadataStore   *metadata.Store
 
 	muPrune sync.Mutex // make sure parallel prune is not allowed so there will not be inconsistent results
 	unlazyG flightcontrol.Group
@@ -87,9 +93,15 @@ type cacheManager struct {
 
 func NewManager(opt ManagerOpt) (Manager, error) {
 	cm := &cacheManager{
-		ManagerOpt:  opt,
-		Snapshotter: snapshot.NewMergeSnapshotter(context.TODO(), opt.Snapshotter, opt.LeaseManager),
-		records:     make(map[string]*cacheRecord),
+		Snapshotter:     snapshot.NewMergeSnapshotter(context.TODO(), opt.Snapshotter, opt.LeaseManager),
+		ContentStore:    opt.ContentStore,
+		LeaseManager:    opt.LeaseManager,
+		PruneRefChecker: opt.PruneRefChecker,
+		GarbageCollect:  opt.GarbageCollect,
+		Applier:         opt.Applier,
+		Differ:          opt.Differ,
+		MetadataStore:   opt.MetadataStore,
+		records:         make(map[string]*cacheRecord),
 	}
 
 	if err := cm.init(context.TODO()); err != nil {
@@ -198,7 +210,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 		go link.Release(context.TODO())
 	}
 
-	l, err := cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 		l.ID = id
 		l.Labels = map[string]string{
 			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
@@ -211,7 +223,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	defer func() {
 		if rerr != nil {
-			if err := cm.ManagerOpt.LeaseManager.Delete(context.TODO(), leases.Lease{
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				logrus.Errorf("failed to remove lease: %+v", err)
@@ -227,7 +239,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	}
 
 	if desc.Digest != "" {
-		if err := cm.ManagerOpt.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+		if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
 			ID:   desc.Digest.String(),
 			Type: "content",
 		}); err != nil {
@@ -491,7 +503,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		}
 	}()
 
-	l, err := cm.ManagerOpt.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
 		l.ID = id
 		l.Labels = map[string]string{
 			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
@@ -504,7 +516,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 
 	defer func() {
 		if err != nil {
-			if err := cm.ManagerOpt.LeaseManager.Delete(context.TODO(), leases.Lease{
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				logrus.Errorf("failed to remove lease: %+v", err)

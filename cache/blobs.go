@@ -133,7 +133,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					fallback = false // prohibit fallback on debug
 				} else if !isTypeWindows(sr) {
 					enableOverlay, fallback = true, true
-					switch sr.cm.ManagerOpt.Snapshotter.Name() {
+					switch sr.cm.Snapshotter.Name() {
 					case "overlayfs", "stargz":
 						// overlayfs-based snapshotters should support overlay diff. so print warn log on failure.
 						logWarnOnErr = true
