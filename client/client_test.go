@@ -72,7 +72,7 @@ func TestIntegration(t *testing.T) {
 	mirroredImages["tonistiigi/test:nolayers"] = "docker.io/tonistiigi/test:nolayers"
 	mirrors := integration.WithMirroredImages(mirroredImages)
 
-	integration.Run(t, integration.TestFuncs(
+	integration.Run(t, append(integration.TestFuncs(
 		testCacheExportCacheKeyLoop,
 		testRelativeWorkDir,
 		testFileOpMkdirMkfile,
@@ -139,7 +139,9 @@ func TestIntegration(t *testing.T) {
 		testPullZstdImage,
 		testMergeOp,
 		testMergeOpCache,
-	), mirrors)
+		// TODO:
+		testDiffOpExport,
+	), diffOpTestCases()...), mirrors)
 
 	integration.Run(t, integration.TestFuncs(
 		testSecurityMode,
@@ -3897,26 +3899,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	requireContents := func(state llb.State, files ...fstest.Applier) {
-		def, err := state.Marshal(sb.Context())
-		require.NoError(t, err)
-
-		destDir, err := ioutil.TempDir("", "buildkit")
-		require.NoError(t, err)
-		defer os.RemoveAll(destDir)
-
-		_, err = c.Solve(sb.Context(), def, SolveOpt{
-			Exports: []ExportEntry{
-				{
-					Type:      ExporterLocal,
-					OutputDir: destDir,
-				},
-			},
-		}, nil)
-		require.NoError(t, err)
-
-		require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(files...)))
-	}
+	ctx := sb.Context()
 
 	stateA := llb.Scratch().
 		File(llb.Mkfile("/foo", 0777, []byte("A"))).
@@ -3934,7 +3917,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 		File(llb.Mkfile("/bar/A", 0400, []byte("C")))
 
 	mergeA := llb.Merge([]llb.State{stateA, stateC})
-	requireContents(mergeA,
+	requireContents(ctx, t, c, mergeA,
 		fstest.CreateFile("foo", []byte("C"), 0775),
 		fstest.CreateFile("c", []byte("C"), 0777),
 		fstest.CreateDir("bar", 0777),
@@ -3943,7 +3926,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	)
 
 	mergeB := llb.Merge([]llb.State{stateC, stateB})
-	requireContents(mergeB,
+	requireContents(ctx, t, c, mergeB,
 		fstest.CreateFile("a", []byte("A"), 0777),
 		fstest.CreateFile("b", []byte("B"), 0777),
 		fstest.CreateFile("c", []byte("C"), 0777),
@@ -3954,7 +3937,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 
 	stateD := llb.Scratch().File(llb.Mkdir("/qaz", 0755))
 	mergeC := llb.Merge([]llb.State{mergeA, mergeB, stateD})
-	requireContents(mergeC,
+	requireContents(ctx, t, c, mergeC,
 		fstest.CreateFile("a", []byte("A"), 0777),
 		fstest.CreateFile("b", []byte("B"), 0777),
 		fstest.CreateFile("c", []byte("C"), 0777),
@@ -3964,46 +3947,35 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 		fstest.CreateDir("qaz", 0755),
 	)
 
-	runA := llb.Merge([]llb.State{llb.Image("busybox"), mergeC}).
-		Run(llb.Shlex("sh -c -e -x '" + strings.Join([]string{
-			// turn /a file into a dir, mv b and c into it
-			"rm /a",
-			"mkdir /a",
-			"mv /b /c /a/",
-			// remove+recreate /bar to make it opaque on overlay snapshotters
-			"rm -rf /bar",
-			"mkdir -m 0777 /bar",
-			"echo -n D > /bar/D",
-			// turn /qaz dir into a file
-			"rm -rf /qaz",
-			"touch /qaz",
-		}, " && ") + "'")).Root().
-		File(llb.Rm("/bin")). // get rid of stuff from busybox image that is tedious to assert on
-		File(llb.Rm("/dev")).
-		File(llb.Rm("/etc")).
-		File(llb.Rm("/home")).
-		File(llb.Rm("/root")).
-		File(llb.Rm("/tmp")).
-		File(llb.Rm("/usr")).
-		File(llb.Rm("/var")).
-		File(llb.Rm("/proc")).
-		File(llb.Rm("/sys"))
+	runA := runShell(llb.Merge([]llb.State{llb.Image("alpine"), mergeC}),
+		// turn /a file into a dir, mv b and c into it
+		"rm /a",
+		"mkdir /a",
+		"mv /b /c /a/",
+		// remove+recreate /bar to make it opaque on overlay snapshotters
+		"rm -rf /bar",
+		"mkdir -m 0777 /bar",
+		"echo -n D > /bar/D",
+		// turn /qaz dir into a file
+		"rm -rf /qaz",
+		"touch /qaz",
+	)
 	stateE := llb.Scratch().
 		File(llb.Mkdir("/bar", 0777)).
 		File(llb.Mkfile("/bar/A", 0777, []byte("A"))).
 		File(llb.Mkfile("/bar/E", 0777, nil))
 	mergeD := llb.Merge([]llb.State{stateE, runA})
-	requireContents(mergeD,
-		fstest.CreateDir("a", 0755),
-		fstest.CreateFile("a/b", []byte("B"), 0777),
-		fstest.CreateFile("a/c", []byte("C"), 0777),
-		fstest.CreateDir("bar", 0777),
-		fstest.CreateFile("bar/D", []byte("D"), 0644),
-		fstest.CreateFile("bar/E", nil, 0777), // exists because opaques dirs are converted to explicit whiteouts
-		fstest.CreateFile("qaz", nil, 0644),
-	)
+	requireEqualContents(ctx, t, c, mergeD, llb.Image("alpine").
+		File(llb.Mkdir("/a", 0755)).
+		File(llb.Mkfile("/a/b", 0777, []byte("B"))).
+		File(llb.Mkfile("/a/c", 0777, []byte("C"))).
+		File(llb.Mkdir("/bar", 0777)).
+		File(llb.Mkfile("/bar/D", 0644, []byte("D"))).
+		File(llb.Mkfile("/bar/E", 0777, nil)). // exists because opaques dirs are converted to explicit whiteouts
+		File(llb.Mkfile("/qaz", 0644, nil)))
 }
 
+// TODO: add test mode where this uses diff-op instead of file-op
 func testMergeOpCache(t *testing.T, sb integration.Sandbox) {
 	skipDockerd(t, sb)
 	requiresLinux(t)
@@ -4080,10 +4052,9 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox) {
 	input1Copy := llb.Scratch().File(llb.Copy(input1, "/dir/1", "/foo/1", &llb.CopyInfo{CreateDestPath: true}))
 
 	// put random contents in the file to ensure it's not re-run later
-	input2 := llb.Image("alpine:latest").Run(llb.Args([]string{"sh", "-c", strings.Join([]string{
+	input2 := runShell(llb.Image("alpine:latest"),
 		"mkdir /dir",
-		"cat /dev/urandom | head -c 100 | sha256sum > /dir/2",
-	}, " && ")})).Root()
+		"cat /dev/urandom | head -c 100 | sha256sum > /dir/2")
 	input2Copy := llb.Scratch().File(llb.Copy(input2, "/dir/2", "/bar/2", &llb.CopyInfo{CreateDestPath: true}))
 
 	merge := llb.Merge([]llb.State{llb.Image(busyboxTarget), input1Copy, input2Copy})
@@ -4269,6 +4240,80 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	require.Equalf(t, bar2Contents, newBar2Contents, "bar/2 contents changed")
+}
+
+func requireContents(ctx context.Context, t *testing.T, c *Client, state llb.State, files ...fstest.Applier) {
+	t.Helper()
+
+	def, err := state.Marshal(ctx)
+	require.NoError(t, err)
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(ctx, def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(files...)))
+}
+
+func requireEqualContents(ctx context.Context, t *testing.T, c *Client, stateA, stateB llb.State) {
+	t.Helper()
+
+	defA, err := stateA.Marshal(ctx)
+	require.NoError(t, err)
+
+	destDirA, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDirA)
+
+	_, err = c.Solve(ctx, defA, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDirA,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	defB, err := stateB.Marshal(ctx)
+	require.NoError(t, err)
+
+	destDirB, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDirB)
+
+	_, err = c.Solve(ctx, defB, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDirB,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqual(destDirA, destDirB))
+}
+
+func runShell(base llb.State, cmds ...string) llb.State {
+	return base.Run(llb.Args([]string{"sh", "-c", strings.Join(cmds, " && ")})).Root()
+}
+
+func chainRunShells(base llb.State, cmdss ...[]string) llb.State {
+	for _, cmds := range cmdss {
+		base = runShell(base, cmds...)
+	}
+	return base
 }
 
 func requiresLinux(t *testing.T) {

@@ -94,16 +94,6 @@ func NewMergeSnapshotter(ctx context.Context, sn Snapshotter, lm leases.Manager)
 }
 
 func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff, opts ...snapshots.Opt) error {
-	var expandedDiffs []Diff
-	for _, diff := range diffs {
-		subdiffs, err := sn.expandDiff(ctx, diff)
-		if err != nil {
-			return err
-		}
-		expandedDiffs = append(expandedDiffs, subdiffs...)
-	}
-	diffs = expandedDiffs
-
 	var baseKey string
 	if sn.overlayBased {
 		// Overlay-based snapshotters can skip the base snapshot of the merge (if one exists) and just use it as the
@@ -144,36 +134,11 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff,
 	}
 	defer done(context.TODO())
 
-	// externalHardlinks keeps track of which inodes have been hard-linked between snapshots (which is
-	//	enabled when sn.useHardlinks is set to true)
-	externalHardlinks := make(map[uint64]struct{})
-
 	// Iterate over (lower, upper) pairs in each applyChain, calculating their diffs and applying each
 	// one to the mount.
-	// TODO: note for @tonistiigi, this is where we are currently flattening input snapshots for both
-	// native and overlay implementations. What is the advantage of splitting this into separate snapshots
-	// for the overlay case?
-	for _, diff := range diffs {
-		var lowerMountable Mountable
-		if diff.Lower != "" {
-			viewID := identity.NewID()
-			var err error
-			lowerMountable, err = sn.View(tempLeaseCtx, viewID, diff.Lower)
-			if err != nil {
-				return errors.Wrapf(err, "failed to get mounts of lower %q", diff.Lower)
-			}
-		}
-
-		viewID := identity.NewID()
-		upperMountable, err := sn.View(tempLeaseCtx, viewID, diff.Upper)
-		if err != nil {
-			return errors.Wrapf(err, "failed to get mounts of upper %q", diff.Upper)
-		}
-
-		err = diffApply(tempLeaseCtx, lowerMountable, upperMountable, applyMountable, sn.useHardlinks, externalHardlinks, sn.overlayBased)
-		if err != nil {
-			return err
-		}
+	externalHardlinks, err := sn.diffApply(tempLeaseCtx, applyMountable, diffs...)
+	if err != nil {
+		return err
 	}
 
 	// save the correctly calculated usage as a label on the committed key
@@ -181,38 +146,10 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff,
 	if err != nil {
 		return errors.Wrap(err, "failed to get disk usage of diff apply merge")
 	}
-	if err := sn.Commit(ctx, key, prepareKey, withMergeUsage(usage)); err != nil {
+	if err := sn.Commit(ctx, key, prepareKey, withUsage(usage)); err != nil {
 		return errors.Wrapf(err, "failed to commit %q", key)
 	}
 	return nil
-}
-
-// TODO: doc
-func (sn *mergeSnapshotter) expandDiff(ctx context.Context, diff Diff) ([]Diff, error) {
-	var diffs []Diff
-	var key string
-	for key = diff.Upper; key != "" && key != diff.Lower; {
-		info, err := sn.Stat(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		diffs = append(diffs, Diff{
-			Lower: info.Parent,
-			Upper: key,
-		})
-		key = info.Parent
-	}
-	if key == diff.Lower {
-		// The diff is sliceable, return the subdiffs that should be applied.
-		// We had to iterate over diffs from child to parent, so reverse them back to the correct order.
-		for i := len(diffs)/2 - 1; i >= 0; i-- {
-			opp := len(diffs) - 1 - i
-			diffs[i], diffs[opp] = diffs[opp], diffs[i]
-		}
-		return diffs, nil
-	}
-	// We can't slice this diff into subdiffs, so just return the original one
-	return []Diff{diff}, nil
 }
 
 func (sn *mergeSnapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
@@ -220,7 +157,7 @@ func (sn *mergeSnapshotter) Usage(ctx context.Context, key string) (snapshots.Us
 	// the snapshotter's usage method is wrong when hardlinks are used to create the merge.
 	if info, err := sn.Stat(ctx, key); err != nil {
 		return snapshots.Usage{}, err
-	} else if usage, ok, err := mergeUsageOf(info); err != nil {
+	} else if usage, ok, err := usageOf(info); err != nil {
 		return snapshots.Usage{}, err
 	} else if ok {
 		return usage, nil
@@ -228,30 +165,32 @@ func (sn *mergeSnapshotter) Usage(ctx context.Context, key string) (snapshots.Us
 	return sn.Snapshotter.Usage(ctx, key)
 }
 
-// mergeUsage{Size,Inodes}Label hold the correct usage calculations for diffApplyMerges, for which the builtin usage
-// is wrong because it can't account for hardlinks made across immutable snapshots
-const mergeUsageSizeLabel = "buildkit.mergeUsageSize"
-const mergeUsageInodesLabel = "buildkit.mergeUsageInodes"
+// usage{Size,Inodes}Label hold the correct usage calculations for snapshots created via diffApply, for
+// which the builtin usage is wrong because it can't account for hardlinks made across immutable snapshots
+const usageSizeLabel = "buildkit.usageSize"
+const usageInodesLabel = "buildkit.usageInodes"
 
-func withMergeUsage(usage snapshots.Usage) snapshots.Opt {
+func withUsage(usage snapshots.Usage) snapshots.Opt {
 	return snapshots.WithLabels(map[string]string{
-		mergeUsageSizeLabel:   strconv.Itoa(int(usage.Size)),
-		mergeUsageInodesLabel: strconv.Itoa(int(usage.Inodes)),
+		usageSizeLabel:   strconv.Itoa(int(usage.Size)),
+		usageInodesLabel: strconv.Itoa(int(usage.Inodes)),
 	})
 }
 
-func mergeUsageOf(info snapshots.Info) (usage snapshots.Usage, ok bool, rerr error) {
+func usageOf(info snapshots.Info) (usage snapshots.Usage, ok bool, rerr error) {
 	if info.Labels == nil {
 		return snapshots.Usage{}, false, nil
 	}
-	if str, ok := info.Labels[mergeUsageSizeLabel]; ok {
+	if str, ok := info.Labels[usageSizeLabel]; ok {
 		i, err := strconv.Atoi(str)
 		if err != nil {
 			return snapshots.Usage{}, false, err
 		}
 		usage.Size = int64(i)
+	} else {
+		return snapshots.Usage{}, false, nil
 	}
-	if str, ok := info.Labels[mergeUsageInodesLabel]; ok {
+	if str, ok := info.Labels[usageInodesLabel]; ok {
 		i, err := strconv.Atoi(str)
 		if err != nil {
 			return snapshots.Usage{}, false, err

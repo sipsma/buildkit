@@ -56,6 +56,7 @@ type Accessor interface {
 	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
 	Merge(ctx context.Context, parents []ImmutableRef, opts ...RefOption) (ImmutableRef, error)
+	Diff(ctx context.Context, lower, upper ImmutableRef, opts ...RefOption) (ImmutableRef, error)
 }
 
 type Controller interface {
@@ -205,8 +206,8 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	snapshotID := chainID.String()
 	blobOnly := true
 	if link != nil {
-		snapshotID = link.getSnapshotID()
 		blobOnly = link.getBlobOnly()
+		snapshotID = link.getSnapshotID()
 		go link.Release(context.TODO())
 	}
 
@@ -470,6 +471,20 @@ func (cm *cacheManager) parentsOf(ctx context.Context, md *cacheMetadata, opts .
 		}
 		ps.mergeParents = append(ps.mergeParents, p)
 	}
+	if lowerParentID := md.getLowerDiffParent(); lowerParentID != "" {
+		p, err := cm.get(ctx, lowerParentID, append(opts, NoUpdateLastUsed))
+		if err != nil {
+			return ps, err
+		}
+		ps.diffParents[0] = p
+	}
+	if upperParentID := md.getUpperDiffParent(); upperParentID != "" {
+		p, err := cm.get(ctx, upperParentID, append(opts, NoUpdateLastUsed))
+		if err != nil {
+			return ps, err
+		}
+		ps.diffParents[1] = p
+	}
 	return ps, nil
 }
 
@@ -611,10 +626,19 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string, opts ...RefOp
 	return rec.mref(true, descHandlersOf(opts...)), nil
 }
 
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// TODO:
+// Test that you now correctly handle case where you are merging inputs that are layers created on top of merges.
+// Previously, deletions present in the underlying merges would get dropped incorrectly.
 func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
 	id := identity.NewID()
 
-	var parents parentRefs
+	parents := parentRefs{mergeParents: []*immutableRef{}}
 	dhs := make(map[digest.Digest]*DescHandler)
 	defer func() {
 		if rerr != nil {
@@ -622,6 +646,9 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		}
 	}()
 	for _, inputParent := range inputParents {
+		if inputParent == nil {
+			continue
+		}
 		var parent *immutableRef
 		if p, ok := inputParent.(*immutableRef); ok {
 			parent = p
@@ -637,11 +664,11 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		}
 		switch parent.parentKind() {
 		case Merge:
-			// if parent is itself a merge, flatten it out by just setting our parents directly to its parents
+			// flatten any inputs that are themselves merges to just use their inputs directly
 			for _, grandparent := range parent.mergeParents {
 				parents.mergeParents = append(parents.mergeParents, grandparent.clone())
 			}
-		case Layer, None:
+		default:
 			parents.mergeParents = append(parents.mergeParents, parent.clone())
 		}
 		for dgst, handler := range parent.descHandlers {
@@ -709,6 +736,117 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		rec.queueSnapshotID(snapshotID)
 	}
 
+	if err := rec.commitMetadata(); err != nil {
+		return nil, err
+	}
+
+	cm.records[id] = rec
+
+	return rec.ref(true, dhs), nil
+}
+
+func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
+	if lower == nil && upper == nil {
+		// The diff of nothing and nothing is nothing. Just return an empty ref. Merging nothing is a good way to do so because
+		// merges of this diff ref will optimize it out entirely (rather than merging an empty directory).
+		return cm.Merge(ctx, nil, opts...)
+	}
+	if lower != nil && upper != nil && lower.ID() == upper.ID() {
+		// The diff of a ref and itself is nothing, return an empty ref.
+		return cm.Merge(ctx, nil, opts...)
+	}
+
+	id := identity.NewID()
+
+	var dps diffParents
+	parents := parentRefs{diffParents: &dps}
+	dhs := make(map[digest.Digest]*DescHandler)
+	defer func() {
+		if rerr != nil {
+			parents.release(context.TODO())
+		}
+	}()
+	for i, inputParent := range []ImmutableRef{lower, upper} {
+		if inputParent == nil {
+			continue
+		}
+		var parent *immutableRef
+		if p, ok := inputParent.(*immutableRef); ok {
+			parent = p
+		} else {
+			// inputParent implements ImmutableRef but isn't our internal struct, get an instance of the internal struct
+			// by calling Get on its ID.
+			p, err := cm.Get(ctx, inputParent.ID(), append(opts, NoUpdateLastUsed)...)
+			if err != nil {
+				return nil, err
+			}
+			parent = p.(*immutableRef)
+			defer parent.Release(context.TODO())
+		}
+		dps[i] = parent.clone()
+		for dgst, handler := range parent.descHandlers {
+			dhs[dgst] = handler
+		}
+	}
+
+	for _, parent := range dps {
+		if parent == nil {
+			continue
+		}
+		if err := parent.Finalize(ctx); err != nil {
+			return nil, errors.Wrapf(err, "failed to finalize parent during diff")
+		}
+	}
+
+	snapshotID := id
+
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+		l.ID = id
+		l.Labels = map[string]string{
+			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create lease")
+	}
+	defer func() {
+		if rerr != nil {
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+				ID: l.ID,
+			}); err != nil {
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
+			}
+		}
+	}()
+
+	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+		ID:   snapshotID,
+		Type: "snapshots/" + cm.Snapshotter.Name(),
+	}); err != nil {
+		return nil, err
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Build the new ref
+	md, _ := cm.getMetadata(id)
+
+	rec := &cacheRecord{
+		mu:            &sync.Mutex{},
+		mutable:       false,
+		cm:            cm,
+		cacheMetadata: md,
+		parentRefs:    parents,
+		refs:          make(map[ref]struct{}),
+	}
+
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
+		return nil, err
+	}
+
+	rec.queueSnapshotID(snapshotID)
 	if err := rec.commitMetadata(); err != nil {
 		return nil, err
 	}
@@ -939,7 +1077,17 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 		case Merge:
 			c.Parents = make([]string, len(cr.mergeParents))
 			for i, p := range cr.mergeParents {
-				c.Parents[i] = p.ID()
+				if p != nil {
+					c.Parents[i] = p.ID()
+				}
+			}
+		case Diff:
+			// TODO: add support for buildctl du output
+			c.Parents = make([]string, 2)
+			for i, p := range cr.diffParents {
+				if p != nil {
+					c.Parents[i] = p.ID()
+				}
 			}
 		}
 		if c.Size == sizeUnknown && cr.equalImmutable != nil {
@@ -1066,6 +1214,12 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			c.parents = make([]string, len(cr.mergeParents))
 			for i, p := range cr.mergeParents {
 				c.parents[i] = p.ID()
+			}
+		case Diff:
+			for _, p := range cr.diffParents {
+				if p != nil {
+					c.parents = append(c.parents, p.ID())
+				}
 			}
 		}
 		if cr.mutable && c.refs > 0 {
@@ -1230,6 +1384,17 @@ func initializeMetadata(m *cacheMetadata, parents parentRefs, opts ...RefOption)
 	}
 
 	switch parents.parentKind() {
+	case Diff:
+		if parents.diffParents.lower() != nil {
+			if err := m.queueLowerDiffParent(parents.diffParents.lower().ID()); err != nil {
+				return err
+			}
+		}
+		if parents.diffParents.upper() != nil {
+			if err := m.queueUpperDiffParent(parents.diffParents.upper().ID()); err != nil {
+				return err
+			}
+		}
 	case Merge:
 		var ids []string
 		for _, p := range parents.mergeParents {

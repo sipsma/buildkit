@@ -16,7 +16,7 @@ func (lm *localMounter) Mount() (string, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	if lm.mounts == nil {
+	if lm.mounts == nil && lm.mountable != nil {
 		mounts, release, err := lm.mountable.Mount()
 		if err != nil {
 			return "", err
@@ -38,7 +38,11 @@ func (lm *localMounter) Mount() (string, error) {
 		}
 	}
 
-	dir, err := ioutil.TempDir("", "buildkit-mount")
+	tmpRoot := os.Getenv("XDG_RUNTIME_DIR")
+	if tmpRoot == "" {
+		tmpRoot = os.TempDir()
+	}
+	dir, err := ioutil.TempDir(tmpRoot, "buildkit-mount")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create temp dir")
 	}

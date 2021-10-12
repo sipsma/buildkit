@@ -114,6 +114,7 @@ const (
 	None parentKind = iota
 	Layer
 	Merge
+	Diff
 )
 
 // parentRefs is a disjoint union type that holds either a single layerParent for this record, a list
@@ -122,11 +123,25 @@ const (
 type parentRefs struct {
 	layerParent  *immutableRef
 	mergeParents []*immutableRef
+	diffParents  *diffParents
+}
+
+type diffParents [2]*immutableRef
+
+func (dp diffParents) lower() *immutableRef {
+	return dp[0]
+}
+
+func (dp diffParents) upper() *immutableRef {
+	return dp[1]
 }
 
 func (p parentRefs) parentKind() parentKind {
-	if len(p.mergeParents) > 0 {
+	if p.mergeParents != nil {
 		return Merge
+	}
+	if p.diffParents != nil {
+		return Diff
 	}
 	if p.layerParent != nil {
 		return Layer
@@ -154,6 +169,19 @@ func (p parentRefs) release(ctx context.Context) (rerr error) {
 			}
 			parent.mu.Unlock()
 		}
+	case Diff:
+		for i, parent := range p.diffParents {
+			if parent == nil {
+				continue
+			}
+			parent.mu.Lock()
+			if err := parent.release(ctx); err != nil {
+				rerr = multierror.Append(rerr, err).ErrorOrNil()
+			} else {
+				p.diffParents[i] = nil
+			}
+			parent.mu.Unlock()
+		}
 	}
 	return rerr
 }
@@ -165,9 +193,19 @@ func (p parentRefs) clone() parentRefs {
 	case Merge:
 		newParents := make([]*immutableRef, len(p.mergeParents))
 		for i, p := range p.mergeParents {
-			newParents[i] = p.clone()
+			if p != nil {
+				newParents[i] = p.clone()
+			}
 		}
 		p.mergeParents = newParents
+	case Diff:
+		var newParents diffParents
+		for i, p := range p.diffParents {
+			if p != nil {
+				newParents[i] = p.clone()
+			}
+		}
+		p.diffParents = &newParents
 	}
 	return p
 }
@@ -180,7 +218,17 @@ func (p parentRefs) parentSnapshotIDs() []string {
 	case Merge:
 		snapshots := make([]string, len(p.mergeParents))
 		for i, p := range p.mergeParents {
-			snapshots[i] = p.getSnapshotID()
+			if p != nil {
+				snapshots[i] = p.getSnapshotID()
+			}
+		}
+		return snapshots
+	case Diff:
+		snapshots := make([]string, len(p.diffParents))
+		for i, p := range p.diffParents {
+			if p != nil {
+				snapshots[i] = p.getSnapshotID()
+			}
 		}
 		return snapshots
 	}
@@ -188,8 +236,25 @@ func (p parentRefs) parentSnapshotIDs() []string {
 }
 
 // order is from parent->child, cr will be at end of slice
+// TODO: use a memo to optimize this when there's overlap (i.e. with diffs)
 func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
 	switch cr.parentKind() {
+	case Diff:
+		lower := cr.diffParents.lower()
+		upper := cr.diffParents.upper()
+		if upper != nil {
+			// If upper is only one blob different from lower, then re-use that blob
+			if lower == nil && upper.parentKind() == None {
+				layers = append(layers, upper.cacheRecord)
+				return layers
+			}
+			if lower != nil && upper.parentKind() == Layer && upper.layerParent.ID() == lower.ID() {
+				layers = append(layers, upper.cacheRecord)
+				return layers
+			}
+		}
+		layers = append(layers, cr)
+		return layers
 	case Merge:
 		for _, parent := range cr.mergeParents {
 			layers = append(layers, parent.layerChain()...)
@@ -230,8 +295,8 @@ func (cr *cacheRecord) isDead() bool {
 
 var errSkipWalk = errors.New("skip")
 
-// walkRecords calls the provided func on cr and each of its ancestors, counting both layer
-// and merge parents. It starts at cr and does a depth-first walk to parents. It will visit
+// walkRecords calls the provided func on cr and each of its ancestors, counting layer, merge
+// and diff parents. It starts at cr and does a depth-first walk to parents. It will visit
 // a record and its parents multiple times if encountered more than once. It will only skip
 // visiting parents of a record if errSkipWalk is returned. If any other error is returned,
 // the walk will stop and return the error to the caller.
@@ -252,6 +317,12 @@ func (cr *cacheRecord) walkRecords(f func(*cacheRecord) error) error {
 		case Merge:
 			for _, p := range cur.mergeParents {
 				curs = append(curs, p.cacheRecord)
+			}
+		case Diff:
+			for _, p := range cur.diffParents {
+				if p != nil {
+					curs = append(curs, p.cacheRecord)
+				}
 			}
 		}
 	}
@@ -669,6 +740,12 @@ func (cr *cacheRecord) PrepareMount(ctx context.Context, dhs DescHandlers, s ses
 		ctx = winlayers.UseWindowsLayerMode(ctx)
 	}
 
+	// Get the records that will actually exist in the snapshot chain so we can filter out
+	// records that don't need their mounts to be prepared to prepare this one. This matters
+	// for cases involving diffs where sometimes diffs re-use parent layers and sometimes
+	// they are calculated on their own.
+	// TODO:
+
 	if cr.cm.Snapshotter.Name() == "stargz" {
 		if err := cr.withRemoteSnapshotLabelsStargzMode(ctx, dhs, s, func() {
 			if rerr = cr.prepareRemoteSnapshotsStargzMode(ctx, dhs, s); rerr != nil {
@@ -833,6 +910,39 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			case Merge:
 				for _, parent := range cr.mergeParents {
 					parent := parent
+					if parent.parentKind() == Diff {
+						// Don't unlazy diff merge inputs themselves, unlazy their lower+upper.
+						// Diff merge inputs are merged by applying the diff of the original
+						// lower and upper directly into the merge. Unlazying the diff by itself
+						// isn't required in this case.
+						// TODO: this ugly
+						for _, grandparent := range parent.diffParents {
+							if grandparent == nil {
+								continue
+							}
+							grandparent := grandparent
+							eg.Go(func() error {
+								if err := grandparent.prepareMount(egctx, dhs, s); err != nil {
+									return err
+								}
+								return nil
+							})
+						}
+						continue
+					}
+					eg.Go(func() error {
+						if err := parent.prepareMount(egctx, dhs, s); err != nil {
+							return err
+						}
+						return nil
+					})
+				}
+			case Diff:
+				for _, parent := range cr.diffParents {
+					parent := parent
+					if parent == nil {
+						continue
+					}
 					eg.Go(func() error {
 						if err := parent.prepareMount(egctx, dhs, s); err != nil {
 							return err
@@ -926,14 +1036,31 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			} else {
 				mountSnapshotID = cr.viewSnapshotID()
 			}
-		case Merge:
+		case Merge, Diff:
 			mountSnapshotID = cr.viewSnapshotID()
 			var diffs []snapshot.Diff
-			for _, parent := range cr.mergeParents {
-				diffs = append(diffs, snapshot.Diff{Upper: parent.getSnapshotID()})
+			for _, layer := range cr.layerChain() {
+				diff := snapshot.Diff{}
+				switch layer.parentKind() {
+				case Diff:
+					if layer.diffParents.lower() != nil {
+						diff.Lower = layer.diffParents.lower().getSnapshotID()
+					}
+					if layer.diffParents.upper() != nil {
+						diff.Upper = layer.diffParents.upper().getSnapshotID()
+					}
+				case Layer:
+					diff.Lower = layer.layerParent.getSnapshotID()
+					fallthrough
+				case None:
+					diff.Upper = layer.getSnapshotID()
+				}
+				diffs = append(diffs, diff)
 			}
-			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, diffs); err != nil && !errdefs.IsAlreadyExists(err) {
-				return nil, err
+			if len(diffs) > 0 {
+				if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, diffs); err != nil && !errdefs.IsAlreadyExists(err) {
+					return nil, err
+				}
 			}
 		}
 
@@ -1062,7 +1189,7 @@ func (cr *cacheRecord) finalize(ctx context.Context) error {
 
 	if err := cr.cm.Snapshotter.Commit(ctx, cr.getSnapshotID(), mutable.getSnapshotID()); err != nil {
 		cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.ID()})
-		return errors.Wrapf(err, "failed to commit %s to %s", mutable.getSnapshotID(), cr.getSnapshotID())
+		return errors.Wrapf(err, "failed to commit %s to %s during finalize", mutable.getSnapshotID(), cr.getSnapshotID())
 	}
 	cr.mountCache = nil
 
