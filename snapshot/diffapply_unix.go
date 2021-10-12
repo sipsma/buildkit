@@ -59,13 +59,13 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 	}
 	defer unmountApply()
 
-	return withTempMount(ctx, lowerMounts, func(lowerView string) error {
-		return withTempMount(ctx, upperMounts, func(upperView string) error {
+	return withTempMount(ctx, lowerMounts, func(lowerView string, directLower bool) error {
+		return withTempMount(ctx, upperMounts, func(upperView string, directUpper bool) error {
 			applyMounter := withTempMount
 			if useHardlink {
 				applyMounter = withRWDirMount
 			}
-			return applyMounter(ctx, applyMounts, func(applyRoot string) error {
+			return applyMounter(ctx, applyMounts, func(applyRoot string, directApply bool) error {
 				type pathTime struct {
 					applyPath string
 					atime     unix.Timespec
@@ -87,6 +87,7 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 				if useHardlink {
 					if upperdir, err := overlay.GetUpperdir(lowerMounts, upperMounts); err == nil {
 						upperRoot = upperdir
+						directUpper = true
 						diffCalculator = func(cf fs.ChangeFunc) error {
 							return overlay.Changes(ctx, cf, upperRoot, upperView, lowerView)
 						}
@@ -112,6 +113,7 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 					// hardlink or recreate here. In that case, upperFi is non-nil. Otherwise, upperFi is nil and
 					// there's nothing to do besides remove the existing path, so unlink and return early.
 					if kind == fs.ChangeKindDelete && upperFi == nil {
+						// TODO: does diffop need to create whiteout devices sometimes now?
 						if err := os.RemoveAll(applyPath); err != nil {
 							return errors.Wrapf(err, "failed to remove path %s during apply", applyPath)
 						}
@@ -164,11 +166,26 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 							// Named pipes and sockets can be hard-linked but is best to avoid as it could enable IPC by sharing merge inputs.
 							break
 						default:
+							linkSrc := upperPath
+							if !directUpper {
+								directPath, ok, err := findDirectPath(upperMounts, changePath)
+								if err != nil {
+									return err
+								}
+								if !ok {
+									// TODO: couldn't find the direct path for some reason, should this just be an error?
+									break
+								}
+								linkSrc = directPath
+							}
+
 							// TODO:(sipsma) consider handling EMLINK by falling back to copy
-							if err := os.Link(upperPath, applyPath); err != nil {
+							if err := os.Link(linkSrc, applyPath); err != nil {
 								return errors.Wrapf(err, "failed to hardlink %q to %q during apply", upperPath, applyPath)
 							}
 							// mark this inode as one coming from a separate snapshot, needed for disk usage calculations elsewhere
+							// TODO: technically it's true that upperStat.Ino will always be the same as what was found to link from...
+							// TODO: but still feels very delicate....
 							externalHardlinks[upperStat.Ino] = struct{}{}
 							return nil
 						}
@@ -274,6 +291,36 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 	})
 }
 
+func findDirectPath(mnts []mount.Mount, subpath string) (string, bool, error) {
+	if len(mnts) != 1 {
+		return "", false, errors.Errorf("invalid number of mounts for finding direct path: %d", len(mnts))
+	}
+	mnt := mnts[0]
+	switch mnt.Type {
+	case "bind", "rbind":
+		return filepath.Join(mnt.Source, subpath), true, nil
+	case "overlay":
+		dirs, err := overlay.GetOverlayLayers(mnt)
+		if err != nil {
+			return "", false, errors.Wrap(err, "failed to get overlay layers when finding direct path")
+		}
+		for i := 0; i < len(dirs); i++ {
+			dir := dirs[len(dirs)-1-i]
+			path := filepath.Join(dir, subpath)
+			if _, err := os.Lstat(path); err == nil {
+				return path, true, nil
+			} else if os.IsNotExist(err) || errors.Is(err, unix.ENOTDIR) {
+				continue
+			} else {
+				return "", false, errors.Wrap(err, "failed to lstat when finding direct path")
+			}
+		}
+		return "", false, nil
+	default:
+		return "", false, nil
+	}
+}
+
 // diskUsage calculates the disk space used by the provided mounts, similar to the normal containerd snapshotter disk usage
 // calculations but with the extra ability to take into account hardlinks that were created between snapshots, ensuring that
 // they don't get double counted.
@@ -286,7 +333,8 @@ func diskUsage(ctx context.Context, mountable Mountable, externalHardlinks map[u
 
 	inodes := make(map[uint64]struct{})
 	var usage snapshots.Usage
-	if err := withRWDirMount(ctx, mounts, func(root string) error {
+	// TODO: is withRWDirMount always the right thing here???? What if withTempMount got used???
+	if err := withRWDirMount(ctx, mounts, func(root string, _ bool) error {
 		return filepath.WalkDir(root, func(path string, dirent gofs.DirEntry, err error) error {
 			if err != nil {
 				return err

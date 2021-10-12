@@ -56,6 +56,7 @@ type Accessor interface {
 	GetMutable(ctx context.Context, id string, opts ...RefOption) (MutableRef, error) // Rebase?
 	IdentityMapping() *idtools.IdentityMapping
 	Merge(ctx context.Context, parents []ImmutableRef, opts ...RefOption) (ImmutableRef, error)
+	Diff(ctx context.Context, lower, upper ImmutableRef, opts ...RefOption) (ImmutableRef, error)
 }
 
 type Controller interface {
@@ -470,6 +471,20 @@ func (cm *cacheManager) parentsOf(ctx context.Context, md *cacheMetadata, opts .
 		}
 		ps.mergeParents = append(ps.mergeParents, p)
 	}
+	if lowerParentID := md.getLowerDiffParent(); lowerParentID != "" {
+		p, err := cm.get(ctx, lowerParentID, append(opts, NoUpdateLastUsed))
+		if err != nil {
+			return ps, err
+		}
+		ps.diffParents[0] = p
+	}
+	if upperParentID := md.getUpperDiffParent(); upperParentID != "" {
+		p, err := cm.get(ctx, upperParentID, append(opts, NoUpdateLastUsed))
+		if err != nil {
+			return ps, err
+		}
+		ps.diffParents[1] = p
+	}
 	return ps, nil
 }
 
@@ -641,7 +656,8 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 			for _, grandparent := range parent.mergeParents {
 				parents.mergeParents = append(parents.mergeParents, grandparent.clone())
 			}
-		case Layer, None:
+		case Diff, Layer, None:
+			// TODO: handle some of the optimizations possible when merging a diff?
 			parents.mergeParents = append(parents.mergeParents, parent.clone())
 		}
 		for dgst, handler := range parent.descHandlers {
@@ -696,8 +712,149 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		}
 	}()
 
-	// Merges use View snapshots, which will be created w/ ID set to snapshotID and
-	// held for the duration of this lease.
+	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
+		ID:   snapshotID,
+		Type: "snapshots/" + cm.Snapshotter.Name(),
+	}); err != nil {
+		return nil, err
+	}
+
+	rec.queueSnapshotID(snapshotID)
+	if err := rec.commitMetadata(); err != nil {
+		return nil, err
+	}
+
+	cm.records[id] = rec
+
+	return rec.ref(true, dhs), nil
+}
+
+func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
+	id := identity.NewID()
+
+	var dps diffParents
+	parents := parentRefs{diffParents: &dps}
+	dhs := make(map[digest.Digest]*DescHandler)
+	defer func() {
+		if rerr != nil {
+			parents.release(context.TODO())
+		}
+	}()
+	for i, inputParent := range []ImmutableRef{lower, upper} {
+		if inputParent == nil {
+			return nil, errors.New("invalid nil ref for diff")
+		}
+		var parent *immutableRef
+		if p, ok := inputParent.(*immutableRef); ok {
+			parent = p
+		} else {
+			// inputParent implements ImmutableRef but isn't our internal struct, get an instance of the internal struct
+			// by calling Get on its ID.
+			p, err := cm.Get(ctx, inputParent.ID(), append(opts, NoUpdateLastUsed)...)
+			if err != nil {
+				return nil, err
+			}
+			parent = p.(*immutableRef)
+			defer parent.Release(context.TODO())
+		}
+		dps[i] = parent
+		for dgst, handler := range parent.descHandlers {
+			dhs[dgst] = handler
+		}
+	}
+
+	/* TODO: consider if this case is worth the extra complication right now
+	// TODO: important case: Diff(Merge(A,B), Merge(A,B).Run("foo")) == Run("foo")
+	// TODO: ^^ actually, in that case merge(a,b) will have to have been unlazied anyways, so not actually important
+	var lowers []*immutableRef
+	if parents.lower().parentKind() == Merge {
+		lowers = parents.lower().mergeParents
+	} else {
+		lowers = []*immutableRef{parents.lower()}
+	}
+
+	var uppers []*immutableRef
+	if parents.lower().parentKind() == Merge {
+		uppers = parents.upper().mergeParents
+	} else {
+		uppers = []*immutableRef{parents.upper()}
+	}
+
+	if len(lowers) < len(uppers) {
+		sliceable := true
+		for i := 0; i < len(lowers); i++ {
+			if lowers[i].ID() != uppers[i].ID() {
+				sliceable = false
+				break
+			}
+		}
+		if sliceable {
+			defer func() {
+				if rerr == nil {
+					parents.release(context.TODO())
+				}
+			}()
+			slice := uppers[len(lowers):]
+			switch len(slice) {
+			case 0:
+				// TODO: not sure what to do... scratch is represented as nil, so return nil?
+				return nil, nil
+			case 1:
+				return slice[0].Clone(), nil
+			default:
+				return cm.merge(ctx, slice, opts...)
+			}
+		}
+	}
+	*/
+
+	for _, parent := range dps {
+		if err := parent.finalizeLocked(ctx); err != nil {
+			return nil, errors.Wrapf(err, "failed to finalize parent during diff")
+		}
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Build the new ref
+	md, _ := cm.getMetadata(id)
+
+	rec := &cacheRecord{
+		mu:            &sync.Mutex{},
+		mutable:       false,
+		cm:            cm,
+		cacheMetadata: md,
+		parentRefs:    parents,
+		refs:          make(map[ref]struct{}),
+	}
+
+	if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
+		return nil, err
+	}
+
+	snapshotID := id
+
+	l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+		l.ID = id
+		l.Labels = map[string]string{
+			"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create lease")
+	}
+	defer func() {
+		if rerr != nil {
+			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+				ID: l.ID,
+			}); err != nil {
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
+			}
+		}
+	}()
+
 	if err := cm.LeaseManager.AddResource(ctx, leases.Lease{ID: id}, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
@@ -1227,6 +1384,17 @@ func initializeMetadata(m *cacheMetadata, parents parentRefs, opts ...RefOption)
 	}
 
 	switch parents.parentKind() {
+	case Diff:
+		if parents.diffParents.lower() != nil {
+			if err := m.queueLowerDiffParent(parents.diffParents.lower().ID()); err != nil {
+				return err
+			}
+		}
+		if parents.diffParents.upper() != nil {
+			if err := m.queueUpperDiffParent(parents.diffParents.upper().ID()); err != nil {
+				return err
+			}
+		}
 	case Merge:
 		var ids []string
 		for _, p := range parents.mergeParents {

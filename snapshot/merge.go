@@ -44,6 +44,9 @@ type MergeSnapshotter interface {
 	// implementation. Implementations using hardlinks to create merged views will take up
 	// less space than those that use copies, for example.
 	Merge(ctx context.Context, key string, parents []string, opts ...snapshots.Opt) error
+
+	// TODO: Doc
+	Diff(ctx context.Context, key, lower, upper string, opts ...snapshots.Opt) error
 }
 
 type mergeSnapshotter struct {
@@ -86,6 +89,51 @@ func NewMergeSnapshotter(ctx context.Context, sn Snapshotter, lm leases.Manager)
 		useHardlinks:        useHardlinks,
 		reuseBaseMergeInput: overlayBased,
 	}
+}
+
+func (sn *mergeSnapshotter) Diff(ctx context.Context, key, lower, upper string, opts ...snapshots.Opt) error {
+	prepareKey := identity.NewID()
+	if err := sn.Prepare(ctx, prepareKey, ""); err != nil {
+		return errors.Wrapf(err, "failed to prepare %q", key)
+	}
+	applyMountable, err := sn.Mounts(ctx, prepareKey)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get mounts of %q", key)
+	}
+
+	tempLeaseCtx, done, err := leaseutil.WithLease(ctx, sn.lm, leaseutil.MakeTemporary)
+	if err != nil {
+		return errors.Wrap(err, "failed to create temporary lease for view mounts during merge")
+	}
+	defer done(context.TODO())
+
+	lowerMountable, err := sn.View(tempLeaseCtx, identity.NewID(), lower)
+	if err != nil {
+		return errors.Wrap(err, "failed to create view for lower key of diff")
+	}
+
+	upperMountable, err := sn.View(tempLeaseCtx, identity.NewID(), upper)
+	if err != nil {
+		return errors.Wrap(err, "failed to create view for upper key of diff")
+	}
+
+	// externalHardlinks keeps track of which inodes have been hard-linked between snapshots (which is
+	//	enabled when sn.useHardlinks is set to true)
+	externalHardlinks := make(map[uint64]struct{})
+
+	if err := diffApply(ctx, lowerMountable, upperMountable, applyMountable, sn.useHardlinks, externalHardlinks); err != nil {
+		return errors.Wrapf(err, "failed to create diff of lower %q and upper %q", lower, upper)
+	}
+
+	// save the correctly calculated usage as a label on the committed key
+	usage, err := diskUsage(ctx, applyMountable, externalHardlinks)
+	if err != nil {
+		return errors.Wrap(err, "failed to get disk usage of diff apply")
+	}
+	if err := sn.Commit(ctx, key, prepareKey, withUsage(usage)); err != nil {
+		return errors.Wrapf(err, "failed to commit %q", key)
+	}
+	return nil
 }
 
 func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []string, opts ...snapshots.Opt) error {
@@ -192,7 +240,7 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []str
 	if err != nil {
 		return errors.Wrap(err, "failed to get disk usage of diff apply merge")
 	}
-	if err := sn.Commit(ctx, key, prepareKey, withMergeUsage(usage), withMergeKeys(mergeKeys)); err != nil {
+	if err := sn.Commit(ctx, key, prepareKey, withUsage(usage), withMergeKeys(mergeKeys)); err != nil {
 		return errors.Wrapf(err, "failed to commit %q", key)
 	}
 	return nil
@@ -203,7 +251,7 @@ func (sn *fromContainerd) Usage(ctx context.Context, key string) (snapshots.Usag
 	// the snapshotter's usage method is wrong when hardlinks are used to create the merge.
 	if info, err := sn.Stat(ctx, key); err != nil {
 		return snapshots.Usage{}, err
-	} else if usage, ok, err := mergeUsageOf(info); err != nil {
+	} else if usage, ok, err := usageOf(info); err != nil {
 		return snapshots.Usage{}, err
 	} else if ok {
 		return usage, nil
@@ -211,30 +259,30 @@ func (sn *fromContainerd) Usage(ctx context.Context, key string) (snapshots.Usag
 	return sn.Snapshotter.Usage(ctx, key)
 }
 
-// mergeUsage{Size,Inodes}Label hold the correct usage calculations for diffApplyMerges, for which the builtin usage
-// is wrong because it can't account for hardlinks made across immutable snapshots
-const mergeUsageSizeLabel = "buildkit.mergeUsageSize"
-const mergeUsageInodesLabel = "buildkit.mergeUsageInodes"
+// usage{Size,Inodes}Label hold the correct usage calculations for snapshots created via diffApply, for
+// which the builtin usage is wrong because it can't account for hardlinks made across immutable snapshots
+const usageSizeLabel = "buildkit.usageSize"
+const usageInodesLabel = "buildkit.usageInodes"
 
-func withMergeUsage(usage snapshots.Usage) snapshots.Opt {
+func withUsage(usage snapshots.Usage) snapshots.Opt {
 	return snapshots.WithLabels(map[string]string{
-		mergeUsageSizeLabel:   strconv.Itoa(int(usage.Size)),
-		mergeUsageInodesLabel: strconv.Itoa(int(usage.Inodes)),
+		usageSizeLabel:   strconv.Itoa(int(usage.Size)),
+		usageInodesLabel: strconv.Itoa(int(usage.Inodes)),
 	})
 }
 
-func mergeUsageOf(info snapshots.Info) (usage snapshots.Usage, ok bool, rerr error) {
+func usageOf(info snapshots.Info) (usage snapshots.Usage, ok bool, rerr error) {
 	if info.Labels == nil {
 		return snapshots.Usage{}, false, nil
 	}
-	if str, ok := info.Labels[mergeUsageSizeLabel]; ok {
+	if str, ok := info.Labels[usageSizeLabel]; ok {
 		i, err := strconv.Atoi(str)
 		if err != nil {
 			return snapshots.Usage{}, false, err
 		}
 		usage.Size = int64(i)
 	}
-	if str, ok := info.Labels[mergeUsageInodesLabel]; ok {
+	if str, ok := info.Labels[usageInodesLabel]; ok {
 		i, err := strconv.Atoi(str)
 		if err != nil {
 			return snapshots.Usage{}, false, err

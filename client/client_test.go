@@ -136,6 +136,7 @@ func TestIntegration(t *testing.T) {
 		testBuildExportZstd,
 		testPullZstdImage,
 		testMergeOpInlineCache,
+		testDiffOp,
 	}, mirrors)
 
 	integration.Run(t, []integration.Test{
@@ -3761,6 +3762,42 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+}
+
+func testDiffOp(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	// TODO: issue w/ /proc and /sys not existing in busybox base := llb.Image("busybox:latest")
+	base := llb.Image("alpine:latest")
+	diff := llb.Diff(base, base.
+		Run(llb.Shlex("mkdir /hello")).Root().
+		Run(llb.Shlex("touch /hello/hey")).Root())
+
+	def, err := diff.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+		fstest.CreateDir("hello", 0755),
+		fstest.CreateFile("hello/hey", nil, 0644),
+	)))
 }
 
 func testMergeOpInlineCache(t *testing.T, sb integration.Sandbox) {
