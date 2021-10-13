@@ -965,12 +965,12 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			}
 		case Merge:
 			mountSnapshotID = cr.viewSnapshotID()
-			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, cr.parentSnapshotIDs()); err != nil {
+			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, cr.parentSnapshotIDs()); err != nil && !errdefs.IsAlreadyExists(err) {
 				return nil, err
 			}
 		case Diff:
 			mountSnapshotID = cr.viewSnapshotID()
-			if err := cr.cm.Snapshotter.Diff(ctx, snapshotID, cr.diffParents.lower().getSnapshotID(), cr.diffParents.upper().getSnapshotID()); err != nil {
+			if err := cr.cm.Snapshotter.Diff(ctx, snapshotID, cr.diffParents.lower().getSnapshotID(), cr.diffParents.upper().getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
 				return nil, err
 			}
 		}

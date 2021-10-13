@@ -76,7 +76,7 @@ func (s *fromContainerd) Commit(ctx context.Context, name, key string, opts ...s
 	if err != nil {
 		return errors.Wrap(err, "failed to stat active key during commit")
 	}
-	opts = append(opts, snapshots.WithLabels(snapshots.FilterInheritedLabels(info.Labels)))
+	opts = append([]snapshots.Opt{snapshots.WithLabels(snapshots.FilterInheritedLabels(info.Labels))}, opts...)
 	return s.Snapshotter.Commit(ctx, name, key, opts...)
 }
 

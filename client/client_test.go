@@ -3771,13 +3771,20 @@ func testDiffOp(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO: what if you open a file for writing on overlay but never change it...
+
 	// TODO: issue w/ /proc and /sys not existing in busybox base := llb.Image("busybox:latest")
+
 	base := llb.Image("alpine:latest")
-	diff := llb.Diff(base, base.
+	diff1 := llb.Diff(base, base.
+		Run(llb.Shlex("touch /yo")).Root().
 		Run(llb.Shlex("mkdir /hello")).Root().
 		Run(llb.Shlex("touch /hello/hey")).Root())
 
-	def, err := diff.Marshal(sb.Context())
+	def, err := diff1.Marshal(sb.Context())
 	require.NoError(t, err)
 
 	destDir, err := ioutil.TempDir("", "buildkit")
@@ -3795,8 +3802,55 @@ func testDiffOp(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+		fstest.CreateFile("yo", nil, 0644),
 		fstest.CreateDir("hello", 0755),
 		fstest.CreateFile("hello/hey", nil, 0644),
+	)))
+
+	diff2 := llb.Diff(diff1, diff1.
+		File(llb.Rm("/hello")))
+
+	def, err = diff2.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir, err = ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply()))
+
+	merge := llb.Merge([]llb.State{diff1, diff2}).File(llb.Mkfile("/sup", 0444, []byte("sup")))
+
+	def, err = merge.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir, err = ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+		fstest.CreateFile("yo", nil, 0644),
+		fstest.CreateFile("sup", []byte("sup"), 0444),
 	)))
 }
 

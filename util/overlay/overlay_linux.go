@@ -181,7 +181,7 @@ func Changes(ctx context.Context, changeFn fs.ChangeFunc, upperdir, upperdirView
 			kind = fs.ChangeKindModify
 			// Avoid including directory that hasn't been modified. If /foo/bar/baz is modified,
 			// then /foo will apper here even if it's not been modified because it's the parent of bar.
-			if same, err := sameDir(baseF, f, filepath.Join(base, path), filepath.Join(upperdirView, path)); same {
+			if same, err := SameDir(baseF, f, filepath.Join(base, path), filepath.Join(upperdirView, path)); same {
 				skipRecord = true // Both are the same, don't record the change
 			} else if err != nil {
 				return err
@@ -267,11 +267,11 @@ func checkOpaque(upperdir string, path string, base string, f os.FileInfo) (isOp
 	return false, nil
 }
 
-// sameDir performs continity-compatible comparison of directories.
+// SameDir performs continity-compatible comparison of directories.
 // https://github.com/containerd/continuity/blob/v0.1.0/fs/path.go#L91-L133
 // This doesn't compare files because it requires to compare their contents.
 // This is what we want to avoid by this overlayfs-specialized differ.
-func sameDir(f1, f2 os.FileInfo, f1fullPath, f2fullPath string) (bool, error) {
+func SameDir(f1, f2 os.FileInfo, f1fullPath, f2fullPath string) (bool, error) {
 	if !f1.IsDir() || !f2.IsDir() {
 		return false, nil
 	}

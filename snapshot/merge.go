@@ -2,16 +2,24 @@ package snapshot
 
 import (
 	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/continuity/sysx"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/overlay"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 // hardlinkMergeSnapshotters are the names of snapshotters that support merges implemented by
@@ -60,6 +68,9 @@ type mergeSnapshotter struct {
 	// On overlay-based snapshotters, we can use the base merge input as a parent w/out
 	// needing to copy it.
 	reuseBaseMergeInput bool
+
+	// TODO:
+	useOverlaySliceDiff bool
 }
 
 func NewMergeSnapshotter(ctx context.Context, sn Snapshotter, lm leases.Manager) MergeSnapshotter {
@@ -88,10 +99,25 @@ func NewMergeSnapshotter(ctx context.Context, sn Snapshotter, lm leases.Manager)
 		lm:                  lm,
 		useHardlinks:        useHardlinks,
 		reuseBaseMergeInput: overlayBased,
+		useOverlaySliceDiff: overlayBased,
 	}
 }
 
 func (sn *mergeSnapshotter) Diff(ctx context.Context, key, lower, upper string, opts ...snapshots.Opt) error {
+	// check to see if the diff can be represented by slicing lowerdirs
+	if lower, upper, err := sn.asDiffSlice(ctx, lower, upper); err != nil {
+		return err
+	} else if lower != "" && upper != "" {
+		prepareKey := identity.NewID()
+		if err := sn.Prepare(ctx, prepareKey, ""); err != nil {
+			return errors.Wrapf(err, "failed to prepare %q", key)
+		}
+		if err := sn.Commit(ctx, key, prepareKey, withDiffSnapshotKeys(lower, upper)); err != nil {
+			return errors.Wrap(err, "failed to commit optimized diff snapshot")
+		}
+		return nil
+	}
+
 	prepareKey := identity.NewID()
 	if err := sn.Prepare(ctx, prepareKey, ""); err != nil {
 		return errors.Wrapf(err, "failed to prepare %q", key)
@@ -118,7 +144,7 @@ func (sn *mergeSnapshotter) Diff(ctx context.Context, key, lower, upper string, 
 	}
 
 	// externalHardlinks keeps track of which inodes have been hard-linked between snapshots (which is
-	//	enabled when sn.useHardlinks is set to true)
+	//enabled when sn.useHardlinks is set to true)
 	externalHardlinks := make(map[uint64]struct{})
 
 	if err := diffApply(ctx, lowerMountable, upperMountable, applyMountable, sn.useHardlinks, externalHardlinks); err != nil {
@@ -134,6 +160,63 @@ func (sn *mergeSnapshotter) Diff(ctx context.Context, key, lower, upper string, 
 		return errors.Wrapf(err, "failed to commit %q", key)
 	}
 	return nil
+}
+
+func (sn *mergeSnapshotter) slice(ctx context.Context, key string) ([]snapshots.Info, error) {
+	var lower string
+	info, err := sn.Stat(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if diffLower, diffUpper := diffSnapshotKeysOf(info); diffLower != "" && diffUpper != "" {
+		lower = diffLower
+		info, err = sn.Stat(ctx, diffUpper)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	infos := []snapshots.Info{info}
+	key = info.Parent
+	for key != "" && key != lower {
+		info, err := sn.Stat(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, info)
+		key = info.Parent
+	}
+	for i, j := 0, len(infos)-1; i < j; i, j = i+1, j-1 {
+		infos[i], infos[j] = infos[j], infos[i]
+	}
+	return infos, nil
+}
+
+func (sn *mergeSnapshotter) asDiffSlice(ctx context.Context, lower, upper string) (string, string, error) {
+	if lower == "" {
+		return "", "", nil // TODO: kind of can be a slice sorta..
+	}
+	if upper == "" {
+		return "", "", nil
+	}
+
+	lowerSlice, err := sn.slice(ctx, lower)
+	if err != nil {
+		return "", "", err
+	}
+	upperSlice, err := sn.slice(ctx, upper)
+	if err != nil {
+		return "", "", err
+	}
+
+	if len(lowerSlice) >= len(upperSlice) {
+		return "", "", nil
+	}
+
+	if upperSlice[len(lowerSlice)-1].Name != lowerSlice[len(lowerSlice)-1].Name {
+		return "", "", nil
+	}
+	return upperSlice[len(lowerSlice)-1].Name, upperSlice[len(upperSlice)-1].Name, nil
 }
 
 func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []string, opts ...snapshots.Opt) error {
@@ -246,7 +329,291 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []str
 	return nil
 }
 
-func (sn *fromContainerd) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
+func (sn *mergeSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) error {
+	if parent != "" {
+		if info, err := sn.Stat(ctx, parent); err != nil {
+			return err
+		} else if lower, upper := diffSnapshotKeysOf(info); lower != "" && upper != "" {
+			opts = append(opts, withDiffSnapshotKeys(lower, key))
+		}
+	}
+	return sn.Snapshotter.Prepare(ctx, key, parent, opts...)
+}
+
+func (sn *mergeSnapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	info, err := sn.Stat(ctx, key)
+	if err != nil {
+		return err
+	}
+	if lower, upper := diffSnapshotKeysOf(info); lower != "" && upper != "" {
+		opts = append(opts, withDiffSnapshotKeys(lower, name))
+	}
+
+	// TODO: doc, this fixes the corner case w/ overlay snapshotters where a file created and deleted results in
+	// TODO: copied up directories that are not actually part of the diff this layer represents.
+	// TODO: Be sure to note that this work is fairly cheap and also amortizes work that would be done later by exporter
+	// TODO: We will need to apply this fix for already existing snapshots in the cache too...
+	// TODO: Need to handle what happens if there is a crash in the middle of this, make sure state is always consistent
+	mountable, err := sn.Mounts(ctx, key)
+	if err != nil {
+		return err
+	}
+	mnts, unmount, err := mountable.Mount()
+	if err != nil {
+		return err
+	}
+	defer unmount()
+	if len(mnts) == 1 && mnts[0].Type == "overlay" {
+		mnt := mnts[0]
+		var upperdir string
+		for _, opt := range mnt.Options {
+			if strings.HasPrefix(opt, "upperdir=") {
+				upperdir = strings.SplitN(opt, "=", 2)[1]
+				break
+			}
+		}
+		if upperdir != "" {
+			leafDirs := make(map[string]struct{})
+			filepath.WalkDir(upperdir, func(path string, d fs.DirEntry, prevErr error) error {
+				if prevErr != nil {
+					return prevErr
+				}
+
+				// skip root
+				if path == upperdir {
+					return nil
+				}
+
+				delete(leafDirs, filepath.Dir(path))
+				if d.IsDir() {
+					xattrs, err := sysx.LListxattr(path)
+					if err != nil {
+						return err
+					}
+					for _, xattr := range xattrs {
+						if isOpaqueXattr(xattr) {
+							return fs.SkipDir
+						}
+					}
+					leafDirs[path] = struct{}{}
+				}
+				return nil
+			})
+			if len(leafDirs) > 0 {
+				var parentMntOptions []string
+				var lowerdirs []string
+				for _, opt := range mnt.Options {
+					if strings.HasPrefix(opt, "upperdir=") || strings.HasPrefix(opt, "workdir=") {
+						continue
+					}
+					if strings.HasPrefix(opt, "lowerdir=") {
+						lowerdirs = strings.Split(strings.SplitN(opt, "=", 2)[1], ":")
+					}
+					parentMntOptions = append(parentMntOptions, opt)
+				}
+				var parentMnts []mount.Mount
+				if len(lowerdirs) == 0 {
+					return errors.New("invalid overlay mount with no lowerdirs")
+				}
+				if len(lowerdirs) == 1 {
+					parentMnts = []mount.Mount{{
+						Type:    "bind",
+						Source:  lowerdirs[0],
+						Options: []string{"rbind", "ro"},
+					}}
+				} else {
+					parentMnts = []mount.Mount{{
+						Type:    "overlay",
+						Source:  "overlay",
+						Options: parentMntOptions,
+					}}
+				}
+
+				if err := withTempMount(ctx, parentMnts, func(parentMntRoot string, isDirect bool) error {
+					for len(leafDirs) > 0 {
+						newLeafDirs := make(map[string]struct{})
+						for leafDir := range leafDirs {
+							relpath, err := filepath.Rel(upperdir, leafDir)
+							if err != nil {
+								return err
+							}
+							parentPath := filepath.Join(parentMntRoot, relpath)
+
+							parentStat, err := os.Lstat(parentPath)
+							if os.IsNotExist(err) || errors.Is(err, unix.ENOTDIR) {
+								// this is a real diff because the directory didn't exist before, keep it
+								continue
+							}
+							if err != nil {
+								return err
+							}
+
+							leafStat, err := os.Lstat(leafDir)
+							if err != nil {
+								return err
+							}
+
+							if same, err := overlay.SameDir(leafStat, parentStat, leafDir, parentPath); err != nil {
+								return err
+							} else if same {
+								if err := os.Remove(leafDir); err != nil {
+									return err
+								}
+								checkLeafDir := filepath.Dir(leafDir)
+								if checkLeafDir == upperdir {
+									continue
+								}
+								if dirents, err := os.ReadDir(checkLeafDir); err != nil {
+									return err
+								} else if len(dirents) == 0 {
+									newLeafDirs[checkLeafDir] = struct{}{}
+								}
+							}
+						}
+						leafDirs = newLeafDirs
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return sn.Snapshotter.Commit(ctx, name, key, opts...)
+}
+
+func (sn *mergeSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) (Mountable, error) {
+	if parent != "" {
+		if info, err := sn.Stat(ctx, parent); err != nil {
+			return nil, err
+		} else if lower, upper := diffSnapshotKeysOf(info); lower != "" && upper != "" {
+			opts = append(opts, withDiffSnapshotKeys(lower, upper))
+		}
+	}
+	return sn.Snapshotter.View(ctx, key, parent, opts...)
+}
+
+func (sn *mergeSnapshotter) Mounts(ctx context.Context, key string) (Mountable, error) {
+	// TODO: comments
+	if info, err := sn.Stat(ctx, key); err != nil {
+		return nil, err
+	} else if lower, upper := diffSnapshotKeysOf(info); lower != "" && upper != "" {
+		// TODO: temp leases on views
+		lowerView := identity.NewID()
+		lowerMountable, err := sn.Snapshotter.View(ctx, lowerView, lower)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get lower view for %s", key)
+		}
+		var lowerLayers []string
+		mounts, unmountLower, err := lowerMountable.Mount()
+		if err != nil {
+			return nil, err
+		}
+		defer unmountLower()
+		if len(mounts) == 1 {
+			mnt := mounts[0]
+			switch mnt.Type {
+			case "bind", "rbind":
+				lowerLayers = []string{mnt.Source}
+			case "overlay":
+				layers, err := overlay.GetOverlayLayers(mnt)
+				if err != nil {
+					return nil, err
+				}
+				lowerLayers = layers
+			default:
+				// TODO: just fallback to normal diff in this case, not error
+				return nil, errors.Errorf("invalid mount type %q for snapshot %q", mnt.Type, lower)
+			}
+		} else {
+			return nil, errors.Errorf("invalid number of mounts %d for snapshot %q", len(mounts), lower)
+		}
+
+		var upperMountable Mountable
+		if upper == key {
+			// case where key is an active snapshot
+			// TODO: this condition is confusing
+			upperMountable, err = sn.Snapshotter.Mounts(ctx, upper)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to get upper mounts for %s", key)
+			}
+		} else {
+			// TODO: temp leases on views
+			upperView := identity.NewID()
+			upperMountable, err = sn.Snapshotter.View(ctx, upperView, upper)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to get upper view for %s", key)
+			}
+		}
+		var upperLayers []string
+		mounts, unmountUpper, err := upperMountable.Mount()
+		if err != nil {
+			return nil, err
+		}
+		defer unmountUpper()
+		if len(mounts) == 1 {
+			mnt := mounts[0]
+			switch mnt.Type {
+			case "bind", "rbind":
+				upperLayers = []string{mnt.Source}
+			case "overlay":
+				layers, err := overlay.GetOverlayLayers(mnt)
+				if err != nil {
+					return nil, err
+				}
+				upperLayers = layers
+			default:
+				// TODO: just fallback to normal diff in this case, not error
+				return nil, errors.Errorf("invalid mount type %q for snapshot %q", mnt.Type, lower)
+			}
+		} else {
+			return nil, errors.Errorf("invalid number of mounts %d for snapshot %q", len(mounts), lower)
+		}
+
+		slicedLayers := upperLayers[len(lowerLayers):]
+		if len(slicedLayers) == 0 {
+			return nil, errors.Errorf("invalid empty diff for snapshot %q", key)
+		}
+		if len(slicedLayers) == 1 {
+			// TODO: doc, this deals with corner case where a bind might might directly reveal whiteout devices
+			// TODO: Using an empty view is nice in that cleanup is handled in all cases automatically
+			// TODO: temp lease on view
+			// TODO: Make sure this doesn't confuse the overlay differ on export
+			tempViewID := identity.NewID()
+			mntable, err := sn.View(ctx, tempViewID, "")
+			if err != nil {
+				return nil, err
+			}
+			mnts, unmount, err := mntable.Mount()
+			if err != nil {
+				return nil, err
+			}
+			defer unmount()
+			if len(mnts) != 1 {
+				return nil, errors.New("invalid multiple mounts")
+			}
+			mnt := mnts[0]
+			// TODO: more validation this is a bind? Should always be, but still
+			emptyDir := mnt.Source
+			slicedLayers = []string{emptyDir, slicedLayers[0]}
+		}
+
+		for i, j := 0, len(slicedLayers)-1; i < j; i, j = i+1, j-1 {
+			slicedLayers[i], slicedLayers[j] = slicedLayers[j], slicedLayers[i]
+		}
+		// TODO: include special options from the original overlay mount, especially userxattr
+		return &staticMountable{mounts: []mount.Mount{{
+			Type:    "overlay",
+			Source:  "overlay",
+			Options: []string{fmt.Sprintf("lowerdir=%s", strings.Join(slicedLayers, ":"))},
+		}}, idmap: sn.IdentityMapping(), id: key}, nil
+	}
+
+	return sn.Snapshotter.Mounts(ctx, key)
+}
+
+func (sn *mergeSnapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
 	// If key was created by Merge, we may need to use the annotated mergeUsage key as
 	// the snapshotter's usage method is wrong when hardlinks are used to create the merge.
 	if info, err := sn.Stat(ctx, key); err != nil {
@@ -314,4 +681,25 @@ func mergeKeysOf(info snapshots.Info) []string {
 		return strings.Split(v, ",")
 	}
 	return nil
+}
+
+// TODO: doc
+const lowerDiffSnapshotKey = "containerd.io/snapshot/buildkit.lowerDiffSnapshotKey"
+const upperDiffSnapshotKey = "containerd.io/snapshot/buildkit.upperDiffSnapshotKey"
+
+func withDiffSnapshotKeys(lower, upper string) snapshots.Opt {
+	return snapshots.WithLabels(map[string]string{
+		lowerDiffSnapshotKey: lower,
+		upperDiffSnapshotKey: upper,
+	})
+}
+
+func diffSnapshotKeysOf(info snapshots.Info) (lower string, upper string) {
+	if v := info.Labels[lowerDiffSnapshotKey]; v != "" {
+		lower = v
+	}
+	if v := info.Labels[upperDiffSnapshotKey]; v != "" {
+		upper = v
+	}
+	return lower, upper
 }
