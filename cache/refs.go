@@ -780,16 +780,19 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			}); err != nil && !errdefs.IsAlreadyExists(err) {
 				return nil, err
 			}
-			if _, err := cr.cm.Snapshotter.View(ctx, cr.viewSnapshotID(), cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
+			var err error
+			if cr.mountCache, err = cr.cm.Snapshotter.View(ctx, mountSnapshotID, cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
 				return nil, err
 			}
 		}
 
-		mountable, err := cr.cm.Snapshotter.Mounts(ctx, mountSnapshotID)
-		if err != nil {
-			return nil, err
+		if cr.mountCache == nil {
+			var err error
+			cr.mountCache, err = cr.cm.Snapshotter.Mounts(ctx, mountSnapshotID)
+			if err != nil {
+				return nil, err
+			}
 		}
-		cr.mountCache = mountable
 		return nil, nil
 	})
 	return err
