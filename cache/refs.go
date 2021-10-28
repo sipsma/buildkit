@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
@@ -38,7 +39,6 @@ type Ref interface {
 
 type ImmutableRef interface {
 	Ref
-	Parent() ImmutableRef
 	Clone() ImmutableRef
 	// Finalize commits the snapshot to the driver if it's not already.
 	// This means the snapshot can no longer be mounted as mutable.
@@ -46,6 +46,7 @@ type ImmutableRef interface {
 
 	Extract(ctx context.Context, s session.Group) error // +progress
 	GetRemotes(ctx context.Context, createIfNeeded bool, compressionopt solver.CompressionOpt, all bool, s session.Group) ([]*solver.Remote, error)
+	LayerChain() RefList
 }
 
 type MutableRef interface {
@@ -283,6 +284,30 @@ type immutableRef struct {
 	descHandlers    DescHandlers
 }
 
+type RefList []ImmutableRef
+
+func (l RefList) Release(ctx context.Context) (rerr error) {
+	for i, r := range l {
+		if r == nil {
+			continue
+		}
+		if err := r.Release(ctx); err != nil {
+			rerr = multierror.Append(rerr, err).ErrorOrNil()
+		} else {
+			l[i] = nil
+		}
+	}
+	return rerr
+}
+
+func (sr *immutableRef) LayerChain() RefList {
+	var l RefList
+	for _, rec := range sr.layerChain() {
+		l = append(l, rec.ref(false, sr.descHandlers))
+	}
+	return l
+}
+
 type mutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
@@ -294,13 +319,6 @@ func (sr *immutableRef) Clone() ImmutableRef {
 	ref := sr.ref(false, sr.descHandlers)
 	sr.mu.Unlock()
 	return ref
-}
-
-func (sr *immutableRef) Parent() ImmutableRef {
-	if p := sr.parentRef(true, sr.descHandlers); p != nil { // avoid returning typed nil pointer
-		return p
-	}
-	return nil
 }
 
 func (cr *cacheRecord) ociDesc(ctx context.Context, dhs DescHandlers) (ocispecs.Descriptor, error) {
