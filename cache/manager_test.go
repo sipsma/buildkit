@@ -1273,7 +1273,7 @@ func TestGetRemotes(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, 1, len(remotes))
 				remote := remotes[0]
-				refChain := ir.parentRefChain()
+				recChain := ir.layerChain()
 				for i, desc := range remote.Descriptors {
 					switch compressionType {
 					case compression.Uncompressed:
@@ -1306,7 +1306,7 @@ func TestGetRemotes(t *testing.T) {
 					variantsMap[ir.ID()][i][compressionType] = desc
 					variantsMapMu.Unlock()
 
-					r := refChain[i]
+					r := recChain[i]
 					isLazy, err := r.isLazy(egctx)
 					require.NoError(t, err)
 					needs, err := needsConversion(ctx, co.cs, desc, compressionType)
