@@ -108,6 +108,12 @@ func diffApply(ctx context.Context, lowerMountable, upperMountable, applyMountab
 						return nil
 					}
 
+					// TODO:
+					// TODO:
+					// TODO:
+					// TODO:
+					bklog.G(ctx).Debugf("%s %s %s", kind, upperPath, applyPath)
+
 					// When using overlay, a delete is represented with a whiteout device, which we actually want to
 					// hardlink or recreate here. If upperFi is non-nil, that means we have a whiteout device we can
 					// hardlink in. If upperFi is nil though, we need to first remove what's at the path and then, in

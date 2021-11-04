@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 
+	"github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -87,20 +88,42 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 	}
 
 	recKey := rootKey(e.k.Digest(), e.k.Output())
-	rec := t.Add(recKey)
-	allRec := []CacheExporterRecord{rec}
-
+	var rec CacheExporterRecord
+	var allRec []CacheExporterRecord
 	addRecord := true
 
 	if e.override != nil {
 		addRecord = *e.override
 	}
 
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	var nm string
+	if e.edge != nil && e.edge.edge.Vertex != nil {
+		nm = e.edge.edge.Vertex.Name()
+	}
+	bklog.G(ctx).Debugf("exporting %s %s %s", e.k.Digest(), recKey, nm)
+	rec = t.Add(recKey)
+	allRec = []CacheExporterRecord{rec}
+	/*
+		if strings.HasPrefix(nm, "merge") {
+			addRecord = false
+		} else {
+			bklog.G(ctx).Debugf("exporting %s %s %s", e.k.Digest(), recKey, nm)
+			rec = t.Add(recKey)
+			allRec = []CacheExporterRecord{rec}
+		}
+	*/
+
 	if e.record == nil && len(e.k.Deps()) > 0 {
 		e.record = getBestResult(e.records)
 	}
 
 	var remote *Remote
+
 	if v := e.record; v != nil && len(e.k.Deps()) > 0 && addRecord {
 		var variants []CacheExporterRecord
 
@@ -160,6 +183,16 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		opt.Mode = CacheExportModeRemoteOnly
 	}
 
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	/*
+		if !strings.HasPrefix(nm, "merge") {
+		}
+	*/
 	srcs := make([][]expr, len(deps))
 
 	for i, deps := range deps {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/containerd/containerd/content"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -55,6 +56,12 @@ func (c *CacheChains) normalize() error {
 	for _, it := range c.items {
 		if !it.invalid {
 			validated = append(validated, it)
+		} else {
+			//TODO:
+			//TODO:
+			//TODO:
+			//TODO:
+			bklog.G(context.TODO()).Debugf("invalid item: %s", it.dgst)
 		}
 	}
 	c.items = validated
@@ -77,12 +84,38 @@ func (c *CacheChains) normalize() error {
 }
 
 func (c *CacheChains) Marshal(ctx context.Context) (*CacheConfig, DescriptorProvider, error) {
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	/*
+		var dbg []string
+		for _, it := range c.items {
+			dbg = append(dbg, fmt.Sprintf("%+v", it))
+		}
+		bklog.G(context.TODO()).Debugf("start marshal chain: %+v", dbg)
+	*/
+
 	if err := c.normalize(); err != nil {
 		return nil, nil, err
 	}
 
+	/*
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		dbg = nil
+		for _, it := range c.items {
+			dbg = append(dbg, fmt.Sprintf("%+v", it))
+		}
+		bklog.G(context.TODO()).Debugf("normalized marshal chain: %+v", dbg)
+	*/
+
 	st := &marshalState{
-		chainsByID:    map[string]int{},
+		chainsByID:    map[digest.Digest][]int{},
 		descriptors:   DescriptorProvider{},
 		recordsByItem: map[*item]int{},
 	}
@@ -93,11 +126,18 @@ func (c *CacheChains) Marshal(ctx context.Context) (*CacheConfig, DescriptorProv
 		}
 	}
 
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(context.TODO()).Debugf("presort records: %+v", st.records)
+
 	cc := CacheConfig{
 		Layers:  st.layers,
 		Records: st.records,
 	}
-	sortConfig(&cc)
+	// TODO: update sortConfig and reenable
+	// sortConfig(&cc)
 
 	return &cc, st.descriptors, nil
 }
@@ -116,10 +156,15 @@ type item struct {
 	result     *solver.Remote
 	resultTime time.Time
 
-	links       []map[link]struct{}
+	// links is slice of sets of links to other items. The i'th set
+	// in the slice holds the links from the i'th input.
+	links []map[link]struct{}
+
+	// backlinks is a set of items that have this item as an input.
 	backlinksMu sync.Mutex
 	backlinks   map[*item]struct{}
-	invalid     bool
+
+	invalid bool
 }
 
 type link struct {

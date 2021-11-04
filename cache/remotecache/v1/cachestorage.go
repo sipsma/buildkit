@@ -7,6 +7,7 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -235,6 +236,14 @@ func (cs *cacheResultStorage) LoadWithParents(ctx context.Context, res solver.Ca
 					return nil
 				}
 				if isSubRemote(*i.result, *v.result) {
+					// TODO:
+					// TODO:
+					// TODO:
+					// TODO:
+					// TODO:
+					// TODO:
+					bklog.G(ctx).Debugf("LoadWithParents: %s %+v", i.dgst, i.result)
+
 					ref, err := cs.w.FromRemote(ctx, i.result)
 					if err != nil {
 						return err
@@ -259,6 +268,14 @@ func (cs *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) 
 	if item == nil || item.result == nil {
 		return nil, errors.WithStack(solver.ErrNotFound)
 	}
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(ctx).Debugf("Load: %s %+v", item.dgst, item.result)
 
 	ref, err := cs.w.FromRemote(ctx, item.result)
 	if err != nil {

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -186,22 +187,31 @@ func (p parentRefs) parentSnapshotIDs() []string {
 	return nil
 }
 
+type layerRecord struct {
+	*cacheRecord
+	mergeID string
+	inputID string
+}
+
 // order is from parent->child, cr will be at end of slice
-func (cr *cacheRecord) layerChain() (layers []*cacheRecord) {
-	switch cr.parentKind() {
-	case Merge:
-		for _, parent := range cr.mergeParents {
-			layers = append(layers, parent.layerChain()...)
+// TODO: update doc string about merge/input ID
+func (cr *cacheRecord) layerChain() []*layerRecord {
+	var visit func(lr *layerRecord) []*layerRecord
+	visit = func(lr *layerRecord) (layers []*layerRecord) {
+		switch lr.parentKind() {
+		case Merge:
+			for inputID, parent := range lr.mergeParents {
+				layers = append(layers, visit(&layerRecord{parent.cacheRecord, lr.ID(), strconv.Itoa(inputID)})...)
+			}
+		case Layer:
+			layers = append(layers, visit(&layerRecord{lr.layerParent.cacheRecord, lr.mergeID, lr.inputID})...)
+			fallthrough
+		case None:
+			layers = append(layers, lr)
 		}
 		return layers
-	case Layer:
-		layers = append(layers, cr.layerParent.layerChain()...)
-		fallthrough
-	case None:
-		layers = append(layers, cr)
-		return layers
 	}
-	return nil
+	return visit(&layerRecord{cr, "", ""})
 }
 
 // hold cacheRecord.mu lock before calling

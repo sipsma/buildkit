@@ -8,7 +8,9 @@ import (
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -73,13 +75,27 @@ func (ce *exporter) ExportForLayers(ctx context.Context, layers []digest.Digest)
 		return nil, nil
 	}
 
-	cache := map[int]int{}
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(context.TODO()).Debugf("export cache presort layers: %+v", cfg.Layers)
 
 	// reorder layers based on the order in the image
+	blobIndexes := make(map[digest.Digest]int)
+	for i, blob := range layers {
+		blobIndexes[blob] = i
+	}
 	for i, r := range cfg.Records {
 		for j, rr := range r.Results {
-			n := getSortedLayerIndex(rr.LayerIndex, cfg.Layers, cache)
-			rr.LayerIndex = n
+			for k, layerIndex := range rr.LayerIndexes {
+				n, ok := blobIndexes[cfg.Layers[layerIndex].Blob]
+				if !ok {
+					return nil, errors.Errorf("failed to find blob %s in layers", cfg.Layers[layerIndex].Blob)
+				}
+				rr.LayerIndexes[k] = n
+			}
 			r.Results[j] = rr
 			cfg.Records[i] = r
 		}
@@ -91,17 +107,13 @@ func (ce *exporter) ExportForLayers(ctx context.Context, layers []digest.Digest)
 	}
 	ce.reset()
 
-	return dt, nil
-}
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(context.TODO()).Debugf("export cache layers: %+v", cfg.Layers)
+	bklog.G(context.TODO()).Debugf("export cache records: %s", string(dt))
 
-func getSortedLayerIndex(idx int, layers []v1.CacheLayer, cache map[int]int) int {
-	if idx == -1 {
-		return -1
-	}
-	l := layers[idx]
-	if i, ok := cache[idx]; ok {
-		return i
-	}
-	cache[idx] = getSortedLayerIndex(l.ParentIndex, layers, cache) + 1
-	return cache[idx]
+	return dt, nil
 }

@@ -252,15 +252,46 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 				}
 				ctx = withDescHandlerCacheOpts(ctx, workerRef.ImmutableRef)
 
-				// all keys have same export chain so exporting others is not needed
+				// TODO:
+				// TODO:
+				// TODO:
+				// TODO:
+				// TODO:
+				// TODO:
+				/*
+					layerChain := workerRef.ImmutableRef.LayerChain()
+					defer layerChain.Release(ctx)
+					if layerChain[len(layerChain)-1].ID() == workerRef.ImmutableRef.ID() {
+						if _, err := r.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
+							ResolveRemotes: workerRefResolver(solver.CompressionOpt{Type: compression.Default}, false, g), // load as many compression blobs as possible
+							Mode:           solver.CacheExportModeMin,
+							Session:        g,
+						}); err != nil {
+							return err
+						}
+					} else {
+						for _, deps := range r.CacheKeys()[0].Deps() {
+							for _, dep := range deps {
+								if _, err := dep.CacheKey.Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
+									ResolveRemotes: workerRefResolver(solver.CompressionOpt{Type: compression.Default}, false, g), // load as many compression blobs as possible
+									Mode:           solver.CacheExportModeMin,
+									Session:        g,
+								}); err != nil {
+									return err
+								}
+							}
+						}
+					}
+					return nil
+				*/
+
 				_, err = r.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
-					ResolveRemotes: workerRefResolver(solver.CompressionOpt{
-						Type: compression.Default, // TODO: make configurable
-					}, false, g),
-					Mode:    exp.CacheExportMode,
-					Session: g,
+					ResolveRemotes: workerRefResolver(solver.CompressionOpt{Type: compression.Default}, false, g), // load as many compression blobs as possible
+					Mode:           solver.CacheExportModeMin,
+					Session:        g,
 				})
 				return err
+
 			}); err != nil {
 				return prepareDone(err)
 			}
@@ -316,6 +347,7 @@ func inlineCache(ctx context.Context, e remotecache.Exporter, res solver.CachedR
 		}
 
 		ctx = withDescHandlerCacheOpts(ctx, workerRef.ImmutableRef)
+
 		if _, err := res.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
 			ResolveRemotes: workerRefResolver(compressionopt, true, g), // load as many compression blobs as possible
 			Mode:           solver.CacheExportModeMin,
@@ -334,6 +366,7 @@ func withDescHandlerCacheOpts(ctx context.Context, ref cache.ImmutableRef) conte
 	return solver.WithCacheOptGetter(ctx, func(keys ...interface{}) map[interface{}]interface{} {
 		vals := make(map[interface{}]interface{})
 		for _, k := range keys {
+			k := k
 			if key, ok := k.(cache.DescHandlerKey); ok {
 				if handler := ref.DescHandler(digest.Digest(key)); handler != nil {
 					vals[k] = handler

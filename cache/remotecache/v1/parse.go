@@ -2,10 +2,12 @@ package cacheimport
 
 import (
 	"encoding/json"
+	"strconv"
 
+	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/contentutil"
-	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -55,56 +57,78 @@ func parseRecord(cc CacheConfig, idx int, provider DescriptorProvider, t solver.
 	}
 
 	for _, res := range rec.Results {
-		visited := map[int]struct{}{}
-		remote, err := getRemoteChain(cc.Layers, res.LayerIndex, provider, visited)
-		if err != nil {
-			return nil, err
+		var remote *solver.Remote
+		if rec.RecordType == MergeRecordType {
+			// TODO: dedupe this with above maybe?
+			// TODO: verify that order of inputs is always preserved
+			var inputRemotes []*solver.Remote
+			for _, inputs := range rec.Inputs {
+				for _, inp := range inputs {
+					// TODO: guard against panic when out of bounds
+					inputRec := cc.Records[inp.LinkIndex]
+					for _, inputRes := range inputRec.Results { // TODO: there's only ever 0 or 1 result, right?
+						inputRemote, err := getRemoteChain(cc.Layers, inputRes.LayerIndexes, provider)
+						if err != nil {
+							return nil, err
+						}
+						inputRemotes = append(inputRemotes, inputRemote)
+					}
+				}
+			}
+			remote = mergeRemotes(identity.NewID(), inputRemotes)
+		} else {
+			// TODO: backwards compatibility
+			// if res.LayerIndex != -1 {
+			// 	fill in LayerIndexes
+			// }
+
+			// TODO: can you memoize anymore? visited := map[int]struct{}{}
+			var err error
+			remote, err = getRemoteChain(cc.Layers, res.LayerIndexes, provider)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if remote != nil {
-			r.AddResult(res.CreatedAt, remote)
-		}
+		r.AddResult(res.CreatedAt, remote)
 	}
 
 	cache[idx] = r
 	return r, nil
 }
 
-func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, visited map[int]struct{}) (*solver.Remote, error) {
-	if _, ok := visited[idx]; ok {
-		return nil, errors.Errorf("invalid looping layer")
-	}
-	visited[idx] = struct{}{}
-
-	if idx < 0 || idx >= len(layers) {
-		return nil, errors.Errorf("invalid layer index %d", idx)
-	}
-
-	l := layers[idx]
-
-	descPair, ok := provider[l.Blob]
-	if !ok {
-		return nil, nil
-	}
-
-	var r *solver.Remote
-	if l.ParentIndex != -1 {
-		var err error
-		r, err = getRemoteChain(layers, l.ParentIndex, provider, visited)
-		if err != nil {
-			return nil, err
+func getRemoteChain(layers []CacheLayer, layerIndexes []int, provider DescriptorProvider) (*solver.Remote, error) {
+	var r solver.Remote
+	for _, idx := range layerIndexes {
+		if idx < 0 || idx >= len(layers) {
+			return nil, errors.Errorf("invalid layer index: %d", idx) // TODO: return nil, nil like other error case below?
 		}
-		if r == nil {
+		l := layers[idx]
+
+		descPair, ok := provider[l.Blob]
+		if !ok {
 			return nil, nil
 		}
+
 		r.Descriptors = append(r.Descriptors, descPair.Descriptor)
 		mp := contentutil.NewMultiProvider(r.Provider)
 		mp.Add(descPair.Descriptor.Digest, descPair.Provider)
 		r.Provider = mp
-		return r, nil
 	}
-	return &solver.Remote{
-		Descriptors: []ocispecs.Descriptor{descPair.Descriptor},
-		Provider:    descPair.Provider,
-	}, nil
+	return &r, nil
+}
 
+// mergeRemotes creates a remote the represents the merging of the given inputs
+func mergeRemotes(mergeID string, inputs []*solver.Remote) *solver.Remote {
+	var r solver.Remote
+	for inputID, input := range inputs {
+		for _, desc := range input.Descriptors {
+			_, alreadyMerge := desc.Annotations[cache.MergeIDAnnotation]
+			if alreadyMerge {
+				continue
+			}
+			desc.Annotations[cache.MergeIDAnnotation] = mergeID
+			desc.Annotations[cache.MergeInputIDAnnotation] = strconv.Itoa(inputID)
+		}
+	}
+	return &r
 }

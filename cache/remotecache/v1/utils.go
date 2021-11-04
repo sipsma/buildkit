@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -18,6 +22,7 @@ import (
 var EmptyLayerRemovalSupported = true
 
 // sortConfig sorts the config structure to make sure it is deterministic
+// TODO: fix to use LayerIndexes
 func sortConfig(cc *CacheConfig) {
 	type indexedLayer struct {
 		oldIndex int
@@ -180,6 +185,10 @@ func (s *normalizeState) checkLoops(d digest.Digest, visited map[digest.Digest]s
 	}
 }
 
+// normalizeItem identifies any equivalent items (where equivalence is determined
+// by comparing the hash of the item and the identity+order of its inputs).
+// Equivalent items are de-duped, with links updated to point to a single instance
+// of the duplicates.
 func normalizeItem(it *item, state *normalizeState) (*item, error) {
 	if it2, ok := state.added[it]; ok {
 		return it2, nil
@@ -270,41 +279,108 @@ func normalizeItem(it *item, state *normalizeState) (*item, error) {
 	return it2, nil
 }
 
+// getSubremotes returns the remotes representing each merge input
+// of the provided remote. If the provided remote is not a merge, then
+// it is returned unaltered as the only element of the slice.
+func getSubremotes(r *solver.Remote) []solver.Remote {
+	if r == nil {
+		return nil
+	}
+	topDesc := r.Descriptors[len(r.Descriptors)-1]
+	mergeID, isMerge := topDesc.Annotations[cache.MergeIDAnnotation]
+	if !isMerge {
+		return []solver.Remote{*r}
+	}
+
+	maxInputID, err := strconv.Atoi(topDesc.Annotations[cache.MergeInputIDAnnotation])
+	if err != nil {
+		return []solver.Remote{*r} // TODO: should this be an error?
+	}
+
+	subremotes := make([]solver.Remote, maxInputID+1)
+	curInput := 0
+	for _, desc := range r.Descriptors {
+		if desc.Annotations[cache.MergeIDAnnotation] != mergeID {
+			subremotes[curInput].Descriptors = append(subremotes[curInput].Descriptors, desc)
+			continue
+		}
+		input, err := strconv.Atoi(desc.Annotations[cache.MergeInputIDAnnotation])
+		if err != nil {
+			return []solver.Remote{*r} // TODO: should this be an error?
+		}
+		if input != curInput {
+			curInput++
+		}
+		delete(desc.Annotations, cache.MergeIDAnnotation)
+		delete(desc.Annotations, cache.MergeInputIDAnnotation)
+		subremotes[curInput].Descriptors = append(subremotes[curInput].Descriptors, desc)
+	}
+	return subremotes
+}
+
 type marshalState struct {
 	layers      []CacheLayer
-	chainsByID  map[string]int
+	chainsByID  map[digest.Digest][]int // map of remote digest to layer indexes TODO: n^2
 	descriptors DescriptorProvider
 
 	records       []CacheRecord
 	recordsByItem map[*item]int
 }
 
-func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) string {
+func getRemoteDigest(r *solver.Remote) digest.Digest {
+	var digests []digest.Digest
+	for _, desc := range r.Descriptors {
+		digests = append(digests, desc.Digest)
+	}
+	return identity.ChainID(digests)
+}
+
+// TODO: doc
+func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) []int {
 	if len(r.Descriptors) == 0 {
-		return ""
+		return nil
 	}
 
 	if cd, ok := r.Provider.(interface {
 		CheckDescriptor(context.Context, ocispecs.Descriptor) error
 	}); ok && len(r.Descriptors) > 0 {
 		for _, d := range r.Descriptors {
-			if cd.CheckDescriptor(ctx, d) != nil {
-				return ""
+			if err := cd.CheckDescriptor(ctx, d); err != nil {
+				return nil
 			}
 		}
 	}
-	var parentID string
+
+	desc := r.Descriptors[len(r.Descriptors)-1]
+
+	if _, isMerge := desc.Annotations[cache.MergeIDAnnotation]; isMerge {
+		var layerIndexes []int
+		subremotes := getSubremotes(r)
+		for _, subremote := range subremotes {
+			subLayerIndexes := marshalRemote(ctx, &subremote, state)
+			layerIndexes = append(layerIndexes, subLayerIndexes...)
+		}
+		return layerIndexes
+	}
+
+	// TODO: n^2
+	// id := desc.Digest.String() + parentID
+	id := getRemoteDigest(r)
+	if cached, ok := state.chainsByID[id]; ok {
+		return cached
+	}
+
+	var parentLayerIndexes []int
 	if len(r.Descriptors) > 1 {
 		r2 := &solver.Remote{
 			Descriptors: r.Descriptors[:len(r.Descriptors)-1],
 			Provider:    r.Provider,
 		}
-		parentID = marshalRemote(ctx, r2, state)
+		parentLayerIndexes = marshalRemote(ctx, r2, state)
 	}
-	desc := r.Descriptors[len(r.Descriptors)-1]
 
 	if desc.Digest == exptypes.EmptyGZLayer && EmptyLayerRemovalSupported {
-		return parentID
+		return parentLayerIndexes
 	}
 
 	state.descriptors[desc.Digest] = DescriptorProviderPair{
@@ -312,22 +388,19 @@ func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) s
 		Provider:   r.Provider,
 	}
 
-	id := desc.Digest.String() + parentID
-
-	if _, ok := state.chainsByID[id]; ok {
-		return id
-	}
-
-	state.chainsByID[id] = len(state.layers)
 	l := CacheLayer{
 		Blob:        desc.Digest,
 		ParentIndex: -1,
 	}
-	if parentID != "" {
-		l.ParentIndex = state.chainsByID[parentID]
+	if len(parentLayerIndexes) > 0 {
+		l.ParentIndex = parentLayerIndexes[len(parentLayerIndexes)-1]
 	}
+	newLayerIndex := len(state.layers)
 	state.layers = append(state.layers, l)
-	return id
+
+	state.chainsByID[id] = append(state.chainsByID[id], parentLayerIndexes...)
+	state.chainsByID[id] = append(state.chainsByID[id], newLayerIndex)
+	return state.chainsByID[id]
 }
 
 func marshalItem(ctx context.Context, it *item, state *marshalState) error {
@@ -357,18 +430,31 @@ func marshalItem(ctx context.Context, it *item, state *marshalState) error {
 	}
 
 	if it.result != nil {
-		id := marshalRemote(ctx, it.result, state)
-		if id != "" {
-			idx, ok := state.chainsByID[id]
-			if !ok {
-				return errors.Errorf("parent chainid not found")
+		if layerIndexes := marshalRemote(ctx, it.result, state); len(layerIndexes) > 0 {
+			rec.Results = append(rec.Results, CacheResult{
+				LayerIndexes: layerIndexes,
+				CreatedAt:    it.resultTime,
+			})
+			// TODO: util func
+			_, isMerge := it.result.Descriptors[len(it.result.Descriptors)-1].Annotations[cache.MergeIDAnnotation]
+			if isMerge {
+				rec.RecordType = MergeRecordType
 			}
-			rec.Results = append(rec.Results, CacheResult{LayerIndex: idx, CreatedAt: it.resultTime})
 		}
 	}
 
 	state.recordsByItem[it] = len(state.records)
 	state.records = append(state.records, rec)
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// fmt.Printf("%+v %+v\n\n", rec, errors.New("fjdklas"))
+	// bklog.G(ctx).Debugf("%+v %+v\n", rec, errors.New("fjdklas"))
+	bklog.G(ctx).Debugf("%+v", state.records)
+
 	return nil
 }
 

@@ -4079,9 +4079,11 @@ func testMergeOpInlineCache(t *testing.T, sb integration.Sandbox) {
 		File(llb.Mkfile("/dir/1", 0777, nil))
 	input1Copy := llb.Scratch().File(llb.Copy(input1, "/dir/1", "/foo/1", &llb.CopyInfo{CreateDestPath: true}))
 
-	input2 := llb.Scratch().
-		File(llb.Mkdir("/dir", 0755)).
-		File(llb.Mkfile("/dir/2", 0777, nil))
+	// put random contents in the file to ensure it's not re-run later
+	input2 := llb.Image("alpine:latest").Run(llb.Args([]string{"sh", "-c", strings.Join([]string{
+		"mkdir /dir",
+		"cat /dev/urandom | head -c 100 | sha256sum > /dir/2",
+	}, " && ")})).Root()
 	input2Copy := llb.Scratch().File(llb.Copy(input2, "/dir/2", "/bar/2", &llb.CopyInfo{CreateDestPath: true}))
 
 	merge := llb.Merge([]llb.State{llb.Image(busyboxTarget), input1Copy, input2Copy})
@@ -4112,6 +4114,24 @@ func testMergeOpInlineCache(t *testing.T, sb integration.Sandbox) {
 		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
 	}
 
+	// get the random value at /bar/2
+	destDir, err := ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	bar2Contents, err := ioutil.ReadFile(filepath.Join(destDir, "bar", "2"))
+	require.NoError(t, err)
+
 	// clear all local state out
 	img, err := imageService.Get(ctx, target)
 	require.NoError(t, err)
@@ -4127,6 +4147,14 @@ func testMergeOpInlineCache(t *testing.T, sb integration.Sandbox) {
 		_, err = contentStore.Info(ctx, layer.Digest)
 		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
 	}
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// add a step where you re-run the build exactly as it is and test everything stays lazy
 
 	// re-run the build with a change only to input1 using the remote cache
 	input1 = llb.Scratch().
@@ -4180,6 +4208,42 @@ func testMergeOpInlineCache(t *testing.T, sb integration.Sandbox) {
 			require.Fail(t, "unexpected layer index %d", i)
 		}
 	}
+
+	// check the random value at /bar/2 didn't change
+	destDir, err = ioutil.TempDir("", "buildkit")
+	require.NoError(t, err)
+	defer os.RemoveAll(destDir)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+		CacheImports: []CacheOptionsEntry{{
+			Type: "registry",
+			Attrs: map[string]string{
+				"ref": target,
+			},
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	// TODO:
+	/*
+		require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+			fstest.CreateDir("bar", 0777),
+			fstest.CreateFile("bar/2", bar2Contents, 0777),
+		)))
+	*/
+
+	newBar2Contents, err := ioutil.ReadFile(filepath.Join(destDir, "bar", "2"))
+	require.NoError(t, err)
+
+	require.Equalf(t, bar2Contents, newBar2Contents, "bar/2 contents changed")
+
+	// TODO: add a step with a run on top of the merge
 }
 
 func requiresLinux(t *testing.T) {

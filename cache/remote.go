@@ -21,6 +21,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const MergeIDAnnotation = "buildkit.io/merge.id"
+const MergeInputIDAnnotation = "buildkit.io/merge.input.id"
+
 type Unlazier interface {
 	Unlazy(ctx context.Context) error
 }
@@ -47,6 +50,14 @@ func (sr *immutableRef) GetRemotes(ctx context.Context, createIfNeeded bool, com
 	if !all || compressionopt.Force || len(remote.Descriptors) == 0 {
 		return []*solver.Remote{remote}, nil // early return if compression variants aren't required
 	}
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// Copy merge input annotations to variants
 
 	// Search all available remotes that has the topmost blob with the specified
 	// compression with all combination of copmressions
@@ -151,6 +162,7 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, comp
 	remote := &solver.Remote{
 		Provider: mprovider,
 	}
+
 	for _, rec := range chain {
 		desc, err := rec.ociDesc(ctx, sr.descHandlers)
 		if err != nil {
@@ -241,9 +253,18 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, comp
 			}
 		}
 
+		// add merge annotations if needed
+		if rec.mergeID != "" {
+			if desc.Annotations == nil {
+				desc.Annotations = make(map[string]string)
+			}
+			desc.Annotations[MergeIDAnnotation] = rec.mergeID
+			desc.Annotations[MergeInputIDAnnotation] = rec.inputID
+		}
+
 		remote.Descriptors = append(remote.Descriptors, desc)
 		mprovider.Add(lazyRefProvider{
-			rec:     rec,
+			rec:     rec.cacheRecord,
 			desc:    desc,
 			dh:      sr.descHandlers[desc.Digest],
 			session: s,

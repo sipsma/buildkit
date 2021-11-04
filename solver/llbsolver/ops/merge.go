@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
 
@@ -55,12 +57,35 @@ func (m *mergeOp) CacheMap(ctx context.Context, group session.Group, index int) 
 		}, len(m.op.Inputs)),
 	}
 
+	// TODO: ?
+	// TODO: ?
+	// TODO: ?
+	/*
+		for i := range cm.Deps {
+			cm.Deps[i].ComputeDigestFunc = func(ctx context.Context, input solver.Result, s session.Group) (digest.Digest, error) {
+				return digest.Digest(input.ID()), nil
+			}
+		}
+	*/
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(ctx).Debugf("merge cache map: %+v", cm)
+
 	return cm, true, nil
 }
 
 func (m *mergeOp) Exec(ctx context.Context, g session.Group, inputs []solver.Result) ([]solver.Result, error) {
 	refs := make([]cache.ImmutableRef, len(inputs))
 	ids := make([]string, len(inputs))
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	descrs := make([]string, len(inputs))
 	for i, inp := range inputs {
 		wref, ok := inp.Sys().(*worker.WorkerRef)
 		if !ok {
@@ -68,7 +93,17 @@ func (m *mergeOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		}
 		refs[i] = wref.ImmutableRef
 		ids[i] = wref.ImmutableRef.ID()
+		descrs[i] = strconv.Quote(wref.ImmutableRef.GetDescription())
 	}
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	bklog.G(ctx).Debugf("merge exec inputs: %+v", inputs)
+	bklog.G(ctx).Debugf("merge exec ids: %+v", ids)
+	bklog.G(ctx).Debugf("merge exec descrs: %+v", descrs)
 
 	mergedRef, err := m.worker.CacheManager().Merge(ctx, refs,
 		cache.WithDescription(fmt.Sprintf("merge %s", strings.Join(ids, ";"))))

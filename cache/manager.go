@@ -180,6 +180,11 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 		if err := setImageRefMetadata(ref.cacheMetadata, opts...); err != nil {
 			return nil, errors.Wrapf(err, "failed to append image ref metadata to ref %s", ref.ID())
 		}
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		bklog.G(ctx).Debugf("getByBlob: found ref %s by blobchainid for %s", ref.ID(), desc.Digest)
 		return ref, nil
 	}
 
@@ -193,9 +198,14 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 		ref, err := cm.get(ctx, si.ID(), opts...)
 		// if the error was NotFound or NeedsRemoteProvider, we can't re-use the snapshot from the blob so just skip it
 		if err != nil && !IsNotFound(err) && !errors.As(err, &NeedsRemoteProvidersError{}) {
-			return nil, errors.Wrapf(err, "failed to get record %s by chainid", si.ID())
+			return nil, errors.Wrapf(err, "failed to get record %s by chainid for %s", si.ID(), desc.Digest)
 		}
 		if ref != nil {
+			// TODO:
+			// TODO:
+			// TODO:
+			// TODO:
+			bklog.G(ctx).Debugf("getByBlob: found ref %s by chainid", ref.ID())
 			link = ref
 			break
 		}

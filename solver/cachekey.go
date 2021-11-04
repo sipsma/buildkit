@@ -35,6 +35,10 @@ type CacheKey struct {
 	indexIDs []string
 }
 
+// Deps returns a nested slice of dependencies for this cache key.
+// The outer slice is indexed by the input operation. The inner
+// slice is indexed by the cache keys for that input operation (if
+// there were multiple).
 func (ck *CacheKey) Deps() [][]CacheKeyWithSelector {
 	ck.mu.RLock()
 	defer ck.mu.RUnlock()

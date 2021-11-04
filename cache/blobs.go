@@ -295,10 +295,10 @@ func (sr *immutableRef) setChains(ctx context.Context) error {
 	var layerParent *cacheRecord
 	switch sr.parentKind() {
 	case Merge:
-		layerParent = layerChain[len(layerChain)-1]
+		layerParent = layerChain[len(layerChain)-1].cacheRecord
 	case Layer:
 		// skip the last layer in the chain, which is this ref itself
-		layerParent = layerChain[len(layerChain)-2]
+		layerParent = layerChain[len(layerChain)-2].cacheRecord
 	}
 	if layerParent != nil {
 		if parentChainID := layerParent.getChainID(); parentChainID != "" {
