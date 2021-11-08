@@ -3,7 +3,6 @@ package snapshot
 import (
 	"context"
 	"strconv"
-	"strings"
 
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/pkg/userns"
@@ -30,6 +29,11 @@ var overlayBasedSnapshotters = map[string]struct{}{
 	"stargz":    {},
 }
 
+type Diff struct {
+	Lower string
+	Upper string
+}
+
 type MergeSnapshotter interface {
 	Snapshotter
 	// Merge creates a snapshot whose contents are the merged contents of each of the provided
@@ -43,7 +47,8 @@ type MergeSnapshotter interface {
 	// The size of a merged snapshot (as returned by the Usage method) depends on the merge
 	// implementation. Implementations using hardlinks to create merged views will take up
 	// less space than those that use copies, for example.
-	Merge(ctx context.Context, key string, parents []string, opts ...snapshots.Opt) error
+	// TODO: update docs
+	Merge(ctx context.Context, key string, diffs []Diff, opts ...snapshots.Opt) error
 }
 
 type mergeSnapshotter struct {
@@ -88,50 +93,39 @@ func NewMergeSnapshotter(ctx context.Context, sn Snapshotter, lm leases.Manager)
 	}
 }
 
-func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []string, opts ...snapshots.Opt) error {
-	// Flatten the provided parent keys out. If any of them are them selves merges, don't use that key directly as
-	// a parent and instead use each of the merge inputs to that parent directly in the merge here. This is important
-	// for ensuring deletions defined between layers are preserved as part of each merge.
-	var mergeKeys []string
-	for _, parentKey := range parents {
-		parentInfo, err := sn.Stat(ctx, parentKey)
+func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff, opts ...snapshots.Opt) error {
+	var expandedDiffs []Diff
+	for _, diff := range diffs {
+		subdiffs, err := sn.expandDiff(ctx, diff)
 		if err != nil {
-			return errors.Wrap(err, "failed to stat parent during merge")
+			return err
 		}
-		if parentInfo.Kind != snapshots.KindCommitted {
-			return errors.Wrapf(err, "invalid kind %q for parent key %q provided to merge", parentInfo.Kind, parentKey)
-		}
-		if parentKeys := mergeKeysOf(parentInfo); parentKeys != nil {
-			mergeKeys = append(mergeKeys, parentKeys...)
-		} else {
-			mergeKeys = append(mergeKeys, parentKey)
-		}
+		expandedDiffs = append(expandedDiffs, subdiffs...)
 	}
+	diffs = expandedDiffs
 
-	// Map each key in mergeKeys to each key making up the snapshot chain.
-	// applyChains' outer slice has the same order as parents, which is expected to be lowest merge input to highest.
-	// applyChains' inner slice is ordered from highest layer to lowest.
-	var applyChains [][]string
 	var baseKey string
-	for i, parent := range mergeKeys {
-		if i == 0 && sn.overlayBased {
-			// Overlay-based snapshotters can skip the base of the merge and just use it as the parent of the merge snapshot.
-			// Other snapshotters will start empty (with baseKey set to "")
-			baseKey = parent
-			continue
-		}
-		var chain []string
-		for curkey := parent; curkey != ""; {
-			info, err := sn.Stat(ctx, curkey)
+	if sn.overlayBased {
+		// Overlay-based snapshotters can skip the base snapshot of the merge (if one exists) and just use it as the
+		// parent of the merge snapshot. Other snapshotters will start empty (with baseKey set to "").
+		// Find the baseKey by following the chain of diffs for as long as it follows the pattern of the current lower
+		// being the parent of the current upper and equal to the previous upper.
+		var baseIndex int
+		for i, diff := range diffs {
+			info, err := sn.Stat(ctx, diff.Upper)
 			if err != nil {
-				return errors.Wrapf(err, "failed to stat chain key %q", curkey)
+				return err
 			}
-			chain = append(chain, info.Name)
-			curkey = info.Parent
+			if info.Parent != diff.Lower {
+				break
+			}
+			if diff.Lower != baseKey {
+				break
+			}
+			baseKey = diff.Upper
+			baseIndex = i + 1
 		}
-		// add an empty key as the bottom layer so that the real bottom layer gets diffed with it and applied
-		chain = append(chain, "")
-		applyChains = append(applyChains, chain)
+		diffs = diffs[baseIndex:]
 	}
 
 	// Make the snapshot that will be merged into
@@ -139,7 +133,7 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []str
 	if err := sn.Prepare(ctx, prepareKey, baseKey); err != nil {
 		return errors.Wrapf(err, "failed to prepare %q", key)
 	}
-	applyMounts, err := sn.Mounts(ctx, prepareKey)
+	applyMountable, err := sn.Mounts(ctx, prepareKey)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get mounts of %q", key)
 	}
@@ -159,43 +153,66 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, parents []str
 	// TODO: note for @tonistiigi, this is where we are currently flattening input snapshots for both
 	// native and overlay implementations. What is the advantage of splitting this into separate snapshots
 	// for the overlay case?
-	for _, chain := range applyChains {
-		for j := range chain[:len(chain)-1] {
-			lower := chain[len(chain)-1-j]
-			upper := chain[len(chain)-2-j]
-
-			var lowerMounts Mountable
-			if lower != "" {
-				viewID := identity.NewID()
-				var err error
-				lowerMounts, err = sn.View(tempLeaseCtx, viewID, lower)
-				if err != nil {
-					return errors.Wrapf(err, "failed to get mounts of lower %q", lower)
-				}
-			}
-
+	for _, diff := range diffs {
+		var lowerMountable Mountable
+		if diff.Lower != "" {
 			viewID := identity.NewID()
-			upperMounts, err := sn.View(tempLeaseCtx, viewID, upper)
+			var err error
+			lowerMountable, err = sn.View(tempLeaseCtx, viewID, diff.Lower)
 			if err != nil {
-				return errors.Wrapf(err, "failed to get mounts of upper %q", upper)
+				return errors.Wrapf(err, "failed to get mounts of lower %q", diff.Lower)
 			}
+		}
 
-			err = diffApply(tempLeaseCtx, lowerMounts, upperMounts, applyMounts, sn.useHardlinks, externalHardlinks, sn.overlayBased)
-			if err != nil {
-				return err
-			}
+		viewID := identity.NewID()
+		upperMountable, err := sn.View(tempLeaseCtx, viewID, diff.Upper)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get mounts of upper %q", diff.Upper)
+		}
+
+		err = diffApply(tempLeaseCtx, lowerMountable, upperMountable, applyMountable, sn.useHardlinks, externalHardlinks, sn.overlayBased)
+		if err != nil {
+			return err
 		}
 	}
 
 	// save the correctly calculated usage as a label on the committed key
-	usage, err := diskUsage(ctx, applyMounts, externalHardlinks)
+	usage, err := diskUsage(ctx, applyMountable, externalHardlinks)
 	if err != nil {
 		return errors.Wrap(err, "failed to get disk usage of diff apply merge")
 	}
-	if err := sn.Commit(ctx, key, prepareKey, withMergeUsage(usage), withMergeKeys(mergeKeys)); err != nil {
+	if err := sn.Commit(ctx, key, prepareKey, withMergeUsage(usage)); err != nil {
 		return errors.Wrapf(err, "failed to commit %q", key)
 	}
 	return nil
+}
+
+// TODO: doc
+func (sn *mergeSnapshotter) expandDiff(ctx context.Context, diff Diff) ([]Diff, error) {
+	var diffs []Diff
+	var key string
+	for key = diff.Upper; key != "" && key != diff.Lower; {
+		info, err := sn.Stat(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		diffs = append(diffs, Diff{
+			Lower: info.Parent,
+			Upper: key,
+		})
+		key = info.Parent
+	}
+	if key == diff.Lower {
+		// The diff is sliceable, return the subdiffs that should be applied.
+		// We had to iterate over diffs from child to parent, so reverse them back to the correct order.
+		for i := len(diffs)/2 - 1; i >= 0; i-- {
+			opp := len(diffs) - 1 - i
+			diffs[i], diffs[opp] = diffs[opp], diffs[i]
+		}
+		return diffs, nil
+	}
+	// We can't slice this diff into subdiffs, so just return the original one
+	return []Diff{diff}, nil
 }
 
 func (sn *mergeSnapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
@@ -242,28 +259,4 @@ func mergeUsageOf(info snapshots.Info) (usage snapshots.Usage, ok bool, rerr err
 		usage.Inodes = int64(i)
 	}
 	return usage, true, nil
-}
-
-// mergeKeysLabel holds the keys that a given snapshot should be merged on top of in order to be mounted
-const mergeKeysLabel = "containerd.io/snapshot/buildkit.mergeKeys"
-
-func withMergeKeys(keys []string) snapshots.Opt {
-	return func(info *snapshots.Info) error {
-		// make sure no keys have "," in them
-		for _, k := range keys {
-			if strings.Contains(k, ",") {
-				return errors.Errorf("invalid merge key containing \",\": %s", k)
-			}
-		}
-		return snapshots.WithLabels(map[string]string{
-			mergeKeysLabel: strings.Join(keys, ","),
-		})(info)
-	}
-}
-
-func mergeKeysOf(info snapshots.Info) []string {
-	if v := info.Labels[mergeKeysLabel]; v != "" {
-		return strings.Split(v, ",")
-	}
-	return nil
 }

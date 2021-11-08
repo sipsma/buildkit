@@ -172,6 +172,7 @@ func (p parentRefs) clone() parentRefs {
 	return p
 }
 
+// TODO: remove if unused now
 func (p parentRefs) parentSnapshotIDs() []string {
 	switch p.parentKind() {
 	case Layer:
@@ -927,7 +928,11 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			}
 		case Merge:
 			mountSnapshotID = cr.viewSnapshotID()
-			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, cr.parentSnapshotIDs()); err != nil && !errdefs.IsAlreadyExists(err) {
+			var diffs []snapshot.Diff
+			for _, parent := range cr.mergeParents {
+				diffs = append(diffs, snapshot.Diff{Upper: parent.getSnapshotID()})
+			}
+			if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, diffs); err != nil && !errdefs.IsAlreadyExists(err) {
 				return nil, err
 			}
 		}

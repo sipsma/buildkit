@@ -482,7 +482,11 @@ func mergeKey(
 	parents []string,
 ) snapshotInfo {
 	t.Helper()
-	err := sn.Merge(ctx, key, parents)
+	var diffs []Diff
+	for _, parent := range parents {
+		diffs = append(diffs, Diff{Upper: parent})
+	}
+	err := sn.Merge(ctx, key, diffs)
 	require.NoError(t, err)
 	return getInfo(ctx, t, sn, key)
 }
