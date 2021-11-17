@@ -72,7 +72,7 @@ func TestIntegration(t *testing.T) {
 	mirroredImages["tonistiigi/test:nolayers"] = "docker.io/tonistiigi/test:nolayers"
 	mirrors := integration.WithMirroredImages(mirroredImages)
 
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testCacheExportCacheKeyLoop,
 		testRelativeWorkDir,
 		testFileOpMkdirMkfile,
@@ -139,13 +139,13 @@ func TestIntegration(t *testing.T) {
 		testPullZstdImage,
 		testMergeOp,
 		testMergeOpCache,
-	}, mirrors)
+	), mirrors)
 
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testSecurityMode,
 		testSecurityModeSysfs,
 		testSecurityModeErrors,
-	},
+	),
 		mirrors,
 		integration.WithMatrix("secmode", map[string]interface{}{
 			"sandbox":  securitySandbox,
@@ -153,9 +153,9 @@ func TestIntegration(t *testing.T) {
 		}),
 	)
 
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testHostNetworking,
-	},
+	),
 		mirrors,
 		integration.WithMatrix("netmode", map[string]interface{}{
 			"default": defaultNetwork,

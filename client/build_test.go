@@ -32,7 +32,7 @@ import (
 )
 
 func TestClientGatewayIntegration(t *testing.T) {
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testClientGatewaySolve,
 		testClientGatewayFailedSolve,
 		testClientGatewayEmptySolve,
@@ -51,20 +51,20 @@ func TestClientGatewayIntegration(t *testing.T) {
 		testClientGatewaySlowCacheExecError,
 		testClientGatewayExecFileActionError,
 		testClientGatewayContainerExtraHosts,
-	}, integration.WithMirroredImages(integration.OfficialImages("busybox:latest")))
+	), integration.WithMirroredImages(integration.OfficialImages("busybox:latest")))
 
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testClientGatewayContainerSecurityMode,
-	}, integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
+	), integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
 		integration.WithMatrix("secmode", map[string]interface{}{
 			"sandbox":  securitySandbox,
 			"insecure": securityInsecure,
 		}),
 	)
 
-	integration.Run(t, []integration.Test{
+	integration.Run(t, integration.TestFuncs(
 		testClientGatewayContainerHostNetworking,
-	},
+	),
 		integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
 		integration.WithMatrix("netmode", map[string]interface{}{
 			"default": defaultNetwork,
