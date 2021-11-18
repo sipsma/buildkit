@@ -1059,7 +1059,7 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			}
 			if len(diffs) > 0 {
 				if err := cr.cm.Snapshotter.Merge(ctx, snapshotID, diffs); err != nil && !errdefs.IsAlreadyExists(err) {
-					return nil, err
+					return nil, errors.Wrap(err, "failed to created merged snapshot")
 				}
 			}
 		}
@@ -1083,11 +1083,11 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 				ID:   mountSnapshotID,
 				Type: "snapshots/" + cr.cm.Snapshotter.Name(),
 			}); err != nil && !errdefs.IsAlreadyExists(err) {
-				return nil, err
+				return nil, errors.Wrap(err, "failed to add view to lease")
 			}
 			var err error
 			if cr.mountCache, err = cr.cm.Snapshotter.View(ctx, mountSnapshotID, cr.getSnapshotID()); err != nil && !errdefs.IsAlreadyExists(err) {
-				return nil, err
+				return nil, errors.Wrap(err, "failed to create view")
 			}
 		}
 
@@ -1095,7 +1095,7 @@ func (cr *cacheRecord) prepareMount(ctx context.Context, dhs DescHandlers, s ses
 			var err error
 			cr.mountCache, err = cr.cm.Snapshotter.Mounts(ctx, mountSnapshotID)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrap(err, "failed to get mounts")
 			}
 		}
 		return nil, nil

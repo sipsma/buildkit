@@ -102,11 +102,15 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff,
 		// being the parent of the current upper and equal to the previous upper.
 		var baseIndex int
 		for i, diff := range diffs {
-			info, err := sn.Stat(ctx, diff.Upper)
-			if err != nil {
-				return err
+			var parentKey string
+			if diff.Upper != "" {
+				info, err := sn.Stat(ctx, diff.Upper)
+				if err != nil {
+					return err
+				}
+				parentKey = info.Parent
 			}
-			if info.Parent != diff.Lower {
+			if parentKey != diff.Lower {
 				break
 			}
 			if diff.Lower != baseKey {
@@ -134,8 +138,6 @@ func (sn *mergeSnapshotter) Merge(ctx context.Context, key string, diffs []Diff,
 	}
 	defer done(context.TODO())
 
-	// Iterate over (lower, upper) pairs in each applyChain, calculating their diffs and applying each
-	// one to the mount.
 	externalHardlinks, err := sn.diffApply(tempLeaseCtx, applyMountable, diffs...)
 	if err != nil {
 		return err

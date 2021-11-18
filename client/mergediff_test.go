@@ -1,10 +1,14 @@
 package client
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/testutil/integration"
@@ -90,7 +94,45 @@ func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 
 	requireContents(ctx, t, c, tc.state, tc.contents(sb))
 
-	// TODO: test export/import cycle
+	// export as an image, reimport and verify the image contents also match
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrorRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	def, err := tc.state.Marshal(sb.Context())
+	require.NoError(t, err)
+	imageTarget := fmt.Sprintf("%s/buildkit/%s:latest", registry, strings.ToLower(tc.name))
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": imageTarget,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// clear out all local state
+	cdAddress := sb.ContainerdAddress()
+	if cdAddress != "" {
+		client, err := newContainerd(cdAddress)
+		require.NoError(t, err)
+		defer client.Close()
+		ctdCtx := namespaces.WithNamespace(ctx, "buildkit")
+		imageService := client.ImageService()
+		img, err := imageService.Get(ctdCtx, imageTarget)
+		require.NoError(t, err)
+		err = imageService.Delete(ctdCtx, img.Name, images.SynchronousDelete())
+		require.NoError(t, err)
+	}
+	checkAllReleasable(t, c, sb, true)
+
+	requireContents(ctx, t, c, llb.Image(imageTarget), tc.contents(sb))
 }
 
 func diffOpTestCases() (tests []integration.Test) {

@@ -121,9 +121,16 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				return nil, errors.Errorf("unknown layer compression type: %q", compressionType)
 			}
 
+			var lowerRef *immutableRef
+			switch sr.parentKind() {
+			case Layer:
+				lowerRef = sr.layerParent
+			case Diff:
+				lowerRef = sr.diffParents.lower()
+			}
 			var lower []mount.Mount
-			if sr.layerParent != nil {
-				m, err := sr.layerParent.Mount(ctx, true, s)
+			if lowerRef != nil {
+				m, err := lowerRef.Mount(ctx, true, s)
 				if err != nil {
 					return nil, err
 				}
@@ -136,18 +143,32 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					defer release()
 				}
 			}
-			m, err := sr.Mount(ctx, true, s)
-			if err != nil {
-				return nil, err
+
+			var upperRef *immutableRef
+			switch sr.parentKind() {
+			case Diff:
+				upperRef = sr.diffParents.upper()
+			default:
+				upperRef = sr
 			}
-			upper, release, err := m.Mount()
-			if err != nil {
-				return nil, err
+			var upper []mount.Mount
+			if upperRef != nil {
+				m, err := upperRef.Mount(ctx, true, s)
+				if err != nil {
+					return nil, err
+				}
+				var release func() error
+				upper, release, err = m.Mount()
+				if err != nil {
+					return nil, err
+				}
+				if release != nil {
+					defer release()
+				}
 			}
-			if release != nil {
-				defer release()
-			}
+
 			var desc ocispecs.Descriptor
+			var err error
 
 			// Determine differ and error/log handling according to the platform, envvar and the snapshotter.
 			var enableOverlay, fallback, logWarnOnErr bool
