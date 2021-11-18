@@ -128,7 +128,8 @@ func WriteUpperdir(ctx context.Context, w io.Writer, upperdir string, lower []mo
 	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
 		return mount.WithTempMount(ctx, upperView, func(upperViewRoot string) error {
 			cw := archive.NewChangeWriter(w, upperViewRoot)
-			if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot, false); err != nil {
+			// TODO: if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot, false); err != nil {
+			if err := Changes(ctx, cw.HandleChange, upperdir, upperViewRoot, lowerRoot, true); err != nil {
 				if err2 := cw.Close(); err2 != nil {
 					return errors.Wrapf(err, "failed to record upperdir changes (close error: %v)", err2)
 				}
