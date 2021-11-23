@@ -19,6 +19,7 @@ import (
 	"github.com/containerd/continuity/devices"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/continuity/sysx"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
@@ -284,10 +285,20 @@ func sameDirent(f1, f2 os.FileInfo, f1fullPath, f2fullPath string, checkSameFile
 
 	equalStat, err := compareSysStat(f1.Sys(), f2.Sys())
 	if err != nil || !equalStat {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		bklog.G(context.TODO()).Debugf("stat mismatch: %s %s", f1fullPath, f2fullPath)
 		return equalStat, err
 	}
 
 	if eq, err := compareCapabilities(f1fullPath, f2fullPath); err != nil || !eq {
+		// TODO:
+		// TODO:
+		// TODO:
+		// TODO:
+		bklog.G(context.TODO()).Debugf("capabilities mismatch: %s %s", f1fullPath, f2fullPath)
 		return eq, err
 	}
 

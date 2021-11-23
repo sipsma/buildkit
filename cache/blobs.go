@@ -70,203 +70,201 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
 			})
 		}
-		return eg.Wait()
 	case Diff:
-		if _, ok := neededLayers[sr.ID()]; !ok {
-			// we are just re-using a diff input blob, recurse to diff parents
-			for _, parent := range sr.diffParents {
-				if parent == nil {
-					continue
-				}
-				parent := parent
-				eg.Go(func() error {
-					return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
-				})
+		for _, parent := range sr.diffParents {
+			if parent == nil {
+				continue
 			}
-			return eg.Wait()
+			if _, ok := neededLayers[parent.ID()]; !ok {
+				continue
+			}
+			parent := parent
+			eg.Go(func() error {
+				return computeBlobChain(ctx, parent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
+			})
 		}
 	case Layer:
-		if _, ok := neededLayers[sr.ID()]; !ok {
-			return nil
-		}
 		eg.Go(func() error {
 			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, compressionType, forceCompression, s, neededLayers)
 		})
 	}
 
-	eg.Go(func() error {
-		_, err := g.Do(ctx, fmt.Sprintf("%s-%t", sr.ID(), createIfNeeded), func(ctx context.Context) (interface{}, error) {
-			if sr.getBlob() != "" {
+	if _, ok := neededLayers[sr.ID()]; ok {
+		eg.Go(func() error {
+			_, err := g.Do(ctx, fmt.Sprintf("%s-%t", sr.ID(), createIfNeeded), func(ctx context.Context) (interface{}, error) {
+				if sr.getBlob() != "" {
+					return nil, nil
+				}
+				if !createIfNeeded {
+					return nil, errors.WithStack(ErrNoBlobs)
+				}
+
+				var mediaType string
+				var compressorFunc compressor
+				var finalize func(context.Context, content.Store) (map[string]string, error)
+				switch compressionType {
+				case compression.Uncompressed:
+					mediaType = ocispecs.MediaTypeImageLayer
+				case compression.Gzip:
+					mediaType = ocispecs.MediaTypeImageLayerGzip
+				case compression.EStargz:
+					compressorFunc, finalize = compressEStargz()
+					mediaType = ocispecs.MediaTypeImageLayerGzip
+				case compression.Zstd:
+					compressorFunc = zstdWriter
+					mediaType = ocispecs.MediaTypeImageLayer + "+zstd"
+				default:
+					return nil, errors.Errorf("unknown layer compression type: %q", compressionType)
+				}
+
+				var lowerRef *immutableRef
+				switch sr.parentKind() {
+				case Layer:
+					lowerRef = sr.layerParent
+				case Diff:
+					lowerRef = sr.diffParents.lower()
+				}
+				var lower []mount.Mount
+				if lowerRef != nil {
+					m, err := lowerRef.Mount(ctx, true, s)
+					if err != nil {
+						return nil, err
+					}
+					var release func() error
+					lower, release, err = m.Mount()
+					if err != nil {
+						return nil, err
+					}
+					if release != nil {
+						defer release()
+					}
+				}
+
+				var upperRef *immutableRef
+				switch sr.parentKind() {
+				case Diff:
+					upperRef = sr.diffParents.upper()
+				default:
+					upperRef = sr
+				}
+				var upper []mount.Mount
+				if upperRef != nil {
+					m, err := upperRef.Mount(ctx, true, s)
+					if err != nil {
+						return nil, err
+					}
+					var release func() error
+					upper, release, err = m.Mount()
+					if err != nil {
+						return nil, err
+					}
+					if release != nil {
+						defer release()
+					}
+				}
+
+				var desc ocispecs.Descriptor
+				var err error
+
+				// Determine differ and error/log handling according to the platform, envvar and the snapshotter.
+				var enableOverlay, fallback, logWarnOnErr bool
+				if forceOvlStr := os.Getenv("BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF"); forceOvlStr != "" {
+					enableOverlay, err = strconv.ParseBool(forceOvlStr)
+					if err != nil {
+						return nil, errors.Wrapf(err, "invalid boolean in BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF")
+					}
+					fallback = false // prohibit fallback on debug
+				} else if !isTypeWindows(sr) {
+					enableOverlay, fallback = true, true
+					switch sr.cm.Snapshotter.Name() {
+					case "overlayfs", "stargz":
+						// overlayfs-based snapshotters should support overlay diff. so print warn log on failure.
+						logWarnOnErr = true
+					case "fuse-overlayfs", "native":
+						// not supported with fuse-overlayfs snapshotter which doesn't provide overlayfs mounts.
+						// TODO: add support for fuse-overlayfs
+						enableOverlay = false
+					}
+				}
+				if enableOverlay {
+					computed, ok, err := sr.tryComputeOverlayBlob(ctx, lower, upper, mediaType, sr.ID(), compressorFunc)
+					if !ok || err != nil {
+						if !fallback {
+							if !ok {
+								return nil, errors.Errorf("overlay mounts not detected (lower=%+v,upper=%+v)", lower, upper)
+							}
+							if err != nil {
+								return nil, errors.Wrapf(err, "failed to compute overlay diff")
+							}
+						}
+						if logWarnOnErr {
+							logrus.Warnf("failed to compute blob by overlay differ (ok=%v): %v", ok, err)
+						}
+					}
+					if ok {
+						desc = computed
+					}
+				}
+
+				if desc.Digest == "" {
+					desc, err = sr.cm.Differ.Compare(ctx, lower, upper,
+						diff.WithMediaType(mediaType),
+						diff.WithReference(sr.ID()),
+						diff.WithCompressor(compressorFunc),
+					)
+					if err != nil {
+						return nil, err
+					}
+				}
+
+				if desc.Annotations == nil {
+					desc.Annotations = map[string]string{}
+				}
+				if finalize != nil {
+					a, err := finalize(ctx, sr.cm.ContentStore)
+					if err != nil {
+						return nil, errors.Wrapf(err, "failed to finalize compression")
+					}
+					for k, v := range a {
+						desc.Annotations[k] = v
+					}
+				}
+				info, err := sr.cm.ContentStore.Info(ctx, desc.Digest)
+				if err != nil {
+					return nil, err
+				}
+
+				if diffID, ok := info.Labels[containerdUncompressed]; ok {
+					desc.Annotations[containerdUncompressed] = diffID
+				} else if mediaType == ocispecs.MediaTypeImageLayer {
+					desc.Annotations[containerdUncompressed] = desc.Digest.String()
+				} else {
+					return nil, errors.Errorf("unknown layer compression type")
+				}
+
+				if err := sr.setBlob(ctx, compressionType, desc); err != nil {
+					return nil, err
+				}
 				return nil, nil
-			}
-			if !createIfNeeded {
-				return nil, errors.WithStack(ErrNoBlobs)
-			}
-
-			var mediaType string
-			var compressorFunc compressor
-			var finalize func(context.Context, content.Store) (map[string]string, error)
-			switch compressionType {
-			case compression.Uncompressed:
-				mediaType = ocispecs.MediaTypeImageLayer
-			case compression.Gzip:
-				mediaType = ocispecs.MediaTypeImageLayerGzip
-			case compression.EStargz:
-				compressorFunc, finalize = compressEStargz()
-				mediaType = ocispecs.MediaTypeImageLayerGzip
-			case compression.Zstd:
-				compressorFunc = zstdWriter
-				mediaType = ocispecs.MediaTypeImageLayer + "+zstd"
-			default:
-				return nil, errors.Errorf("unknown layer compression type: %q", compressionType)
-			}
-
-			var lowerRef *immutableRef
-			switch sr.parentKind() {
-			case Layer:
-				lowerRef = sr.layerParent
-			case Diff:
-				lowerRef = sr.diffParents.lower()
-			}
-			var lower []mount.Mount
-			if lowerRef != nil {
-				m, err := lowerRef.Mount(ctx, true, s)
-				if err != nil {
-					return nil, err
-				}
-				var release func() error
-				lower, release, err = m.Mount()
-				if err != nil {
-					return nil, err
-				}
-				if release != nil {
-					defer release()
-				}
-			}
-
-			var upperRef *immutableRef
-			switch sr.parentKind() {
-			case Diff:
-				upperRef = sr.diffParents.upper()
-			default:
-				upperRef = sr
-			}
-			var upper []mount.Mount
-			if upperRef != nil {
-				m, err := upperRef.Mount(ctx, true, s)
-				if err != nil {
-					return nil, err
-				}
-				var release func() error
-				upper, release, err = m.Mount()
-				if err != nil {
-					return nil, err
-				}
-				if release != nil {
-					defer release()
-				}
-			}
-
-			var desc ocispecs.Descriptor
-			var err error
-
-			// Determine differ and error/log handling according to the platform, envvar and the snapshotter.
-			var enableOverlay, fallback, logWarnOnErr bool
-			if forceOvlStr := os.Getenv("BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF"); forceOvlStr != "" {
-				enableOverlay, err = strconv.ParseBool(forceOvlStr)
-				if err != nil {
-					return nil, errors.Wrapf(err, "invalid boolean in BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF")
-				}
-				fallback = false // prohibit fallback on debug
-			} else if !isTypeWindows(sr) {
-				enableOverlay, fallback = true, true
-				switch sr.cm.Snapshotter.Name() {
-				case "overlayfs", "stargz":
-					// overlayfs-based snapshotters should support overlay diff. so print warn log on failure.
-					logWarnOnErr = true
-				case "fuse-overlayfs", "native":
-					// not supported with fuse-overlayfs snapshotter which doesn't provide overlayfs mounts.
-					// TODO: add support for fuse-overlayfs
-					enableOverlay = false
-				}
-			}
-			if enableOverlay {
-				computed, ok, err := sr.tryComputeOverlayBlob(ctx, lower, upper, mediaType, sr.ID(), compressorFunc)
-				if !ok || err != nil {
-					if !fallback {
-						if !ok {
-							return nil, errors.Errorf("overlay mounts not detected (lower=%+v,upper=%+v)", lower, upper)
-						}
-						if err != nil {
-							return nil, errors.Wrapf(err, "failed to compute overlay diff")
-						}
-					}
-					if logWarnOnErr {
-						logrus.Warnf("failed to compute blob by overlay differ (ok=%v): %v", ok, err)
-					}
-				}
-				if ok {
-					desc = computed
-				}
-			}
-
-			if desc.Digest == "" {
-				desc, err = sr.cm.Differ.Compare(ctx, lower, upper,
-					diff.WithMediaType(mediaType),
-					diff.WithReference(sr.ID()),
-					diff.WithCompressor(compressorFunc),
-				)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			if desc.Annotations == nil {
-				desc.Annotations = map[string]string{}
-			}
-			if finalize != nil {
-				a, err := finalize(ctx, sr.cm.ContentStore)
-				if err != nil {
-					return nil, errors.Wrapf(err, "failed to finalize compression")
-				}
-				for k, v := range a {
-					desc.Annotations[k] = v
-				}
-			}
-			info, err := sr.cm.ContentStore.Info(ctx, desc.Digest)
+			})
 			if err != nil {
-				return nil, err
+				return err
 			}
 
-			if diffID, ok := info.Labels[containerdUncompressed]; ok {
-				desc.Annotations[containerdUncompressed] = diffID
-			} else if mediaType == ocispecs.MediaTypeImageLayer {
-				desc.Annotations[containerdUncompressed] = desc.Digest.String()
-			} else {
-				return nil, errors.Errorf("unknown layer compression type")
+			if forceCompression {
+				if err := ensureCompression(ctx, sr, compressionType, s); err != nil {
+					return errors.Wrapf(err, "failed to ensure compression type of %q", compressionType)
+				}
 			}
-
-			if err := sr.setBlob(ctx, compressionType, desc); err != nil {
-				return nil, err
-			}
-			return nil, nil
+			return nil
 		})
-		if err != nil {
-			return err
-		}
 
-		if forceCompression {
-			if err := ensureCompression(ctx, sr, compressionType, s); err != nil {
-				return errors.Wrapf(err, "failed to ensure compression type of %q", compressionType)
-			}
-		}
-		return nil
-	})
+	}
 
 	if err := eg.Wait(); err != nil {
 		return err
 	}
-	return sr.setChains(ctx)
+	return sr.setChains(ctx, neededLayers)
 }
 
 // setBlob associates a blob with the cache record.
@@ -320,7 +318,7 @@ func (sr *immutableRef) setBlob(ctx context.Context, compressionType compression
 	return nil
 }
 
-func (cr *cacheRecord) setChains(ctx context.Context) error {
+func (cr *cacheRecord) setChains(ctx context.Context, neededLayers map[string]struct{}) error {
 	if _, ok := leases.FromContext(ctx); !ok {
 		return errors.Errorf("missing lease requirement for setChains")
 	}
@@ -334,43 +332,59 @@ func (cr *cacheRecord) setChains(ctx context.Context) error {
 
 	var chainIDs []digest.Digest
 	var blobChainIDs []digest.Digest
-
-	// Blobs should be set the actual layers in the ref's chain
-	// TODO: double check this again... this still feels wrong and like you will use only parts of the chain
-	// in the merge+diff case.
-	layerChain := cr.layerChain()
-	var layerParent *cacheRecord
 	switch cr.parentKind() {
-	case Merge:
-		// merges don't create their own layers, they just re-use input layers
-		layerParent = layerChain[len(layerChain)-1]
 	case Layer:
-		// skip the last layer in the chain, which is this ref itself
-		layerParent = layerChain[len(layerChain)-2]
-		// TODO: note about Diff, basically for either case you end up with a single layer (either re-used or newly created)
-	}
-
-	if layerParent != nil {
-		if err := layerParent.setChains(ctx); err != nil {
-			return err
+		if _, ok := neededLayers[cr.layerParent.ID()]; ok {
+			if parentChainID := cr.layerParent.getChainID(); parentChainID != "" {
+				chainIDs = append(chainIDs, parentChainID)
+			} else {
+				return errors.Errorf("failed to set chain for reference with non-addressable parent %q", cr.layerParent.GetDescription())
+			}
+			if parentBlobChainID := cr.layerParent.getBlobChainID(); parentBlobChainID != "" {
+				blobChainIDs = append(blobChainIDs, parentBlobChainID)
+			} else {
+				return errors.Errorf("failed to set blobchain for reference with non-addressable parent %q", cr.layerParent.GetDescription())
+			}
 		}
-		if parentChainID := layerParent.getChainID(); parentChainID != "" {
-			chainIDs = append(chainIDs, parentChainID)
-		} else {
-			return errors.Errorf("failed to set chain for reference %q with non-addressable parent", cr.GetDescription())
+		fallthrough
+	case None:
+		if _, ok := neededLayers[cr.ID()]; !ok {
+			return nil
 		}
-		if parentBlobChainID := layerParent.getBlobChainID(); parentBlobChainID != "" {
-			blobChainIDs = append(blobChainIDs, parentBlobChainID)
-		} else {
-			return errors.Errorf("failed to set blobchain for reference %q with non-addressable parent", cr.GetDescription())
-		}
-	}
-
-	switch cr.parentKind() {
-	case Diff, Layer, None:
 		diffID := digest.Digest(cr.getDiffID())
 		chainIDs = append(chainIDs, diffID)
 		blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.getBlob()), diffID}))
+	case Merge:
+		layerChain := cr.layerChain()
+		for i, layer := range layerChain {
+			if _, ok := neededLayers[layer.ID()]; !ok {
+				// TODO: ugly, needed because you can recurse to a merge input that isn't used i.e. Diff(Merge(a,b), c) where c's layerparent is Merge(a,b)
+				return nil
+			}
+			if layer.getChainID() != "" {
+				chainIDs = append(chainIDs, layer.getChainID())
+				blobChainIDs = append(blobChainIDs, layer.getBlobChainID())
+			} else {
+				return errors.Errorf("failed to set chain for merge reference with non-addressable parent %q", layer.GetDescription())
+			}
+			if i > 0 && i < len(layerChain)-1 {
+				chainIDs[0] = imagespecidentity.ChainID(chainIDs)
+				chainIDs = chainIDs[:1]
+				blobChainIDs[0] = imagespecidentity.ChainID(blobChainIDs)
+				blobChainIDs = blobChainIDs[:1]
+			}
+		}
+	case Diff:
+		// TODO: ugly
+		if cr.layerChain()[0].ID() == cr.ID() {
+			diffID := digest.Digest(cr.getDiffID())
+			chainIDs = append(chainIDs, diffID)
+			blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.getBlob()), diffID}))
+		} else {
+			diffID := digest.Digest(cr.diffParents.upper().getDiffID())
+			chainIDs = append(chainIDs, diffID)
+			blobChainIDs = append(blobChainIDs, imagespecidentity.ChainID([]digest.Digest{digest.Digest(cr.diffParents.upper().getBlob()), diffID}))
+		}
 	}
 
 	chainID := imagespecidentity.ChainID(chainIDs)

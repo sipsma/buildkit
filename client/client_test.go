@@ -3917,7 +3917,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 		File(llb.Mkfile("/bar/A", 0400, []byte("C")))
 
 	mergeA := llb.Merge([]llb.State{stateA, stateC})
-	requireContents(ctx, t, c, mergeA,
+	requireContents(ctx, t, c, mergeA, nil,
 		fstest.CreateFile("foo", []byte("C"), 0775),
 		fstest.CreateFile("c", []byte("C"), 0777),
 		fstest.CreateDir("bar", 0777),
@@ -3926,7 +3926,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 	)
 
 	mergeB := llb.Merge([]llb.State{stateC, stateB})
-	requireContents(ctx, t, c, mergeB,
+	requireContents(ctx, t, c, mergeB, nil,
 		fstest.CreateFile("a", []byte("A"), 0777),
 		fstest.CreateFile("b", []byte("B"), 0777),
 		fstest.CreateFile("c", []byte("C"), 0777),
@@ -3937,7 +3937,7 @@ func testMergeOp(t *testing.T, sb integration.Sandbox) {
 
 	stateD := llb.Scratch().File(llb.Mkdir("/qaz", 0755))
 	mergeC := llb.Merge([]llb.State{mergeA, mergeB, stateD})
-	requireContents(ctx, t, c, mergeC,
+	requireContents(ctx, t, c, mergeC, nil,
 		fstest.CreateFile("a", []byte("A"), 0777),
 		fstest.CreateFile("b", []byte("B"), 0777),
 		fstest.CreateFile("c", []byte("C"), 0777),
@@ -4242,7 +4242,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox) {
 	require.Equalf(t, bar2Contents, newBar2Contents, "bar/2 contents changed")
 }
 
-func requireContents(ctx context.Context, t *testing.T, c *Client, state llb.State, files ...fstest.Applier) {
+func requireContents(ctx context.Context, t *testing.T, c *Client, state llb.State, cacheImports []CacheOptionsEntry, files ...fstest.Applier) {
 	t.Helper()
 
 	def, err := state.Marshal(ctx)
@@ -4259,6 +4259,7 @@ func requireContents(ctx context.Context, t *testing.T, c *Client, state llb.Sta
 				OutputDir: destDir,
 			},
 		},
+		CacheImports: cacheImports,
 	}, nil)
 	require.NoError(t, err)
 
@@ -4305,8 +4306,12 @@ func requireEqualContents(ctx context.Context, t *testing.T, c *Client, stateA, 
 	require.NoError(t, fstest.CheckDirectoryEqual(destDirA, destDirB))
 }
 
+func runShellExecState(base llb.State, cmds ...string) llb.ExecState {
+	return base.Run(llb.Args([]string{"sh", "-c", strings.Join(cmds, " && ")}))
+}
+
 func runShell(base llb.State, cmds ...string) llb.State {
-	return base.Run(llb.Args([]string{"sh", "-c", strings.Join(cmds, " && ")})).Root()
+	return runShellExecState(base, cmds...).Root()
 }
 
 func chainRunShells(base llb.State, cmdss ...[]string) llb.State {

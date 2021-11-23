@@ -160,7 +160,51 @@ func walkingDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, change
 		}
 	}()
 
+	// Add any parent directories that haven't been visited, even when they aren't modified according to
+	// the double-walking differ. This is important because it matches the behavior of containerd's archive
+	// diff writer, which we want to be consistent with in order to ensure that merge+diff refs are equivalent.
+	// before and after exporting/importing.
+	//
+	// Examples of cases where this makes a difference include when the diff is being made to a file /foo/bar
+	// but in the destination being applied to /foo is a symlink, not a directory. In this case, if we don't
+	// include a change for /foo, it will remain a symlink and be followed when being applied to.
 	visited := make(map[string]struct{})
+	var checkParent func(string) error
+	checkParent = func(subpath string) error {
+		if subpath == "/" {
+			return nil
+		}
+		if err := checkParent(filepath.Dir(subpath)); err != nil {
+			return err
+		}
+		srcpath, err := safeJoin(upper, subpath)
+		if err != nil {
+			return err
+		}
+		if _, ok := visited[srcpath]; ok {
+			return nil
+		}
+		visited[srcpath] = struct{}{}
+		srcfi, err := os.Lstat(srcpath)
+		if err != nil {
+			return err
+		}
+		srcStat, ok := srcfi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return errors.Errorf("unexpected type %T", srcfi)
+		}
+		select {
+		case changes <- &change{
+			kind:    fs.ChangeKindModify,
+			subpath: subpath,
+			srcpath: srcpath,
+			srcStat: srcStat,
+		}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
 	return cleanup, fs.Changes(ctx, lower, upper, func(kind fs.ChangeKind, changePath string, srcfi os.FileInfo, prevErr error) error {
 		if prevErr != nil {
@@ -168,6 +212,10 @@ func walkingDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, change
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		if kind == fs.ChangeKindUnmodified {
+			return nil
 		}
 
 		srcpath, err := safeJoin(upper, changePath)
@@ -181,50 +229,10 @@ func walkingDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, change
 			srcpath: srcpath,
 		}
 
-		// Add any parent directories that haven't been visited, even when they aren't modified according to
-		// the double-walking differ. This is important because it matches the behavior of containerd's archive
-		// diff writer, which we want to be consistent with in order to ensure that merge+diff refs are equivalent.
-		// before and after exporting/importing.
-		//
-		// Examples of cases where this makes a difference include when the diff is being made to a file /foo/bar
-		// but in the destination being applied to /foo is a symlink, not a directory. In this case, if we don't
-		// include a change for /foo, it will remain a symlink and be followed when being applied to.
-		var checkParent func(string) error
-		checkParent = func(subpath string) error {
-			if subpath == "/" {
-				return nil
-			}
-			if err := checkParent(filepath.Dir(subpath)); err != nil {
-				return err
-			}
-			srcpath, err := safeJoin(upper, subpath)
-			if err != nil {
-				return err
-			}
-			if _, ok := visited[srcpath]; ok {
-				return nil
-			}
-			visited[srcpath] = struct{}{}
-			srcfi, err := os.Lstat(srcpath)
-			if err != nil {
-				return err
-			}
-			srcStat, ok := srcfi.Sys().(*syscall.Stat_t)
-			if !ok {
-				return errors.Errorf("unexpected type %T", srcfi)
-			}
-			select {
-			case changes <- &change{
-				kind:    fs.ChangeKindModify,
-				subpath: subpath,
-				srcpath: srcpath,
-				srcStat: srcStat,
-			}:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
+		// TODO: dedupe this comment somehow
+		// NOTE: it's tempting to skip creating parent dirs when change kind is Delete, but
+		// that would make us incompatible with the image exporter code:
+		// https://github.com/containerd/containerd/pull/2095
 		if err := checkParent(filepath.Dir(c.subpath)); err != nil {
 			return err
 		}
@@ -315,6 +323,10 @@ func overlayDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, upperd
 			return ctx.Err()
 		}
 
+		if kind == fs.ChangeKindUnmodified {
+			return nil
+		}
+
 		srcpath, err := safeJoin(upperdir, changePath)
 		if err != nil {
 			return err
@@ -335,7 +347,7 @@ func overlayDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, upperd
 			if err := checkParent(filepath.Dir(subpath)); err != nil {
 				return err
 			}
-			srcpath, err := safeJoin(upper, subpath)
+			srcpath, err := safeJoin(upperdir, subpath)
 			if err != nil {
 				return err
 			}
@@ -363,9 +375,13 @@ func overlayDiff(ctx context.Context, lowerMnts, upperMnts []mount.Mount, upperd
 				return ctx.Err()
 			}
 		}
+		// NOTE: it's tempting to skip creating parent dirs when change kind is Delete, but
+		// that would make us incompatible with the image exporter code:
+		// https://github.com/containerd/containerd/pull/2095
 		if err := checkParent(filepath.Dir(c.subpath)); err != nil {
 			return err
 		}
+		// TODO: make sure visited is getting set right in both the case where the overlay differ is returning upperdir paths and when it uses double-walking diff
 		visited[c.srcpath] = struct{}{}
 
 		if srcfi != nil {
@@ -398,7 +414,6 @@ func applyChanges(ctx context.Context, dest Mountable, changes <-chan *change) (
 	mnt := mnts[0]
 
 	app := &applier{
-		visited:           make(map[string]struct{}),
 		inodes:            make(map[uint64]string),
 		externalHardlinks: make(map[uint64]struct{}),
 		times:             make(map[string]*pathTime),
@@ -414,8 +429,8 @@ func applyChanges(ctx context.Context, dest Mountable, changes <-chan *change) (
 		if app.root == "" {
 			return nil, errors.Errorf("could not find upperdir in mount options %v", mnt.Options)
 		}
-		app.whiteoutDeletes = true
 		app.tryHardlink = true
+		app.deletes = make(map[string]struct{})
 	case "bind", "rbind":
 		app.root = mnt.Source
 		app.tryHardlink = true
@@ -441,8 +456,6 @@ func applyChanges(ctx context.Context, dest Mountable, changes <-chan *change) (
 			continue
 		}
 
-		app.visited[c.srcpath] = struct{}{}
-
 		dstpath, err := safeJoin(app.root, c.subpath)
 		if err != nil {
 			return nil, err
@@ -456,28 +469,48 @@ func applyChanges(ctx context.Context, dest Mountable, changes <-chan *change) (
 		// TODO:
 		bklog.G(ctx).Debugf("applyChanges: %q %q %q", c.kind, c.srcpath, dstpath)
 
-		tryHardlink := app.tryHardlink
 		if c.kind == fs.ChangeKindDelete {
-			if app.whiteoutDeletes {
-				c.kind = fs.ChangeKindModify
-				if c.srcStat == nil {
-					// we don't have a whiteout to link from, we will have to mknod one
-					tryHardlink = false
-					c.srcStat = &syscall.Stat_t{
-						Mode: syscall.S_IFCHR,
-						Rdev: unix.Mkdev(0, 0),
-						// TODO: do we care about times?
-					}
-				}
-			} else {
-				if err := os.RemoveAll(dstpath); err != nil {
-					return nil, errors.Wrap(err, "failed to remove during apply")
-				}
-				continue
+			if app.deletes != nil {
+				app.deletes[c.subpath] = struct{}{}
 			}
+			if err := os.RemoveAll(dstpath); err != nil {
+				return nil, errors.Wrap(err, "failed to remove during apply")
+			}
+			continue
+		}
+		if app.deletes != nil {
+			delete(app.deletes, c.subpath)
 		}
 
-		if err := app.addOrModify(ctx, c.subpath, c.srcpath, c.srcStat, dstpath, tryHardlink); err != nil {
+		if err := app.addOrModify(ctx, c.subpath, c.srcpath, c.srcStat, dstpath); err != nil {
+			return nil, err
+		}
+	}
+
+	// If we have been tracking deletes, apply them to the actual mount now. This is
+	// needed in the overlay case to correctly create whiteouts only when they actually
+	// apply to any files across the whole mount and, in that case, with parent dirs
+	// that have the right metadata set.
+	// TODO: this relies on the fact that we don't already have a mount in the overlay case, bit delicate
+	if app.deletes != nil {
+		if err := func() error {
+			mounter := LocalMounter(dest)
+			mntRoot, err := mounter.Mount()
+			if err != nil {
+				return err
+			}
+			defer mounter.Unmount()
+			for subpath := range app.deletes {
+				deletePath, err := safeJoin(mntRoot, subpath)
+				if err != nil {
+					return err
+				}
+				if err := os.RemoveAll(deletePath); err != nil {
+					return errors.Wrap(err, "failed to remove during apply")
+				}
+			}
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}
@@ -504,11 +537,10 @@ func applyChanges(ctx context.Context, dest Mountable, changes <-chan *change) (
 type applier struct {
 	root              string
 	tryHardlink       bool
-	whiteoutDeletes   bool
-	visited           map[string]struct{}
 	inodes            map[uint64]string
 	externalHardlinks map[uint64]struct{}
 	times             map[string]*pathTime
+	deletes           map[string]struct{}
 }
 
 type pathTime struct {
@@ -526,7 +558,7 @@ func (pt *pathTime) apply() error {
 }
 
 // TODO: better name?
-func (app *applier) addOrModify(ctx context.Context, subpath string, srcpath string, srcStat *syscall.Stat_t, dstpath string, tryHardlink bool) error {
+func (app *applier) addOrModify(ctx context.Context, subpath string, srcpath string, srcStat *syscall.Stat_t, dstpath string) error {
 	// if there is an existing file/dir at the dstpath, delete it unless both it and srcpath are dirs (in which case they get merged)
 	var dstStat *syscall.Stat_t
 	if dstfi, err := os.Lstat(dstpath); err == nil {
@@ -545,7 +577,7 @@ func (app *applier) addOrModify(ctx context.Context, subpath string, srcpath str
 		dstStat = nil
 	}
 
-	if tryHardlink {
+	if app.tryHardlink {
 		if itWorked, err := app.hardlinkFile(ctx, srcpath, srcStat, dstpath); err != nil {
 			return err
 		} else if itWorked {
@@ -628,9 +660,7 @@ func (app *applier) copyFile(ctx context.Context, srcpath string, srcStat *sysca
 	}
 
 	xattrs, err := sysx.LListxattr(srcpath)
-	// ENOENT can be hit when srcpath doesn't exist, such as when we are creating a new whiteout device
-	// to represent a delete on overlay.
-	if err != nil && !errors.Is(err, unix.ENOENT) {
+	if err != nil {
 		return errors.Wrapf(err, "failed to list xattrs of src path %s", srcpath)
 	}
 	for _, xattr := range xattrs {

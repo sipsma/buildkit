@@ -1,17 +1,20 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/testutil/integration"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +70,16 @@ func apply(appliers ...fstest.Applier) contents {
 	}
 }
 
+func mergeContents(subContents ...contents) contents {
+	return func(sb integration.Sandbox) fstest.Applier {
+		var appliers []fstest.Applier
+		for _, sub := range subContents {
+			appliers = append(appliers, sub(sb))
+		}
+		return fstest.Apply(appliers...)
+	}
+}
+
 func empty(sb integration.Sandbox) fstest.Applier {
 	return applyFn(func(root string) error {
 		return nil
@@ -85,25 +98,49 @@ func (tc verifyContents) Name() string {
 
 func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 	requiresLinux(t)
+	cdAddress := sb.ContainerdAddress()
 
 	ctx := sb.Context()
+	ctdCtx := namespaces.WithNamespace(ctx, "buildkit")
 
 	c, err := New(ctx, sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	requireContents(ctx, t, c, tc.state, tc.contents(sb))
-
-	// export as an image, reimport and verify the image contents also match
 	registry, err := sb.NewRegistry()
 	if errors.Is(err, integration.ErrorRequirements) {
 		t.Skip(err.Error())
 	}
 	require.NoError(t, err)
 
+	resetState := func() {
+		if cdAddress != "" {
+			client, err := newContainerd(cdAddress)
+			require.NoError(t, err)
+			defer client.Close()
+			imageService := client.ImageService()
+			imageList, err := imageService.List(ctdCtx)
+			require.NoError(t, err)
+			for _, img := range imageList {
+				err = imageService.Delete(ctdCtx, img.Name, images.SynchronousDelete())
+				require.NoError(t, err)
+			}
+		}
+		checkAllReleasable(t, c, sb, true)
+	}
+
+	// verify the build has the expected contents
+	resetState()
+	requireContents(ctx, t, c, tc.state, nil, tc.contents(sb))
+
+	// export as an image, verify it reimports the same
 	def, err := tc.state.Marshal(sb.Context())
 	require.NoError(t, err)
-	imageTarget := fmt.Sprintf("%s/buildkit/%s:latest", registry, strings.ToLower(tc.name))
+
+	imageName := fmt.Sprintf("buildkit/%s", strings.ToLower(tc.name))
+	imageTarget := fmt.Sprintf("%s/%s:latest", registry, imageName)
+	cacheName := fmt.Sprintf("buildkit/%s-cache", imageName)
+	cacheTarget := fmt.Sprintf("%s/%s:latest", registry, cacheName)
 	_, err = c.Solve(sb.Context(), def, SolveOpt{
 		Exports: []ExportEntry{
 			{
@@ -114,44 +151,80 @@ func (tc verifyContents) Run(t *testing.T, sb integration.Sandbox) {
 				},
 			},
 		},
+		CacheExports: []CacheOptionsEntry{{
+			Type: "registry",
+			Attrs: map[string]string{
+				"ref": cacheTarget,
+			},
+		}},
 	}, nil)
 	require.NoError(t, err)
 
-	// clear out all local state
-	cdAddress := sb.ContainerdAddress()
+	resetState()
+	requireContents(ctx, t, c, llb.Image(imageTarget), nil, tc.contents(sb))
+
+	// Check that the cache is actually used. This can only be asserted on
+	// in containerd-based tests because it needs access to the image+content store
 	if cdAddress != "" {
 		client, err := newContainerd(cdAddress)
 		require.NoError(t, err)
 		defer client.Close()
-		ctdCtx := namespaces.WithNamespace(ctx, "buildkit")
-		imageService := client.ImageService()
-		img, err := imageService.Get(ctdCtx, imageTarget)
-		require.NoError(t, err)
-		err = imageService.Delete(ctdCtx, img.Name, images.SynchronousDelete())
-		require.NoError(t, err)
-	}
-	checkAllReleasable(t, c, sb, true)
 
-	requireContents(ctx, t, c, llb.Image(imageTarget), tc.contents(sb))
+		resetState()
+		_, err = c.Solve(sb.Context(), def, SolveOpt{
+			Exports: []ExportEntry{
+				{
+					Type: ExporterImage,
+					Attrs: map[string]string{
+						"name": imageTarget,
+						"push": "true",
+					},
+				},
+			},
+			CacheImports: []CacheOptionsEntry{{
+				Type: "registry",
+				Attrs: map[string]string{
+					"ref": cacheTarget,
+				},
+			}},
+		}, nil)
+		require.NoError(t, err)
+
+		img, err := client.GetImage(ctdCtx, imageTarget)
+		require.NoError(t, err)
+
+		var unexpectedLayers []v1.Descriptor
+		require.NoError(t, images.Walk(ctdCtx, images.HandlerFunc(func(ctx context.Context, desc v1.Descriptor) ([]v1.Descriptor, error) {
+			if images.IsLayerType(desc.MediaType) {
+				_, err := client.ContentStore().Info(ctdCtx, desc.Digest)
+				if err == nil {
+					unexpectedLayers = append(unexpectedLayers, desc)
+				} else {
+					require.True(t, errdefs.IsNotFound(err))
+				}
+			}
+			return images.Children(ctx, client.ContentStore(), desc)
+		}), img.Target()))
+		require.Empty(t, unexpectedLayers)
+	}
+
+	// verify that builds using cache reimport the same contents
+	resetState()
+	requireContents(ctx, t, c, tc.state, []CacheOptionsEntry{{
+		Type: "registry",
+		Attrs: map[string]string{
+			"ref": cacheTarget,
+		},
+	}}, tc.contents(sb))
 }
 
 func diffOpTestCases() (tests []integration.Test) {
-	alpine := llb.Image("alpine:latest")
-	// busybox doesn't have /proc or /sys in the base image, add them
-	// so they don't show up as diffs after execs.
-	busybox := llb.Image("busybox:latest").
+	alpine := llb.Image("alpine:latest", llb.ResolveDigest(true))
+	// busybox doesn't have /proc or /sys in its base image, add them
+	// so they don't show up in every diff of an exec on it
+	busybox := llb.Image("busybox:latest", llb.ResolveDigest(true)).
 		File(llb.Mkdir("/proc", 0755)).
 		File(llb.Mkdir("/sys", 0755))
-
-	// Merges of diffs of lazy blobs should work.
-	// This also tests that Merge(A, Diff(A,B)) == B
-	tests = append(tests,
-		verifyContents{
-			name:     "TestDiffLazyBlobMerge",
-			state:    llb.Merge([]llb.State{busybox, llb.Diff(busybox, alpine)}),
-			contents: contentsOf(alpine),
-		},
-	)
 
 	// Diffs of identical states are empty
 	tests = append(tests,
@@ -183,14 +256,14 @@ func diffOpTestCases() (tests []integration.Test) {
 			name: "TestDiffLowerScratchDeletes",
 			state: llb.Merge([]llb.State{
 				llb.Scratch().
-					File(llb.Mkfile("/foo", 0777, nil)),
+					File(llb.Mkfile("/foo", 0777, []byte("A"))),
 				llb.Diff(llb.Scratch(), llb.Scratch().
-					File(llb.Mkfile("/foo", 0777, nil)).
+					File(llb.Mkfile("/foo", 0644, []byte("B"))).
 					File(llb.Rm("/foo")).
 					File(llb.Mkfile("/bar", 0644, nil))),
 			}),
 			contents: apply(
-				fstest.CreateFile("/foo", nil, 0777),
+				fstest.CreateFile("/foo", []byte("A"), 0777),
 				fstest.CreateFile("/bar", nil, 0644),
 			),
 		},
@@ -211,72 +284,575 @@ func diffOpTestCases() (tests []integration.Test) {
 		},
 	)
 
-	// Basic diff slices should work the same for single layer and multi-layer diffs
-	tests = append(tests, func() []integration.Test {
-		diffSingleLayer := llb.Diff(alpine, runShell(alpine,
-			"echo foo > /foo",
-			"rm -rf /var",
-		))
-		diffMultiLayer := llb.Diff(alpine, chainRunShells(alpine,
-			[]string{"echo foo > /foo"},
-			[]string{"rm -rf /var"},
-		))
+	// Basic diff slices
+	tests = append(tests, func() (tests []integration.Test) {
+		// TODO: local export resets uid/gid, so we can't test that here, make sure its in the unit tests at least
 
-		diffContents := apply(fstest.CreateFile("/foo", []byte("foo\n"), 0644))
-		rebaseContents := contentsOf(busybox.
-			File(llb.Mkfile("/foo", 0644, []byte("foo\n"))).
-			File(llb.Rm("/var")),
+		base := alpine.
+			File(llb.Mkfile("/shuffleFile1", 0644, []byte("shuffleFile1"))).
+			File(llb.Mkdir("/shuffleDir1", 0755)).
+			File(llb.Mkdir("/shuffleDir1/shuffleSubdir1", 0755)).
+			File(llb.Mkfile("/shuffleDir1/shuffleSubfile1", 0644, nil)).
+			File(llb.Mkfile("/shuffleDir1/shuffleSubdir1/shuffleSubfile2", 0644, nil)).
+			File(llb.Mkdir("/unmodifiedDir", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/chmodSubdir1", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/deleteSubdir1", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/opaqueDir1", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/opaqueDir1/opaqueSubdir1", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/overrideSubdir1", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/shuffleDir2", 0755)).
+			File(llb.Mkdir("/unmodifiedDir/shuffleDir2/shuffleSubdir2", 0755)).
+			File(llb.Mkfile("/unmodifiedDir/chmodFile1", 0644, []byte("chmodFile1"))).
+			File(llb.Mkfile("/unmodifiedDir/modifyContentFile1", 0644, []byte("modifyContentFile1"))).
+			File(llb.Mkfile("/unmodifiedDir/deleteFile1", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/opaqueDir1/opaqueFile1", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/opaqueDir1/opaqueSubdir1/opaqueFile2", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/overrideFile1", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/overrideFile2", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/shuffleFile2", 0644, []byte("shuffleFile2"))).
+			File(llb.Mkfile("/unmodifiedDir/shuffleDir2/shuffleSubfile3", 0644, nil)).
+			File(llb.Mkfile("/unmodifiedDir/shuffleDir2/shuffleSubdir2/shuffleSubfile4", 0644, nil)).
+			File(llb.Mkdir("/modifyDir", 0755)).
+			File(llb.Mkdir("/modifyDir/chmodSubdir2", 0755)).
+			File(llb.Mkdir("/modifyDir/deleteSubdir2", 0755)).
+			File(llb.Mkdir("/modifyDir/opaqueDir2", 0755)).
+			File(llb.Mkdir("/modifyDir/opaqueDir2/opaqueSubdir2", 0755)).
+			File(llb.Mkdir("/modifyDir/overrideSubdir2", 0755)).
+			File(llb.Mkdir("/modifyDir/shuffleDir3", 0755)).
+			File(llb.Mkdir("/modifyDir/shuffleDir3/shuffleSubdir3", 0755)).
+			File(llb.Mkfile("/modifyDir/chmodFile2", 0644, []byte("chmodFile2"))).
+			File(llb.Mkfile("/modifyDir/modifyContentFile2", 0644, []byte("modifyContentFile2"))).
+			File(llb.Mkfile("/modifyDir/deleteFile2", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/opaqueDir2/opaqueFile3", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/opaqueDir2/opaqueSubdir2/opaqueFile4", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/overrideFile3", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/overrideFile4", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/shuffleFile3", 0644, []byte("shuffleFile3"))).
+			File(llb.Mkfile("/modifyDir/shuffleDir3/shuffleSubfile4", 0644, nil)).
+			File(llb.Mkfile("/modifyDir/shuffleDir3/shuffleSubdir3/shuffleSubfile6", 0644, nil))
+
+		joinCmds := func(cmds ...[]string) []string {
+			var all []string
+			for _, cmd := range cmds {
+				all = append(all, cmd...)
+			}
+			return all
+		}
+
+		var allCmds []string
+		var allContents []contents
+
+		baseDiffCmds := []string{
+			"chmod 0700 /modifyDir",
+		}
+		baseDiffContents := apply(
+			fstest.CreateDir("/unmodifiedDir", 0755),
+			fstest.CreateDir("/modifyDir", 0700),
 		)
+		allCmds = append(allCmds, baseDiffCmds...)
+		allContents = append(allContents, baseDiffContents)
 
-		return []integration.Test{
-			verifyContents{
-				name:     "TestDiffSliceSingleLayer",
-				state:    diffSingleLayer,
-				contents: diffContents,
-			},
-			verifyContents{
-				name:     "TestDiffSliceSingleLayerDeletes",
-				state:    llb.Merge([]llb.State{busybox, diffSingleLayer}),
-				contents: rebaseContents,
-			},
-			verifyContents{
-				name:     "TestDiffSliceMultiLayer",
-				state:    diffMultiLayer,
-				contents: diffContents,
-			},
-			verifyContents{
-				name:     "TestDiffSliceSingleLayerDeletes",
-				state:    llb.Merge([]llb.State{busybox, diffMultiLayer}),
-				contents: rebaseContents,
-			},
+		newFileCmds := []string{
+			// Create a new file under a new dir
+			"mkdir /newdir1",
+			"touch /newdir1/newfile1",
+			// Create a new file under an unmodified existing dir
+			"touch /unmodifiedDir/newfile2",
+			// Create a new file under a modified existing dir
+			"touch /modifyDir/newfile3",
 		}
+		newFileContents := apply(
+			fstest.CreateDir("/newdir1", 0755),
+			fstest.CreateFile("/newdir1/newfile1", nil, 0644),
+			fstest.CreateFile("/unmodifiedDir/newfile2", nil, 0644),
+			fstest.CreateFile("/modifyDir/newfile3", nil, 0644),
+		)
+		allCmds = append(allCmds, newFileCmds...)
+		allContents = append(allContents, newFileContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffNewFiles",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				newFileCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				newFileContents,
+			),
+		})
+
+		modifyFileCmds := []string{
+			// Modify an existing file under an unmodified existing dir
+			"chmod 0444 /unmodifiedDir/chmodFile1",
+			"echo -n modifyContentFile0 > /unmodifiedDir/modifyContentFile1",
+
+			// Modify an existing file under a modified existing dir
+			"chmod 0440 /modifyDir/chmodFile2",
+			"echo -n modifyContentFile0 > /modifyDir/modifyContentFile2",
+		}
+		modifyFileContents := apply(
+			fstest.CreateFile("/unmodifiedDir/chmodFile1", []byte("chmodFile1"), 0444),
+			fstest.CreateFile("/unmodifiedDir/modifyContentFile1", []byte("modifyContentFile0"), 0644),
+
+			fstest.CreateFile("/modifyDir/chmodFile2", []byte("chmodFile2"), 0440),
+			fstest.CreateFile("/modifyDir/modifyContentFile2", []byte("modifyContentFile0"), 0644),
+		)
+		allCmds = append(allCmds, modifyFileCmds...)
+		allContents = append(allContents, modifyFileContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffModifiedFiles",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				modifyFileCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				modifyFileContents,
+			),
+		})
+
+		createNewDirCmds := []string{
+			// Create a new dir under a new dir
+			"mkdir -p /newdir2/newsubdir1",
+
+			// Create a new dir under an unmodified existing dir
+			"mkdir /unmodifiedDir/newsubdir2",
+
+			// Create a new dir under a modified existing dir
+			"mkdir /modifyDir/newsubdir3",
+		}
+		createNewDirContents := apply(
+			fstest.CreateDir("/newdir2", 0755),
+			fstest.CreateDir("/newdir2/newsubdir1", 0755),
+			fstest.CreateDir("/unmodifiedDir/newsubdir2", 0755),
+			fstest.CreateDir("/modifyDir/newsubdir3", 0755),
+		)
+		allCmds = append(allCmds, createNewDirCmds...)
+		allContents = append(allContents, createNewDirContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffNewDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				createNewDirCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				createNewDirContents,
+			),
+		})
+
+		modifyDirCmds := []string{
+			// Modify a dir under an unmodified existing dir
+			"chmod 0700 /unmodifiedDir/chmodSubdir1",
+
+			// Modify a dir under an modified existing dir
+			"chmod 0770 /modifyDir/chmodSubdir2",
+		}
+		modifyDirContents := apply(
+			fstest.CreateDir("/unmodifiedDir/chmodSubdir1", 0700),
+			fstest.CreateDir("/modifyDir/chmodSubdir2", 0770),
+		)
+		allCmds = append(allCmds, modifyDirCmds...)
+		allContents = append(allContents, modifyDirContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffModifiedDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				modifyDirCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				modifyDirContents,
+			),
+		})
+
+		overrideDirCmds := []string{
+			"rm -rf /unmodifiedDir/overrideSubdir1",
+			"echo -n overrideSubdir1 > /unmodifiedDir/overrideSubdir1",
+
+			"rm -rf /modifyDir/overrideSubdir2",
+			"echo -n overrideSubdir2 > /modifyDir/overrideSubdir2",
+		}
+		overrideDirContents := apply(
+			fstest.CreateFile("/unmodifiedDir/overrideSubdir1", []byte("overrideSubdir1"), 0644),
+			fstest.CreateFile("/modifyDir/overrideSubdir2", []byte("overrideSubdir2"), 0644),
+		)
+		allCmds = append(allCmds, overrideDirCmds...)
+		allContents = append(allContents, overrideDirContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffOverrideDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				overrideDirCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				overrideDirContents,
+			),
+		})
+
+		overrideFileCmds := []string{
+			"rm /unmodifiedDir/overrideFile1",
+			"mkdir -m 0700 /unmodifiedDir/overrideFile1",
+			"rm /unmodifiedDir/overrideFile2",
+			"mkdir -m 0750 /unmodifiedDir/overrideFile2",
+			"mkdir -m 0770 /unmodifiedDir/overrideFile2/newsubdir4",
+			"touch /unmodifiedDir/overrideFile2/newfile4",
+			"touch /unmodifiedDir/overrideFile2/newsubdir4/newfile5",
+
+			"rm /modifyDir/overrideFile3",
+			"mkdir -m 0700 /modifyDir/overrideFile3",
+			"rm /modifyDir/overrideFile4",
+			"mkdir -m 0750 /modifyDir/overrideFile4",
+			"mkdir -m 0770 /modifyDir/overrideFile4/newsubdir5",
+			"touch /modifyDir/overrideFile4/newfile6",
+			"touch /modifyDir/overrideFile4/newsubdir5/newfile7",
+		}
+		overrideFileContents := apply(
+			fstest.CreateDir("/unmodifiedDir/overrideFile1", 0700),
+			fstest.CreateDir("/unmodifiedDir/overrideFile2", 0750),
+			fstest.CreateDir("/unmodifiedDir/overrideFile2/newsubdir4", 0770),
+			fstest.CreateFile("/unmodifiedDir/overrideFile2/newfile4", nil, 0644),
+			fstest.CreateFile("/unmodifiedDir/overrideFile2/newsubdir4/newfile5", nil, 0644),
+
+			fstest.CreateDir("/modifyDir/overrideFile3", 0700),
+			fstest.CreateDir("/modifyDir/overrideFile4", 0750),
+			fstest.CreateDir("/modifyDir/overrideFile4/newsubdir5", 0770),
+			fstest.CreateFile("/modifyDir/overrideFile4/newfile6", nil, 0644),
+			fstest.CreateFile("/modifyDir/overrideFile4/newsubdir5/newfile7", nil, 0644),
+		)
+		allCmds = append(allCmds, overrideFileCmds...)
+		allContents = append(allContents, overrideFileContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffOverrideFiles",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				overrideFileCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				overrideFileContents,
+			),
+		})
+
+		// TODO: incorporate this comment into below
+		// Surprisingly, it's expected that /bin shows up in the diff
+		// even though the only change was that /bin/cat was removed.
+		// This is the behavior of the exporter, so we have to enforce
+		// consistency with it.
+		// https://github.com/containerd/containerd/pull/2095
+
+		deleteFileCmds := []string{
+			"rm /unmodifiedDir/deleteFile1",
+			"rm /modifyDir/deleteFile2",
+		}
+		allCmds = append(allCmds, deleteFileCmds...)
+		tests = append(tests, verifyContents{
+			name: "TestDiffDeleteFiles",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				deleteFileCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+			),
+		})
+		tests = append(tests, verifyContents{
+			name: "TestDiffDeleteFilesMerge",
+			state: llb.Merge([]llb.State{
+				base,
+				llb.Diff(base, runShell(base, joinCmds(
+					baseDiffCmds,
+					deleteFileCmds,
+				)...)),
+			}),
+			contents: mergeContents(
+				contentsOf(base),
+				baseDiffContents,
+				apply(
+					fstest.Remove("/unmodifiedDir/deleteFile1"),
+					fstest.Remove("/modifyDir/deleteFile2"),
+				),
+			),
+		})
+
+		deleteDirCmds := []string{
+			"rm -rf /unmodifiedDir/deleteSubdir1",
+			"rm -rf /modifyDir/deleteSubdir2",
+		}
+		allCmds = append(allCmds, deleteDirCmds...)
+		tests = append(tests, verifyContents{
+			name: "TestDiffDeleteDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				deleteDirCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+			),
+		})
+		tests = append(tests, verifyContents{
+			name: "TestDiffDeleteDirsMerge",
+			state: llb.Merge([]llb.State{
+				base,
+				llb.Diff(base, runShell(base, joinCmds(
+					baseDiffCmds,
+					deleteDirCmds,
+				)...)),
+			}),
+			contents: mergeContents(
+				contentsOf(base),
+				baseDiffContents,
+				apply(
+					fstest.RemoveAll("/unmodifiedDir/deleteSubdir1"),
+					fstest.RemoveAll("/modifyDir/deleteSubdir2"),
+				),
+			),
+		})
+
+		// TODO: can you trick the archive unpacked into creating a whiteout under a subdir where it doesn't apply
+		// and the subdir only exists because of that whiteout? If so, that's a bug in the archiver.
+
+		// Opaque dirs should be converted to the "explicit whiteout" format, as described in the OCI image spec:
+		// https://github.com/opencontainers/image-spec/blob/main/layer.md#opaque-whiteout
+		// TODO: verify that hardlinks are used when switching to double-walking? Ideally assert in test case, but at min verify it.
+		opaqueDirCmds := []string{
+			"rm -rf /unmodifiedDir/opaqueDir1",
+			"mkdir -p /unmodifiedDir/opaqueDir1/newOpaqueSubdir1",
+			"touch /unmodifiedDir/opaqueDir1/newOpaqueFile1",
+			"touch /unmodifiedDir/opaqueDir1/newOpaqueSubdir1/newOpaqueFile2",
+
+			"rm -rf /modifyDir/opaqueDir2",
+			"mkdir -p /modifyDir/opaqueDir2/newOpaqueSubdir2",
+			"touch /modifyDir/opaqueDir2/newOpaqueFile3",
+			"touch /modifyDir/opaqueDir2/newOpaqueSubdir2/newOpaqueFile4",
+		}
+		opaqueDirContents := apply(
+			fstest.CreateDir("/unmodifiedDir/opaqueDir1", 0755),
+			fstest.CreateDir("/unmodifiedDir/opaqueDir1/newOpaqueSubdir1", 0755),
+			fstest.CreateFile("/unmodifiedDir/opaqueDir1/newOpaqueFile1", nil, 0644),
+			fstest.CreateFile("/unmodifiedDir/opaqueDir1/newOpaqueSubdir1/newOpaqueFile2", nil, 0644),
+
+			fstest.CreateDir("/modifyDir/opaqueDir2", 0755),
+			fstest.CreateDir("/modifyDir/opaqueDir2/newOpaqueSubdir2", 0755),
+			fstest.CreateFile("/modifyDir/opaqueDir2/newOpaqueFile3", nil, 0644),
+			fstest.CreateFile("/modifyDir/opaqueDir2/newOpaqueSubdir2/newOpaqueFile4", nil, 0644),
+		)
+		allCmds = append(allCmds, opaqueDirCmds...)
+		allContents = append(allContents, opaqueDirContents)
+		tests = append(tests, verifyContents{
+			name: "TestDiffOpaqueDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				opaqueDirCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				opaqueDirContents,
+			),
+		})
+		tests = append(tests, verifyContents{
+			name: "TestDiffOpaqueDirsMerge",
+			state: llb.Merge([]llb.State{
+				base.
+					File(llb.Mkfile("/unmodifiedDir/opaqueDir1/rebaseFile1", 0644, nil)).
+					File(llb.Mkfile("/unmodifiedDir/opaqueDir1/opaqueSubdir1/rebaseFile2", 0644, nil)).
+					File(llb.Mkfile("/modifyDir/opaqueDir2/rebaseFile3", 0644, nil)).
+					File(llb.Mkfile("/modifyDir/opaqueDir2/opaqueSubdir2/rebaseFile4", 0644, nil)),
+				llb.Diff(base, runShell(base, joinCmds(
+					baseDiffCmds,
+					opaqueDirCmds,
+				)...)),
+			}),
+			contents: mergeContents(
+				contentsOf(base),
+				baseDiffContents,
+				apply(
+					fstest.RemoveAll("/unmodifiedDir/opaqueDir1"),
+					fstest.RemoveAll("/modifyDir/opaqueDir2"),
+				),
+				opaqueDirContents,
+				apply(
+					fstest.CreateFile("/unmodifiedDir/opaqueDir1/rebaseFile1", nil, 0644),
+					fstest.CreateFile("/modifyDir/opaqueDir2/rebaseFile3", nil, 0644),
+				),
+			),
+		})
+
+		// TODO: comment about shuffle tests
+
+		shuffleFileCmds := []string{
+			// Shuffle a file under root
+			"mv /shuffleFile1 /shuffleFile1tmp",
+			"mv /shuffleFile1tmp /shuffleFile1",
+
+			// Shuffle a file under an unmodified existing dir
+			"mv /unmodifiedDir/shuffleFile2 /unmodifiedDir/shuffleFile2tmp",
+			"mv /unmodifiedDir/shuffleFile2tmp /unmodifiedDir/shuffleFile2",
+
+			// Shuffle a file under a modified existing dir
+			"mv /modifyDir/shuffleFile3 /modifyDir/shuffleFile3tmp",
+			"mv /modifyDir/shuffleFile3tmp /modifyDir/shuffleFile3",
+		}
+		allCmds = append(allCmds, shuffleFileCmds...)
+		tests = append(tests, verifyContents{
+			name: "TestDiffShuffleFiles",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				shuffleFileCmds,
+			)...)),
+			contents: mergeContents(
+				baseDiffContents,
+				apply(fstest.RemoveAll("/unmodifiedDir")),
+			),
+		})
+		tests = append(tests, verifyContents{
+			name: "TestDiffShuffleFilesMerge",
+			state: llb.Merge([]llb.State{
+				base,
+				llb.Diff(base, runShell(base, joinCmds(
+					baseDiffCmds,
+					shuffleFileCmds,
+				)...)),
+			}),
+			contents: mergeContents(
+				contentsOf(base),
+				baseDiffContents,
+			),
+		})
+
+		shuffleDirCmds := []string{
+			// Shuffle a dir under root
+			"mv /shuffleDir1 /shuffleDir1tmp",
+			"mv /shuffleDir1tmp /shuffleDir1",
+
+			// Shuffle a dir under an unmodified existing dir
+			"mv /unmodifiedDir/shuffleDir2 /unmodifiedDir/shuffleDir2tmp",
+			"mv /unmodifiedDir/shuffleDir2tmp /unmodifiedDir/shuffleDir2",
+
+			// Shuffle a dir under a modified existing dir
+			"mv /modifyDir/shuffleDir3 /modifyDir/shuffleDir3tmp",
+			"mv /modifyDir/shuffleDir3tmp /modifyDir/shuffleDir3",
+		}
+		allCmds = append(allCmds, shuffleDirCmds...)
+		tests = append(tests, verifyContents{
+			name: "TestDiffShuffleDirs",
+			state: llb.Diff(base, runShell(base, joinCmds(
+				baseDiffCmds,
+				shuffleDirCmds,
+			)...)),
+			contents: baseDiffContents,
+		})
+		tests = append(tests, verifyContents{
+			name: "TestDiffShuffleDirsMerge",
+			state: llb.Merge([]llb.State{
+				base,
+				llb.Diff(base, runShell(base, joinCmds(
+					baseDiffCmds,
+					shuffleDirCmds,
+				)...)),
+			}),
+			contents: mergeContents(
+				contentsOf(base),
+				baseDiffContents,
+			),
+		})
+
+		tests = append(tests, verifyContents{
+			name:     "TestDiffCombinedSingleLayer",
+			state:    llb.Diff(base, runShell(base, allCmds...)),
+			contents: mergeContents(allContents...),
+		})
+
+		var allCmdsMultiLayer [][]string
+		for _, cmds := range allCmds {
+			allCmdsMultiLayer = append(allCmdsMultiLayer, []string{cmds})
+		}
+		tests = append(tests, verifyContents{
+			name:     "TestDiffCombinedMultiLayer",
+			state:    llb.Diff(base, chainRunShells(base, allCmdsMultiLayer...)),
+			contents: mergeContents(allContents...),
+		})
+		return tests
+
+		/*
+			diffSingleLayer := llb.Diff(base, runShell(base))
+
+			diffMultiLayer := llb.Diff(alpine, chainRunShells(alpine,
+				[]string{"echo foo > /foo"},
+				[]string{"rm -rf /var /bin/cat"},
+				[]string{"mv /etc/motd /etc/motdtmp"},
+				[]string{"mv /etc/motdtmp /etc/motd"},
+			))
+
+			diffContents := apply(
+				fstest.CreateFile("/foo", []byte("foo\n"), 0644),
+				fstest.CreateDir("/bin", 0755),
+			)
+			rebaseContents := contentsOf(busybox.
+				File(llb.Mkfile("/foo", 0644, []byte("foo\n"))).
+				File(llb.Rm("/var")).
+				File(llb.Rm("/bin/cat")),
+			)
+
+			return []integration.Test{
+				verifyContents{
+					name:     "TestDiffSliceSingleLayer",
+					state:    diffSingleLayer,
+					contents: diffContents,
+				},
+				verifyContents{
+					name:     "TestDiffSliceSingleLayerDeletes",
+					state:    llb.Merge([]llb.State{busybox, diffSingleLayer}),
+					contents: rebaseContents,
+				},
+				verifyContents{
+					name:     "TestDiffSliceMultiLayer",
+					state:    diffMultiLayer,
+					contents: diffContents,
+				},
+				verifyContents{
+					name:     "TestDiffSliceSingleLayerDeletes",
+					state:    llb.Merge([]llb.State{busybox, diffMultiLayer}),
+					contents: rebaseContents,
+				},
+			}
+		*/
 	}()...)
 
-	// Shuffling files back and forth should result in no diff (this requires special
-	// handling in the overlay differ, which can otherwise be tricked into thinking
-	// this is a diff because the file shows up in the upperdir)
 	tests = append(tests, func() []integration.Test {
-		diff := llb.Diff(alpine, runShell(alpine,
-			"mv /etc/motd /etc/foo",
-			"mv /etc/foo /etc/motd",
-		))
+		base := runShell(alpine,
+			"mkdir -p /parentdir/dir/subdir",
+			"touch /parentdir/dir/A /parentdir/dir/B /parentdir/dir/subdir/C",
+		)
 		return []integration.Test{
 			verifyContents{
-				name:     "TestDiffShuffle",
-				state:    diff,
-				contents: empty,
-			},
-			verifyContents{
-				name:     "TestDiffShuffleDeletes",
-				state:    llb.Merge([]llb.State{alpine, diff}),
-				contents: contentsOf(alpine),
+				name: "TestDiffOpaqueDirs",
+				state: llb.Merge([]llb.State{
+					runShell(busybox,
+						"mkdir -p /parentdir/dir/subdir",
+						"touch /parentdir/dir/A /parentdir/dir/B /parentdir/dir/D",
+					),
+					llb.Diff(base, runShell(base,
+						"rm -rf /parentdir/dir",
+						"mkdir /parentdir/dir",
+						"touch /parentdir/dir/E",
+					)),
+				}),
+				contents: contentsOf(runShell(busybox,
+					"mkdir -p /parentdir/dir",
+					"touch /parentdir/dir/D",
+					"touch /parentdir/dir/E",
+				)),
 			},
 		}
 	}()...)
 
-	// TODO: explain, symlink tests
+	// Symlink handling tests
+	// TODO: add a "shuffle symlink" test case
 	tests = append(tests, func() []integration.Test {
 		linkFooToBar := llb.Diff(alpine, runShell(alpine, "mkdir -p /bar", "ln -s /bar /foo"))
+
 		alpinePlusFoo := runShell(alpine, "mkdir /foo")
 		deleteFoo := llb.Diff(alpinePlusFoo, runShell(alpinePlusFoo, "rm -rf /foo"))
 		createFooFile := llb.Diff(alpinePlusFoo, runShell(alpinePlusFoo, "touch /foo/file"))
@@ -351,13 +927,310 @@ func diffOpTestCases() (tests []integration.Test) {
 				contents: contentsOf(runShell(busybox,
 					"mkdir /bar",
 					"touch /bar/file",
-					"mkdir /foo", // TODO: not sure, gotta test whether exporter makes this dir or symlink
+					"mkdir /foo",
 				)),
 			},
 
-			// TODO: symlink to whiteout?
+			verifyContents{
+				name: "TestDiffCircularSymlinks",
+				state: llb.Merge([]llb.State{
+					busybox,
+					llb.Diff(alpine, runShell(alpine, "ln -s /2 /1", "ln -s /1 /2")),
+					llb.Scratch().
+						File(llb.Mkfile("/1", 0644, []byte("foo"))),
+				}),
+				contents: contentsOf(runShell(busybox,
+					"echo -n foo > /1",
+					"ln -s /1 /2",
+				)),
+			},
+			verifyContents{
+				name: "TestDiffCircularDirSymlink",
+				state: llb.Merge([]llb.State{
+					busybox,
+					llb.Diff(alpine, runShell(alpine, "mkdir /foo", "ln -s ../foo /foo/link")),
+					llb.Diff(alpine, runShell(alpine, "mkdir -p /foo/link", "touch /foo/link/file")),
+				}),
+				contents: contentsOf(runShell(busybox,
+					"mkdir -p /foo/link",
+					"touch /foo/link/file",
+				)),
+			},
+			verifyContents{
+				name: "TestDiffCircularParentDirSymlinks",
+				state: llb.Merge([]llb.State{
+					busybox,
+					llb.Diff(alpine, runShell(alpine, "ln -s /2 /1", "ln -s /1 /2")),
+					llb.Diff(alpine, runShell(alpine, "mkdir /1", "echo -n foo > /1/file")),
+				}),
+				contents: contentsOf(runShell(busybox,
+					"mkdir /1",
+					"echo -n foo > /1/file",
+					"ln -s /1 /2",
+				)),
+			},
 		}
 	}()...)
+
+	// Test hardlinks
+	tests = append(tests, func() []integration.Test {
+		// TODO: note about how overlay+native differ inherently (disregarding diff+merge op), so we can't assert.
+
+		linkedFiles := llb.Diff(alpine, runShell(alpine,
+			"mkdir /dir",
+			"touch /dir/1",
+			"ln /dir/1 /dir/2",
+			"chmod 0600 /dir/2",
+		))
+		chmodExecState := runShellExecState(busybox, "chmod 0777 /A/dir/1")
+		chmodExecState.AddMount("/A", linkedFiles)
+		mntB := chmodExecState.AddMount("/B", linkedFiles)
+		return []integration.Test{
+			verifyContents{
+				name:  "TestDiffHardlinks",
+				state: linkedFiles,
+				contents: apply(
+					fstest.CreateDir("/dir", 0755),
+					fstest.CreateFile("/dir/1", nil, 0600),
+					fstest.Link("/dir/1", "/dir/2"),
+				),
+			},
+			verifyContents{
+				name:  "TestDiffHardlinkChangesDoNotPropagateBetweenSnapshots",
+				state: mntB,
+				contents: apply(
+					fstest.CreateDir("/dir", 0755),
+					fstest.CreateFile("/dir/1", nil, 0600),
+					fstest.Link("/dir/1", "/dir/2"),
+				),
+			},
+		}
+	}()...)
+
+	// Diffs of lazy blobs should work.
+	// TODO: add a test where you export a plain diff, not within a merge
+	tests = append(tests,
+		verifyContents{
+			name: "TestDiffLazyBlobMerge",
+			// Merge(A, Diff(A,B)) == B
+			state:    llb.Merge([]llb.State{busybox, llb.Diff(busybox, alpine)}),
+			contents: contentsOf(alpine),
+		},
+	)
+
+	// Diffs of exec mounts should only include the changes made under the mount
+	tests = append(tests, func() []integration.Test {
+		splitDiffExecState := runShellExecState(alpine, "touch /root/A", "touch /mnt/B")
+		splitDiffRoot := splitDiffExecState.Root()
+		splitDiffMnt := splitDiffExecState.AddMount("/mnt", busybox)
+		return []integration.Test{
+			verifyContents{
+				name:  "TestDiffExecRoot",
+				state: llb.Diff(alpine, splitDiffRoot),
+				contents: apply(
+					fstest.CreateDir("/root", 0700),
+					fstest.CreateFile("/root/A", nil, 0644),
+				),
+			},
+			verifyContents{
+				name:  "TestDiffExecMount",
+				state: llb.Diff(busybox, splitDiffMnt),
+				contents: apply(
+					fstest.CreateFile("/B", nil, 0644),
+				),
+			},
+		}
+	}()...)
+
+	// Diff+Merge combinations
+	tests = append(tests, func() []integration.Test {
+		a := llb.Scratch().File(llb.Mkfile("A", 0644, []byte("A")))
+		b := llb.Scratch().File(llb.Mkfile("B", 0644, []byte("B")))
+		c := llb.Scratch().File(llb.Mkfile("C", 0644, []byte("C")))
+		deleteC := c.File(llb.Rm("C"))
+
+		ab := llb.Merge([]llb.State{a, b})
+		abc := llb.Merge([]llb.State{a, b, c})
+		abDeleteC := llb.Merge([]llb.State{a, b, deleteC})
+
+		nested := llb.Merge([]llb.State{
+			abc.File(llb.Mkfile("D", 0644, []byte("D"))),
+			llb.Merge([]llb.State{
+				a,
+				llb.Scratch().File(llb.Mkfile("E", 0644, []byte("E"))),
+			}).File(llb.Rm("A")),
+		})
+		return []integration.Test{
+			verifyContents{
+				name: "TestDiffOnlyMerge",
+				state: llb.Merge([]llb.State{
+					llb.Diff(a, b),
+					llb.Diff(b, a),
+				}),
+				contents: contentsOf(a),
+			},
+
+			// TODO: include this case when testing that diff blobs are reused when diff by one blob
+			verifyContents{
+				name:  "TestDiffOfMerges",
+				state: llb.Diff(ab, abc),
+				contents: apply(
+					fstest.CreateFile("/C", []byte("C"), 0644),
+				),
+			},
+			verifyContents{
+				name:  "TestDiffOfMergesWithDeletes",
+				state: llb.Merge([]llb.State{abc, llb.Diff(abc, abDeleteC)}),
+				contents: apply(
+					fstest.CreateFile("/A", []byte("A"), 0644),
+					fstest.CreateFile("/B", []byte("B"), 0644),
+				),
+			},
+
+			verifyContents{
+				name:  "TestDiffSingleLayerOnMerge",
+				state: llb.Diff(abDeleteC, abDeleteC.File(llb.Mkfile("D", 0644, []byte("D")))),
+				contents: apply(
+					fstest.CreateFile("/D", []byte("D"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffSingleDeleteLayerOnMerge",
+				state: llb.Merge([]llb.State{
+					abDeleteC,
+					llb.Diff(abc, abc.File(llb.Rm("A"))),
+				}),
+				contents: apply(
+					fstest.CreateFile("/B", []byte("B"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffMultipleLayerOnMerge",
+				state: llb.Merge([]llb.State{
+					abDeleteC,
+					llb.Diff(abc, abc.
+						File(llb.Mkfile("D", 0644, []byte("D"))).
+						File(llb.Rm("A")),
+					),
+				}),
+				contents: apply(
+					fstest.CreateFile("/B", []byte("B"), 0644),
+					fstest.CreateFile("/D", []byte("D"), 0644),
+				),
+			},
+
+			verifyContents{
+				name:  "TestDiffNestedLayeredMerges",
+				state: llb.Diff(abc, nested.File(llb.Mkfile("F", 0644, []byte("F")))),
+				contents: apply(
+					fstest.CreateFile("/D", []byte("D"), 0644),
+					fstest.CreateFile("/E", []byte("E"), 0644),
+					fstest.CreateFile("/F", []byte("F"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffNestedLayeredMergeDeletes",
+				state: llb.Merge([]llb.State{
+					ab.File(llb.Mkfile("D", 0644, []byte("D"))),
+					llb.Diff(abc, nested.File(llb.Rm("D"))),
+				}),
+				contents: apply(
+					fstest.CreateFile("/B", []byte("B"), 0644),
+					fstest.CreateFile("/D", []byte("D"), 0644),
+					fstest.CreateFile("/E", []byte("E"), 0644),
+				),
+			},
+			// TODO: add a test case for merging deletes that don't apply (top level, sub-top level, files and dirs)
+
+			// TODO: make sure there's coverage for when there's an intermediate delete that gets applied and then gets overwritten again
+
+			// TODO: case where you do walking diff of overlay mounts (i.e. multi layer overlay diff) and the file that you link from is on
+			// TODO: an intermediate layer whose parent dirs have metadata overriden by higher dirs which results in the dir not having a
+			// TODO: overall metadata change (just an intermediate one)
+		}
+	}()...)
+
+	// Diffs of diffs
+	tests = append(tests, func() []integration.Test {
+		a := llb.Scratch().File(llb.Mkfile("A", 0644, []byte("A")))
+		ab := a.File(llb.Mkfile("B", 0644, []byte("B")))
+		abc := ab.File(llb.Mkfile("C", 0644, []byte("C")))
+		return []integration.Test{
+			verifyContents{
+				name: "TestDiffOfDiffs",
+				state: llb.Diff(
+					llb.Diff(a, ab),
+					llb.Diff(a, abc),
+				),
+				contents: apply(
+					fstest.CreateFile("/C", []byte("C"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffOfDiffsWithDeletes",
+				state: llb.Merge([]llb.State{
+					abc,
+					llb.Diff(
+						llb.Diff(a, abc),
+						llb.Diff(a, ab),
+					),
+				}),
+				contents: apply(
+					fstest.CreateFile("/A", []byte("A"), 0644),
+					fstest.CreateFile("/B", []byte("B"), 0644),
+				),
+			},
+		}
+	}()...)
+
+	// Diffs can be used as layer parents
+	tests = append(tests, func() []integration.Test {
+		a := llb.Scratch().File(llb.Mkfile("A", 0644, []byte("A")))
+		ab := a.File(llb.Mkfile("B", 0644, []byte("B")))
+		abc := ab.File(llb.Mkfile("C", 0644, []byte("C")))
+		return []integration.Test{
+			verifyContents{
+				name:  "TestDiffAsParentSingleLayer",
+				state: llb.Diff(a, ab).File(llb.Mkfile("D", 0644, []byte("D"))),
+				contents: apply(
+					fstest.CreateFile("B", []byte("B"), 0644),
+					fstest.CreateFile("D", []byte("D"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffAsParentSingleLayerDelete",
+				state: llb.Merge([]llb.State{
+					ab,
+					llb.Diff(a, ab).File(llb.Rm("B")),
+				}),
+				contents: apply(
+					fstest.CreateFile("A", []byte("A"), 0644),
+				),
+			},
+			verifyContents{
+				name:  "TestDiffAsParentMultipleLayers",
+				state: llb.Diff(a, abc).File(llb.Mkfile("D", 0644, []byte("D"))),
+				contents: apply(
+					fstest.CreateFile("B", []byte("B"), 0644),
+					fstest.CreateFile("C", []byte("C"), 0644),
+					fstest.CreateFile("D", []byte("D"), 0644),
+				),
+			},
+			verifyContents{
+				name: "TestDiffAsParentMultipleLayerDelete",
+				state: llb.Merge([]llb.State{
+					ab,
+					llb.Diff(a, abc).File(llb.Rm("B")),
+				}),
+				contents: apply(
+					fstest.CreateFile("A", []byte("A"), 0644),
+					fstest.CreateFile("C", []byte("C"), 0644),
+				),
+			},
+		}
+	}()...)
+
+	// TODO: socket + fifos tests, just make sure it doesn't crash or something
 
 	return tests
 }
@@ -407,18 +1280,7 @@ func testDiffOp(t *testing.T, sb integration.Sandbox) {
 
 /* TODO: cases
 	* single layer slice diffs re-use blob input
-	* diffs of execs that have mounts
-	* sliceable diff doesn't include intermediary deletes when merged
-	* diff of "mv foo tmp && mv tmp foo" is empty
-	* diffs where lower or upper or both are merges
-	* diffs where deletes are in subdirectories
-	* diffs where symlinks are overwritten
-	* diffs where hardlinks have metadata changed
-	* diff can be used as parent
-	* diff can be mounted in exec
-	* diff can be copied from
-	* diff can be used as input to diff
-	* merges of only diffs (right now you usually have a normal base in the merge)
+	* diff where a single byte in a file changes but everything else is the same (hit the codepath that does byte comparison)
 	* laziness
 
 	// TODO: separate these into subtests and ensure they each use a clean cache
