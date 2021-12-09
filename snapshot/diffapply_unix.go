@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
@@ -97,6 +98,14 @@ func (sn *mergeSnapshotter) diffApply(ctx context.Context, dest Mountable, diffs
 	if err := a.Flush(); err != nil {
 		return snapshots.Usage{}, errors.Wrapf(err, "failed to flush changes")
 	}
+
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	// TODO:
+	time.Sleep(time.Second)
+
 	return a.Usage()
 }
 

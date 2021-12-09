@@ -1,4 +1,4 @@
-package client
+package client_test
 
 import (
 	"archive/tar"
@@ -41,6 +41,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/progress/progresswriter"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/httpserver"
@@ -50,6 +51,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/sync/errgroup"
+
+	// TODO:
+	. "github.com/moby/buildkit/client"
 )
 
 func init() {
@@ -143,6 +147,8 @@ func TestIntegration(t *testing.T) {
 		testMergeOpCacheMax,
 		testRmSymlink,
 		testMoveParentDir,
+		// TODO:
+		testLazyProgress,
 	)
 	tests = append(tests, diffOpTestCases()...)
 	integration.Run(t, tests, mirrors)
@@ -4018,6 +4024,65 @@ func testProxyEnv(t *testing.T, sb integration.Sandbox) {
 	dt, err = ioutil.ReadFile(filepath.Join(destDir, "env"))
 	require.NoError(t, err)
 	require.Equal(t, string(dt), "httpvalue-httpsvalue-noproxyvalue-noproxyvalue-allproxyvalue-allproxyvalue")
+}
+
+// TODO: remove
+func testLazyProgress(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	a1 := llb.Scratch().File(llb.Mkdir("/A1", 0755))
+	a2 := llb.Scratch().File(llb.Mkdir("/A2", 0755))
+	b1 := llb.Scratch().File(llb.Mkdir("/B1", 0755))
+	b2 := llb.Scratch().File(llb.Mkdir("/B2", 0755))
+	c1 := llb.Scratch().File(llb.Mkdir("/C1", 0755))
+	c2 := llb.Scratch().File(llb.Mkdir("/C2", 0755))
+
+	for _, mode := range []string{"tty", "plain"} {
+		mergeA := llb.Merge([]llb.State{a1, a2})
+		mergeB := llb.Merge([]llb.State{b1, b2}).File(llb.Mkdir("/B3", 0755))
+
+		diffA := llb.Diff(a1, b1).File(llb.Mkdir("/A3", 0755))
+		diffB := llb.Diff(a1, llb.Merge([]llb.State{a1, b2})).File(llb.Mkdir("/B4", 0755))
+
+		state := llb.Merge([]llb.State{mergeA, mergeB, diffA, diffB})
+		def, err := state.Marshal(sb.Context())
+		require.NoError(t, err)
+
+		pw, err := progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
+		require.NoError(t, err)
+
+		_, err = c.Solve(sb.Context(), def, SolveOpt{}, pw.Status())
+		require.NoError(t, err)
+		time.Sleep(time.Second)
+
+		mergeC := llb.Merge([]llb.State{c1, c2})
+
+		state = llb.Merge([]llb.State{mergeA, mergeB, mergeC, diffA, diffB})
+		def, err = state.Marshal(sb.Context())
+		require.NoError(t, err)
+
+		destDir, err := ioutil.TempDir("", "buildkit")
+		require.NoError(t, err)
+		defer os.RemoveAll(destDir)
+
+		pw, err = progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
+		require.NoError(t, err)
+
+		_, err = c.Solve(sb.Context(), def, SolveOpt{
+			Exports: []ExportEntry{{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			}},
+		}, pw.Status())
+		require.NoError(t, err)
+		time.Sleep(time.Second)
+
+		checkAllReleasable(t, c, sb, true)
+	}
 }
 
 func testMergeOp(t *testing.T, sb integration.Sandbox) {

@@ -1,7 +1,7 @@
 //go:build !linux
 // +build !linux
 
-package client
+package client_test
 
 import (
 	"os"

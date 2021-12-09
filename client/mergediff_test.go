@@ -1,4 +1,4 @@
-package client
+package client_test
 
 import (
 	"context"
@@ -17,6 +17,9 @@ import (
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
+
+	// TODO:
+	. "github.com/moby/buildkit/client"
 )
 
 func diffOpTestCases() (tests []integration.Test) {
