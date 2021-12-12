@@ -648,8 +648,6 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 	// These optimizations may make sense here in cache, in the snapshotter or both.
 	// Be sure that any optimizations handle existing pre-optimization refs correctly.
 
-	id := identity.NewID()
-
 	parents := parentRefs{mergeParents: make([]*immutableRef, 0, len(inputParents))}
 	dhs := make(map[digest.Digest]*DescHandler)
 	defer func() {
@@ -688,6 +686,15 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 		}
 	}
 
+	mergeRef, err := cm.createMergeRef(ctx, parents, dhs, opts...)
+	if err != nil {
+		parents.release(context.TODO())
+		return nil, err
+	}
+	return mergeRef, nil
+}
+
+func (cm *cacheManager) createMergeRef(ctx context.Context, parents parentRefs, dhs DescHandlers, opts ...RefOption) (ir *immutableRef, rerr error) {
 	if len(parents.mergeParents) == 0 {
 		// merge of nothing is nothing
 		return nil, nil
@@ -707,6 +714,7 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 	defer cm.mu.Unlock()
 
 	// Build the new ref
+	id := identity.NewID()
 	md, _ := cm.getMetadata(id)
 
 	rec := &cacheRecord{
@@ -762,11 +770,9 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 }
 
 func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, opts ...RefOption) (ir ImmutableRef, rerr error) {
-	if lower == nil && upper == nil {
-		return nil, errors.Errorf("must provide at least one parent")
+	if lower == nil {
+		return nil, errors.New("lower ref for diff cannot be nil")
 	}
-
-	id := identity.NewID()
 
 	var dps diffParents
 	parents := parentRefs{diffParents: &dps}
@@ -803,16 +809,77 @@ func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, opt
 		}
 	}
 
-	if dps.lower != nil {
-		if err := dps.lower.Finalize(ctx); err != nil {
-			return nil, errors.Wrapf(err, "failed to finalize lower parent during diff")
+	// Check to see if lower is an ancestor of upper. If so, define the diff as a merge
+	// of the layers separating the two. This can result in a different diff than just
+	// running the differ directly on lower and upper, but this is chosen as a default
+	// behavior in order to maximize layer re-use in the default case. We may add an
+	// option for controlling this behavior in the future if it's needed.
+	if dps.upper != nil {
+		lowerLayers := dps.lower.layerChain()
+		upperLayers := dps.upper.layerChain()
+		var lowerIsAncestor bool
+		// when upper is only 1 layer different than lower, we can skip this as we
+		// won't need a merge in order to get optimal behavior.
+		if len(upperLayers) > len(lowerLayers)+1 {
+			lowerIsAncestor = true
+			for i, lowerLayer := range lowerLayers {
+				if lowerLayer.ID() != upperLayers[i].ID() {
+					lowerIsAncestor = false
+					break
+				}
+			}
 		}
+		if lowerIsAncestor {
+			mergeParents := parentRefs{mergeParents: make([]*immutableRef, len(upperLayers)-len(lowerLayers))}
+			defer func() {
+				if rerr != nil {
+					mergeParents.release(context.TODO())
+				}
+			}()
+			for i := len(lowerLayers); i < len(upperLayers); i++ {
+				subUpper := upperLayers[i]
+				subLower := subUpper.layerParent
+				if subLower == nil {
+					mergeParents.mergeParents[i-len(lowerLayers)] = subUpper.clone()
+				} else {
+					subParents := parentRefs{diffParents: &diffParents{lower: subLower.clone(), upper: subUpper.clone()}}
+					diffRef, err := cm.createDiffRef(ctx, subParents, subUpper.descHandlers) // TODO: opts that set name ? // TODO: should we clone descHandlers?
+					if err != nil {
+						subParents.release(context.TODO())
+						return nil, err
+					}
+					mergeParents.mergeParents[i-len(lowerLayers)] = diffRef
+				}
+			}
+			mergeRef, err := cm.createMergeRef(ctx, mergeParents, dhs)
+			if err != nil {
+				return nil, err
+			}
+			parents.release(context.TODO())
+			return mergeRef, nil
+		}
+	}
+
+	diffRef, err := cm.createDiffRef(ctx, parents, dhs, opts...)
+	if err != nil {
+		parents.release(context.TODO())
+		return nil, err
+	}
+	return diffRef, nil
+}
+
+func (cm *cacheManager) createDiffRef(ctx context.Context, parents parentRefs, dhs DescHandlers, opts ...RefOption) (ir *immutableRef, rerr error) {
+	dps := parents.diffParents
+	if err := dps.lower.Finalize(ctx); err != nil {
+		return nil, errors.Wrapf(err, "failed to finalize lower parent during diff")
 	}
 	if dps.upper != nil {
 		if err := dps.upper.Finalize(ctx); err != nil {
 			return nil, errors.Wrapf(err, "failed to finalize upper parent during diff")
 		}
 	}
+
+	id := identity.NewID()
 
 	snapshotID := id
 

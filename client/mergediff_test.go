@@ -46,7 +46,7 @@ func diffOpTestCases() (tests []integration.Test) {
 		},
 	)
 
-	// Diff of state with scratch has same contents as the state but without deletes
+	// Diff of state with scratch has same contents as the state
 	tests = append(tests,
 		verifyContents{
 			name:     "TestDiffLowerScratch",
@@ -64,7 +64,6 @@ func diffOpTestCases() (tests []integration.Test) {
 					File(llb.Mkfile("/bar", 0644, nil))),
 			}),
 			contents: apply(
-				fstest.CreateFile("/foo", []byte("A"), 0755),
 				fstest.CreateFile("/bar", nil, 0644),
 			),
 		},
@@ -138,7 +137,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			return all
 		}
 
-		var allCmds []string
+		var allCmds [][]string
 		var allContents []contents
 
 		baseDiffCmds := []string{
@@ -148,7 +147,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateDir("/unmodifiedDir", 0755),
 			fstest.CreateDir("/modifyDir", 0700),
 		)
-		allCmds = append(allCmds, baseDiffCmds...)
+		allCmds = append(allCmds, baseDiffCmds)
 		allContents = append(allContents, baseDiffContents)
 
 		newFileCmds := []string{
@@ -166,7 +165,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateFile("/unmodifiedDir/newfile2", nil, 0644),
 			fstest.CreateFile("/modifyDir/newfile3", nil, 0644),
 		)
-		allCmds = append(allCmds, newFileCmds...)
+		allCmds = append(allCmds, newFileCmds)
 		allContents = append(allContents, newFileContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffNewFiles",
@@ -196,7 +195,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateFile("/modifyDir/chmodFile2", []byte("chmodFile2"), 0440),
 			fstest.CreateFile("/modifyDir/modifyContentFile2", []byte("modifyContentFile0"), 0644),
 		)
-		allCmds = append(allCmds, modifyFileCmds...)
+		allCmds = append(allCmds, modifyFileCmds)
 		allContents = append(allContents, modifyFileContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffModifiedFiles",
@@ -226,7 +225,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateDir("/unmodifiedDir/newsubdir2", 0755),
 			fstest.CreateDir("/modifyDir/newsubdir3", 0755),
 		)
-		allCmds = append(allCmds, createNewDirCmds...)
+		allCmds = append(allCmds, createNewDirCmds)
 		allContents = append(allContents, createNewDirContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffNewDirs",
@@ -251,7 +250,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateDir("/unmodifiedDir/chmodSubdir1", 0700),
 			fstest.CreateDir("/modifyDir/chmodSubdir2", 0770),
 		)
-		allCmds = append(allCmds, modifyDirCmds...)
+		allCmds = append(allCmds, modifyDirCmds)
 		allContents = append(allContents, modifyDirContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffModifiedDirs",
@@ -276,7 +275,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateFile("/unmodifiedDir/overrideSubdir1", []byte("overrideSubdir1"), 0644),
 			fstest.CreateFile("/modifyDir/overrideSubdir2", []byte("overrideSubdir2"), 0644),
 		)
-		allCmds = append(allCmds, overrideDirCmds...)
+		allCmds = append(allCmds, overrideDirCmds)
 		allContents = append(allContents, overrideDirContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffOverrideDirs",
@@ -320,7 +319,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateFile("/modifyDir/overrideFile4/newfile6", nil, 0644),
 			fstest.CreateFile("/modifyDir/overrideFile4/newsubdir5/newfile7", nil, 0644),
 		)
-		allCmds = append(allCmds, overrideFileCmds...)
+		allCmds = append(allCmds, overrideFileCmds)
 		allContents = append(allContents, overrideFileContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffOverrideFiles",
@@ -338,7 +337,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			"rm /unmodifiedDir/deleteFile1",
 			"rm /modifyDir/deleteFile2",
 		}
-		allCmds = append(allCmds, deleteFileCmds...)
+		allCmds = append(allCmds, deleteFileCmds)
 		tests = append(tests, verifyContents{
 			name: "TestDiffDeleteFiles",
 			state: llb.Diff(base, runShell(base, joinCmds(
@@ -372,7 +371,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			"rm -rf /unmodifiedDir/deleteSubdir1",
 			"rm -rf /modifyDir/deleteSubdir2",
 		}
-		allCmds = append(allCmds, deleteDirCmds...)
+		allCmds = append(allCmds, deleteDirCmds)
 		tests = append(tests, verifyContents{
 			name: "TestDiffDeleteDirs",
 			state: llb.Diff(base, runShell(base, joinCmds(
@@ -447,7 +446,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			fstest.CreateFile("/modifyDir/opaqueDir2/newOpaqueFile3", nil, 0644),
 			fstest.CreateFile("/modifyDir/opaqueDir2/newOpaqueSubdir2/newOpaqueFile4", nil, 0644),
 		)
-		allCmds = append(allCmds, opaqueDirCmds...)
+		allCmds = append(allCmds, opaqueDirCmds)
 		allContents = append(allContents, opaqueDirContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffOpaqueDirs",
@@ -511,7 +510,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			"mv /modifyDir/shuffleFile3 /modifyDir/shuffleFile3tmp",
 			"mv /modifyDir/shuffleFile3tmp /modifyDir/shuffleFile3",
 		}
-		allCmds = append(allCmds, shuffleFileCmds...)
+		allCmds = append(allCmds, shuffleFileCmds)
 		tests = append(tests, verifyContents{
 			name: "TestDiffShuffleFiles",
 			state: llb.Diff(base, runShell(base, joinCmds(
@@ -550,7 +549,7 @@ func diffOpTestCases() (tests []integration.Test) {
 			mkfifo("/unmodifiedDir/fifo1", 0644),
 			mkfifo("/modifyDir/fifo2", 0644),
 		)
-		allCmds = append(allCmds, mknodFifosCmds...)
+		allCmds = append(allCmds, mknodFifosCmds)
 		allContents = append(allContents, mknodFifosContents)
 		tests = append(tests, verifyContents{
 			name: "TestDiffFifos",
@@ -587,19 +586,19 @@ func diffOpTestCases() (tests []integration.Test) {
 
 		// combine all the previous tests into one to make sure the diffs can be calculated
 		// together equivalently
+		var flattenedCmds []string
+		for _, cmds := range allCmds {
+			flattenedCmds = append(flattenedCmds, cmds...)
+		}
 		tests = append(tests, verifyContents{
 			name:     "TestDiffCombinedSingleLayer",
-			state:    llb.Diff(base, runShell(base, allCmds...)),
+			state:    llb.Diff(base, runShell(base, flattenedCmds...)),
 			contents: mergeContents(allContents...),
 		})
 
-		var allCmdsMultiLayer [][]string
-		for _, cmds := range allCmds {
-			allCmdsMultiLayer = append(allCmdsMultiLayer, []string{cmds})
-		}
 		tests = append(tests, verifyContents{
 			name:     "TestDiffCombinedMultiLayer",
-			state:    llb.Diff(base, chainRunShells(base, allCmdsMultiLayer...)),
+			state:    llb.Diff(base, chainRunShells(base, allCmds...)),
 			contents: mergeContents(allContents...),
 		})
 		return tests
@@ -838,6 +837,7 @@ func diffOpTestCases() (tests []integration.Test) {
 		abc := llb.Merge([]llb.State{a, b, c})
 		abDeleteC := llb.Merge([]llb.State{a, b, deleteC})
 
+		// nested is abcdae-a
 		nested := llb.Merge([]llb.State{
 			abc.File(llb.Mkfile("D", 0644, []byte("D"))),
 			llb.Merge([]llb.State{
@@ -914,13 +914,13 @@ func diffOpTestCases() (tests []integration.Test) {
 			},
 			verifyContents{
 				name: "TestDiffNestedLayeredMergeDeletes",
+				// this is "ab" + "d" + Diff("abc", "abcdae-a"+"-d") == "abd" + "dae-a-d" == abddae-a-d
 				state: llb.Merge([]llb.State{
 					ab.File(llb.Mkfile("D", 0644, []byte("D"))),
 					llb.Diff(abc, nested.File(llb.Rm("D"))),
 				}),
 				contents: apply(
 					fstest.CreateFile("/B", []byte("B"), 0644),
-					fstest.CreateFile("/D", []byte("D"), 0644),
 					fstest.CreateFile("/E", []byte("E"), 0644),
 				),
 			},

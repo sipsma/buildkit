@@ -103,11 +103,16 @@ func (d *diffOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		}
 	}
 
-	if lowerRef == nil && upperRef == nil {
-		// The diff of nothing and nothing is nothing. Just return an empty ref.
-		return []solver.Result{worker.NewWorkerRefResult(nil, d.worker)}, nil
+	if lowerRef == nil {
+		if upperRef == nil {
+			// The diff of nothing and nothing is nothing. Just return an empty ref.
+			return []solver.Result{worker.NewWorkerRefResult(nil, d.worker)}, nil
+		} else {
+			// The diff of nothing and upper is upper. Just return a clone of upper
+			return []solver.Result{worker.NewWorkerRefResult(upperRef.Clone(), d.worker)}, nil
+		}
 	}
-	if lowerRef != nil && upperRef != nil && lowerRef.ID() == upperRef.ID() {
+	if upperRef != nil && lowerRef.ID() == upperRef.ID() {
 		// The diff of a ref and itself is nothing, return an empty ref.
 		return []solver.Result{worker.NewWorkerRefResult(nil, d.worker)}, nil
 	}
