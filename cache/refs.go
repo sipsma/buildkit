@@ -967,7 +967,7 @@ func (sr *immutableRef) unlazy(ctx context.Context, dhs DescHandlers, s session.
 }
 
 // should be called within sizeG.Do call for this ref's ID
-func (sr *immutableRef) unlazyDiffMerge(ctx context.Context, dhs DescHandlers, s session.Group) error {
+func (sr *immutableRef) unlazyDiffMerge(ctx context.Context, dhs DescHandlers, s session.Group) (rerr error) {
 	eg, egctx := errgroup.WithContext(ctx)
 	var diffs []snapshot.Diff
 	sr.layerWalk(func(sr *immutableRef) {
@@ -1000,6 +1000,23 @@ func (sr *immutableRef) unlazyDiffMerge(ctx context.Context, dhs DescHandlers, s
 	if err := eg.Wait(); err != nil {
 		return err
 	}
+
+	// TODO: weird to use ID as a digest
+	dh := dhs[digest.Digest(sr.ID())]
+	if dh != nil && dh.Progress != nil {
+		var status string
+		switch sr.kind() {
+		case Merge:
+			status = "merging"
+		case Diff:
+			status = "diffing"
+		}
+		_, stopProgress := dh.Progress.Start(ctx)
+		defer stopProgress(rerr)
+		statusDone := dh.Progress.Status(status, status)
+		defer statusDone()
+	}
+
 	return sr.cm.Snapshotter.Merge(ctx, sr.getSnapshotID(), diffs)
 }
 

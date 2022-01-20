@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/progress/controller"
 	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
 
@@ -21,6 +23,7 @@ const diffCacheType = "buildkit.diff.v0"
 type diffOp struct {
 	op     *pb.DiffOp
 	worker worker.Worker
+	vtx    solver.Vertex
 }
 
 func NewDiffOp(v solver.Vertex, op *pb.Op_Diff, w worker.Worker) (solver.Op, error) {
@@ -30,6 +33,7 @@ func NewDiffOp(v solver.Vertex, op *pb.Op_Diff, w worker.Worker) (solver.Op, err
 	return &diffOp{
 		op:     op.Diff,
 		worker: w,
+		vtx:    v,
 	}, nil
 }
 
@@ -122,6 +126,13 @@ func (d *diffOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		return nil, err
 	}
 
+	// TODO: ugly
+	dh := diffRef.DescHandler(digest.Digest(diffRef.ID()))
+	dh.Progress = &controller.Controller{
+		WriterFactory: progress.FromContext(ctx),
+		Digest:        d.vtx.Digest(),
+		Name:          d.vtx.Name(),
+	}
 	return []solver.Result{worker.NewWorkerRefResult(diffRef, d.worker)}, nil
 }
 

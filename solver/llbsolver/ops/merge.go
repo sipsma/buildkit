@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/progress/controller"
 	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
 
@@ -22,6 +24,7 @@ const mergeCacheType = "buildkit.merge.v0"
 type mergeOp struct {
 	op     *pb.MergeOp
 	worker worker.Worker
+	vtx    solver.Vertex
 }
 
 func NewMergeOp(v solver.Vertex, op *pb.Op_Merge, w worker.Worker) (solver.Op, error) {
@@ -31,6 +34,7 @@ func NewMergeOp(v solver.Vertex, op *pb.Op_Merge, w worker.Worker) (solver.Op, e
 	return &mergeOp{
 		op:     op.Merge,
 		worker: w,
+		vtx:    v,
 	}, nil
 }
 
@@ -90,6 +94,13 @@ func (m *mergeOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		return nil, err
 	}
 
+	// TODO: ugly
+	dh := mergedRef.DescHandler(digest.Digest(mergedRef.ID()))
+	dh.Progress = &controller.Controller{
+		WriterFactory: progress.FromContext(ctx),
+		Digest:        m.vtx.Digest(),
+		Name:          m.vtx.Name(),
+	}
 	return []solver.Result{worker.NewWorkerRefResult(mergedRef, m.worker)}, nil
 }
 

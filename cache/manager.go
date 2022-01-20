@@ -738,6 +738,8 @@ func (cm *cacheManager) createMergeRef(ctx context.Context, parents parentRefs, 
 
 	// Build the new ref
 	id := identity.NewID()
+	// TODO: ugly
+	dhs[digest.Digest(id)] = &DescHandler{}
 	md, _ := cm.getMetadata(id)
 
 	rec := &cacheRecord{
@@ -907,6 +909,8 @@ func (cm *cacheManager) createDiffRef(ctx context.Context, parents parentRefs, d
 	}
 
 	id := identity.NewID()
+	// TODO: ugly
+	dhs[digest.Digest(id)] = &DescHandler{}
 
 	snapshotID := id
 
