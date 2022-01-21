@@ -4034,55 +4034,71 @@ func testLazyProgress(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	a1 := llb.Scratch().File(llb.Mkdir("/A1", 0755))
-	a2 := llb.Scratch().File(llb.Mkdir("/A2", 0755))
-	b1 := llb.Scratch().File(llb.Mkdir("/B1", 0755))
-	b2 := llb.Scratch().File(llb.Mkdir("/B2", 0755))
-	c1 := llb.Scratch().File(llb.Mkdir("/C1", 0755))
-	c2 := llb.Scratch().File(llb.Mkdir("/C2", 0755))
+	img := llb.Image("alpine", llb.ProgressGroup("test"))
+	a1 := llb.Scratch().File(llb.Mkdir("/A1", 0755), llb.ProgressGroup("test"))
+	a2 := llb.Scratch().File(llb.Mkdir("/A2", 0755), llb.ProgressGroup("test"))
+	merge := llb.Merge([]llb.State{img, a1, a2}, llb.ProgressGroup("test"))
+	state := merge.File(llb.Mkdir("/B1", 0755))
 
-	for _, mode := range []string{"tty", "plain"} {
-		mergeA := llb.Merge([]llb.State{a1, a2})
-		mergeB := llb.Merge([]llb.State{b1, b2}).File(llb.Mkdir("/B3", 0755))
+	def, err := state.Marshal(sb.Context())
+	require.NoError(t, err)
 
-		diffA := llb.Diff(a1, b1).File(llb.Mkdir("/A3", 0755))
-		diffB := llb.Diff(a1, llb.Merge([]llb.State{a1, b2})).File(llb.Mkdir("/B4", 0755))
+	pw, err := progresswriter.NewPrinter(sb.Context(), os.Stdout, "plain")
+	require.NoError(t, err)
 
-		state := llb.Merge([]llb.State{mergeA, mergeB, diffA, diffB})
-		def, err := state.Marshal(sb.Context())
-		require.NoError(t, err)
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, pw.Status())
+	require.NoError(t, err)
+	time.Sleep(time.Second)
 
-		pw, err := progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
-		require.NoError(t, err)
+	/*
+		b1 := llb.Scratch().File(llb.Mkdir("/B1", 0755))
+		b2 := llb.Scratch().File(llb.Mkdir("/B2", 0755))
+		c1 := llb.Scratch().File(llb.Mkdir("/C1", 0755))
+		c2 := llb.Scratch().File(llb.Mkdir("/C2", 0755))
 
-		_, err = c.Solve(sb.Context(), def, SolveOpt{}, pw.Status())
-		require.NoError(t, err)
-		time.Sleep(time.Second)
+		for _, mode := range []string{"tty", "plain"} {
+			mergeA := llb.Merge([]llb.State{llb.Image("alpine", llb.ProgressGroup("test")), a1, a2}, llb.ProgressGroup("test"))
+			mergeB := llb.Merge([]llb.State{b1, b2}).File(llb.Mkdir("/B3", 0755))
 
-		mergeC := llb.Merge([]llb.State{c1, c2})
+			diffA := llb.Diff(a1, b1).File(llb.Mkdir("/A3", 0755))
+			diffB := llb.Diff(a1, llb.Merge([]llb.State{llb.Image("alpine"), a1, b2})).File(llb.Mkdir("/B4", 0755))
 
-		state = llb.Merge([]llb.State{mergeA, mergeB, mergeC, diffA, diffB})
-		def, err = state.Marshal(sb.Context())
-		require.NoError(t, err)
+			state := llb.Merge([]llb.State{mergeA, mergeB, diffA, diffB})
+			def, err := state.Marshal(sb.Context())
+			require.NoError(t, err)
 
-		destDir, err := ioutil.TempDir("", "buildkit")
-		require.NoError(t, err)
-		defer os.RemoveAll(destDir)
+			pw, err := progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
+			require.NoError(t, err)
 
-		pw, err = progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
-		require.NoError(t, err)
+			_, err = c.Solve(sb.Context(), def, SolveOpt{}, pw.Status())
+			require.NoError(t, err)
+			time.Sleep(time.Second)
 
-		_, err = c.Solve(sb.Context(), def, SolveOpt{
-			Exports: []ExportEntry{{
-				Type:      ExporterLocal,
-				OutputDir: destDir,
-			}},
-		}, pw.Status())
-		require.NoError(t, err)
-		time.Sleep(time.Second)
+			mergeC := llb.Merge([]llb.State{c1, c2})
 
-		checkAllReleasable(t, c, sb, true)
-	}
+			state = llb.Merge([]llb.State{mergeA, mergeB, mergeC, diffA, diffB})
+			def, err = state.Marshal(sb.Context())
+			require.NoError(t, err)
+
+			destDir, err := ioutil.TempDir("", "buildkit")
+			require.NoError(t, err)
+			defer os.RemoveAll(destDir)
+
+			pw, err = progresswriter.NewPrinter(sb.Context(), os.Stdout, mode)
+			require.NoError(t, err)
+
+			_, err = c.Solve(sb.Context(), def, SolveOpt{
+				Exports: []ExportEntry{{
+					Type:      ExporterLocal,
+					OutputDir: destDir,
+				}},
+			}, pw.Status())
+			require.NoError(t, err)
+			time.Sleep(time.Second)
+
+			checkAllReleasable(t, c, sb, true)
+		}
+	*/
 }
 
 func testMergeOp(t *testing.T, sb integration.Sandbox) {

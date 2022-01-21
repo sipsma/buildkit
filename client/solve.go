@@ -270,6 +270,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 					Completed: v.Completed,
 					Error:     v.Error,
 					Cached:    v.Cached,
+					GroupName: v.ProgressGroupName,
 				})
 			}
 			for _, v := range resp.Statuses {

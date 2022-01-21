@@ -50,10 +50,11 @@ type Edge struct {
 // definition or equality check of it. These options are not contained in the
 // vertex digest.
 type VertexOptions struct {
-	IgnoreCache  bool
-	CacheSources []CacheManager
-	Description  map[string]string // text values with no special meaning for solver
-	ExportCache  *bool
+	IgnoreCache       bool
+	CacheSources      []CacheManager
+	Description       map[string]string // text values with no special meaning for solver
+	ExportCache       *bool
+	ProgressGroupName string
 	// WorkerConstraint
 }
 

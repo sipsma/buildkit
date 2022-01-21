@@ -14,6 +14,7 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/identity"
 	"github.com/morikuni/aec"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/tonistiigi/units"
@@ -121,6 +122,7 @@ type trace struct {
 	nextIndex     int
 	updates       map[digest.Digest]struct{}
 	modeConsole   bool
+	vertexGroup   map[string]*vertex
 }
 
 type vertex struct {
@@ -134,7 +136,7 @@ type vertex struct {
 	logsPartial   bool
 	logsOffset    int
 	logsBuffer    *ring.Ring // stores last logs to print them on error
-	prev          *client.Vertex
+	prev          *vertex
 	events        []string
 	lastBlockTime *time.Time
 	count         int
@@ -169,6 +171,7 @@ func newTrace(w io.Writer, modeConsole bool) *trace {
 		updates:     make(map[digest.Digest]struct{}),
 		w:           w,
 		modeConsole: modeConsole,
+		vertexGroup: make(map[string]*vertex),
 	}
 }
 
@@ -180,15 +183,15 @@ func (t *trace) warnings() []client.VertexWarning {
 	return out
 }
 
-func (t *trace) triggerVertexEvent(v *client.Vertex) {
-	if v.Started == nil {
+// TODO: these updates look weird
+func (t *trace) triggerVertexEvent(v *vertex) {
+	if v.Vertex == nil || v.Started == nil {
 		return
 	}
 
 	var old client.Vertex
-	vtx := t.byDigest[v.Digest]
-	if v := vtx.prev; v != nil {
-		old = *v
+	if vtx := v.prev; vtx != nil {
+		old = *vtx.Vertex
 	}
 
 	changed := false
@@ -214,15 +217,36 @@ func (t *trace) triggerVertexEvent(v *client.Vertex) {
 	}
 
 	if changed {
-		vtx.update(1)
+		v.update(1)
 		t.updates[v.Digest] = struct{}{}
 	}
 
-	t.byDigest[v.Digest].prev = v
+	v.prev = v
 }
 
 func (t *trace) update(s *client.SolveStatus, termWidth int) {
 	for _, v := range s.Vertexes {
+		if v.GroupName != "" {
+			parentVtx, ok := t.vertexGroup[v.GroupName]
+			if !ok {
+				t.nextIndex++
+				parentVtx = &vertex{
+					Vertex: &client.Vertex{
+						Name:   v.GroupName,
+						Digest: digest.Digest(identity.NewID()),
+					},
+					byID:          make(map[string]*status),
+					statusUpdates: make(map[string]struct{}),
+					index:         t.nextIndex,
+				}
+				if t.modeConsole {
+					parentVtx.term = vt100.NewVT100(termHeight, termWidth-termPad)
+				}
+				t.vertexGroup[v.GroupName] = parentVtx
+			}
+			// TODO: check for if it's already set? error if so? or something else?
+			t.byDigest[v.Digest] = parentVtx
+		}
 		prev, ok := t.byDigest[v.Digest]
 		if !ok {
 			t.nextIndex++
@@ -235,7 +259,7 @@ func (t *trace) update(s *client.SolveStatus, termWidth int) {
 				t.byDigest[v.Digest].term = vt100.NewVT100(termHeight, termWidth-termPad)
 			}
 		}
-		t.triggerVertexEvent(v)
+		t.triggerVertexEvent(t.byDigest[v.Digest])
 		if v.Started != nil && (prev == nil || prev.Started == nil) {
 			if t.localTimeDiff == 0 {
 				t.localTimeDiff = time.Since(*v.Started)
@@ -243,8 +267,13 @@ func (t *trace) update(s *client.SolveStatus, termWidth int) {
 			t.vertexes = append(t.vertexes, t.byDigest[v.Digest])
 		}
 		// allow a duplicate initial vertex that shouldn't reset state
+		// TODO: ?
 		if !(prev != nil && prev.Started != nil && v.Started == nil) {
-			t.byDigest[v.Digest].Vertex = v
+			if v.GroupName != "" {
+				t.byDigest[v.Digest].Started = v.Started
+			} else {
+				t.byDigest[v.Digest].Vertex = v
+			}
 		}
 		t.byDigest[v.Digest].jobCached = false
 	}

@@ -505,6 +505,10 @@ func mergeMetadata(m1, m2 pb.OpMetadata) pb.OpMetadata {
 		m1.Caps[k] = true
 	}
 
+	if m2.ProgressGroupName != "" {
+		m1.ProgressGroupName = m2.ProgressGroupName
+	}
+
 	return m1
 }
 
@@ -591,6 +595,12 @@ func Platform(p ocispecs.Platform) ConstraintsOpt {
 func LocalUniqueID(v string) ConstraintsOpt {
 	return constraintsOptFunc(func(c *Constraints) {
 		c.LocalUniqueID = v
+	})
+}
+
+func ProgressGroup(name string) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		c.Metadata.ProgressGroupName = name
 	})
 }
 

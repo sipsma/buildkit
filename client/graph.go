@@ -15,6 +15,7 @@ type Vertex struct {
 	Completed *time.Time
 	Cached    bool
 	Error     string
+	GroupName string
 }
 
 type VertexStatus struct {
