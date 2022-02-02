@@ -17,6 +17,7 @@ import (
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/buildinfo"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/entitlements"
@@ -227,7 +228,11 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 			inp.Refs = m
 		}
 
-		if err := inBuilderContext(ctx, j, e.Name(), "", func(ctx context.Context, _ session.Group) error {
+		var pg *pb.ProgressGroup
+		if res.Ref != nil {
+			pg = res.Ref.ProgressGroup()
+		}
+		if err := inBuilderContext(ctx, j, e.Name(), "", pg, func(ctx context.Context, _ session.Group) error {
 			exporterResponse, err = e.Export(ctx, inp, j.SessionID)
 			return err
 		}); err != nil {
@@ -238,7 +243,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	g := session.NewGroup(j.SessionID)
 	var cacheExporterResponse map[string]string
 	if e := exp.CacheExporter; e != nil {
-		if err := inBuilderContext(ctx, j, "exporting cache", "", func(ctx context.Context, _ session.Group) error {
+		if err := inBuilderContext(ctx, j, "exporting cache", "", nil, func(ctx context.Context, _ session.Group) error {
 			prepareDone := oneOffProgress(ctx, "preparing build cache for export")
 			if err := res.EachRef(func(res solver.ResultProxy) error {
 				r, err := res.Result(ctx)
@@ -331,7 +336,7 @@ func inlineCache(ctx context.Context, e remotecache.Exporter, res solver.CachedR
 }
 
 func withDescHandlerCacheOpts(ctx context.Context, ref cache.ImmutableRef) context.Context {
-	return solver.WithCacheOptGetter(ctx, func(keys ...interface{}) map[interface{}]interface{} {
+	return solver.WithCacheOptGetter(ctx, func(includeAncestors bool, keys ...interface{}) map[interface{}]interface{} {
 		vals := make(map[interface{}]interface{})
 		for _, k := range keys {
 			if key, ok := k.(cache.DescHandlerKey); ok {
@@ -390,13 +395,14 @@ func oneOffProgress(ctx context.Context, id string) func(err error) error {
 	}
 }
 
-func inBuilderContext(ctx context.Context, b solver.Builder, name, id string, f func(ctx context.Context, g session.Group) error) error {
+func inBuilderContext(ctx context.Context, b solver.Builder, name, id string, pg *pb.ProgressGroup, f func(ctx context.Context, g session.Group) error) error {
 	if id == "" {
 		id = name
 	}
 	v := client.Vertex{
-		Digest: digest.FromBytes([]byte(id)),
-		Name:   name,
+		Digest:        digest.FromBytes([]byte(id)),
+		Name:          name,
+		ProgressGroup: pg,
 	}
 	return b.InContext(ctx, func(ctx context.Context, g session.Group) error {
 		pw, _, ctx := progress.NewFromContext(ctx, progress.WithMetadata("vertex", v.Digest))

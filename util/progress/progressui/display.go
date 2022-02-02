@@ -14,6 +14,7 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/identity"
 	"github.com/morikuni/aec"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/tonistiigi/units"
@@ -121,10 +122,12 @@ type trace struct {
 	nextIndex     int
 	updates       map[digest.Digest]struct{}
 	modeConsole   bool
+	groups        map[string]*vertexGroup // group id -> group
 }
 
 type vertex struct {
 	*client.Vertex
+
 	statuses []*status
 	byID     map[string]*status
 	indent   string
@@ -159,6 +162,43 @@ func (v *vertex) update(c int) {
 	v.count += c
 }
 
+type vertexGroup struct {
+	*vertex
+	subVtxs map[digest.Digest]client.Vertex
+}
+
+func (vg *vertexGroup) mergeSubVtxs() *client.Vertex {
+	newVtx := *vg.Vertex
+	newVtx.Completed = &time.Time{}
+	newVtx.Cached = true
+	for _, subVtx := range vg.subVtxs {
+		// Group start time is the earliest start time of the vtxs (or nil if none have started)
+		// TODO: ask in PR if we want this or the literal sum of end-start times? This version seems more clear
+		if newVtx.Started == nil || (subVtx.Started != nil && subVtx.Started.Before(*newVtx.Started)) {
+			newVtx.Started = subVtx.Started
+		}
+
+		// Group is considered not completed if any vtxs are not completed. If all vtxs
+		// are completed, then group completed time is the latest of those
+		if newVtx.Completed != nil {
+			if subVtx.Completed == nil {
+				newVtx.Completed = nil
+			} else if subVtx.Completed.After(*newVtx.Completed) {
+				newVtx.Completed = subVtx.Completed
+			}
+		}
+
+		// Group is considered cached iff all subVtxs are cached
+		newVtx.Cached = newVtx.Cached && subVtx.Cached
+
+		// Group error is set to the first error found in subvtxs, if any
+		if newVtx.Error == "" {
+			newVtx.Error = subVtx.Error
+		}
+	}
+	return &newVtx
+}
+
 type status struct {
 	*client.VertexStatus
 }
@@ -169,6 +209,7 @@ func newTrace(w io.Writer, modeConsole bool) *trace {
 		updates:     make(map[digest.Digest]struct{}),
 		w:           w,
 		modeConsole: modeConsole,
+		groups:      make(map[string]*vertexGroup),
 	}
 }
 
@@ -222,7 +263,38 @@ func (t *trace) triggerVertexEvent(v *client.Vertex) {
 }
 
 func (t *trace) update(s *client.SolveStatus, termWidth int) {
+	groups := make(map[string]struct{})
 	for _, v := range s.Vertexes {
+		if v.ProgressGroup != nil {
+			group, ok := t.groups[v.ProgressGroup.Id]
+			if !ok {
+				t.nextIndex++
+				group = &vertexGroup{
+					vertex: &vertex{
+						Vertex: &client.Vertex{
+							Digest:    digest.Digest(identity.NewID()),
+							Name:      v.ProgressGroup.Name,
+							Completed: &time.Time{},
+						},
+						byID:          make(map[string]*status),
+						statusUpdates: make(map[string]struct{}),
+						index:         t.nextIndex,
+					},
+					subVtxs: make(map[digest.Digest]client.Vertex),
+				}
+				if t.modeConsole {
+					group.term = vt100.NewVT100(termHeight, termWidth-termPad)
+				}
+				t.groups[v.ProgressGroup.Id] = group
+				t.byDigest[group.Digest] = group.vertex
+			}
+			groups[v.ProgressGroup.Id] = struct{}{}
+			group.subVtxs[v.Digest] = *v
+			t.byDigest[v.Digest] = group.vertex
+			// TODO:
+			// fmt.Printf("%+v\n", v)
+			continue
+		}
 		prev, ok := t.byDigest[v.Digest]
 		if !ok {
 			t.nextIndex++
@@ -247,6 +319,21 @@ func (t *trace) update(s *client.SolveStatus, termWidth int) {
 			t.byDigest[v.Digest].Vertex = v
 		}
 		t.byDigest[v.Digest].jobCached = false
+	}
+	for groupID := range groups {
+		group := t.groups[groupID]
+		newVtx := group.mergeSubVtxs()
+		t.triggerVertexEvent(newVtx)
+		if newVtx.Started != nil && group.Started == nil {
+			if t.localTimeDiff == 0 {
+				t.localTimeDiff = time.Since(*newVtx.Started)
+			}
+			t.vertexes = append(t.vertexes, group.vertex)
+		}
+		group.Vertex = newVtx
+		group.jobCached = false
+		// TODO:
+		// fmt.Printf("group: %+v\n\n", group.Vertex)
 	}
 	for _, s := range s.Statuses {
 		v, ok := t.byDigest[s.Vertex]
@@ -344,6 +431,11 @@ func (t *trace) displayInfo() (d displayInfo) {
 	}
 	d.countTotal = len(t.byDigest)
 	for _, v := range t.byDigest {
+		if v.ProgressGroup != nil {
+			// don't count vtxs in a group, they are merged into a single vtx
+			d.countTotal--
+			continue
+		}
 		if v.Completed != nil {
 			d.countCompleted++
 		}

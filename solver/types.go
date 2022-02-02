@@ -55,6 +55,7 @@ type VertexOptions struct {
 	Description  map[string]string // text values with no special meaning for solver
 	ExportCache  *bool
 	// WorkerConstraint
+	ProgressGroup *pb.ProgressGroup
 }
 
 // Result is an abstract return value for a solve
@@ -76,6 +77,7 @@ type ResultProxy interface {
 	Release(context.Context) error
 	Definition() *pb.Definition
 	BuildInfo() BuildInfo
+	ProgressGroup() *pb.ProgressGroup
 }
 
 // CacheExportMode is the type for setting cache exporting modes
