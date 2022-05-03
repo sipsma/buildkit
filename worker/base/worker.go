@@ -43,6 +43,7 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
+	"github.com/moby/buildkit/util/tracing"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -369,6 +370,11 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 }
 
 func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cache.ImmutableRef, err error) {
+	span, ctx := tracing.StartSpan(ctx, "FromRemote")
+	defer func() {
+		tracing.FinishWithError(span, err)
+	}()
+
 	if cd, ok := remote.Provider.(interface {
 		CheckDescriptor(context.Context, ocispecs.Descriptor) error
 	}); ok && len(remote.Descriptors) > 0 {

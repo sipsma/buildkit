@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 
+	"github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -149,6 +150,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		}
 
 		if remote != nil {
+			bklog.G(ctx).Debugf("export cachekey %s -> %+v", e.k.Digest(), remote.Descriptors[len(remote.Descriptors)-1])
 			for _, rec := range allRec {
 				rec.AddResult(v.CreatedAt, remote)
 			}

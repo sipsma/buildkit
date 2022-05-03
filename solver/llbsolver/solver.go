@@ -23,6 +23,7 @@ import (
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/tracing"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -280,6 +281,8 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	if e := exp.CacheExporter; e != nil {
 		if err := inBuilderContext(ctx, j, "exporting cache", "", func(ctx context.Context, _ session.Group) error {
 			prepareDone := oneOffProgress(ctx, "preparing build cache for export")
+			span, ctx := tracing.StartSpan(ctx, "exporting cache")
+
 			if err := res.EachRef(func(res solver.ResultProxy) error {
 				r, err := res.Result(ctx)
 				if err != nil {
@@ -304,10 +307,12 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 				})
 				return err
 			}); err != nil {
+				tracing.FinishWithError(span, err)
 				return prepareDone(err)
 			}
 			prepareDone(nil)
 			cacheExporterResponse, err = e.Finalize(ctx)
+			tracing.FinishWithError(span, nil)
 			return err
 		}); err != nil {
 			return nil, err

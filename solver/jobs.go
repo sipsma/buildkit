@@ -11,6 +11,7 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
@@ -647,8 +648,7 @@ func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, err
 	if s.st.mspan.Span != nil {
 		ctx = trace.ContextWithSpan(ctx, s.st.mspan)
 	}
-	// no cache hit. start evaluating the node
-	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name())
+	span, ctx := tracing.StartSpan(ctx, "Load Cache: "+s.st.vtx.Name())
 	notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, true)
 	res, err := s.Cache().Load(withAncestorCacheOpts(ctx, s.st), rec)
 	tracing.FinishWithError(span, err)
@@ -688,7 +688,9 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessF
 			if st.mspan.Span != nil {
 				ctx2 = trace.ContextWithSpan(ctx2, st.mspan)
 			}
-			err = p(ctx2, res, st)
+			span, ctx3 := tracing.StartSpan(ctx2, "PreprocessCache: "+st.vtx.Name())
+			err = p(ctx3, res, st)
+			tracing.FinishWithError(span, err)
 			if err != nil {
 				f = nil
 				ctx = ctx2
@@ -701,7 +703,9 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessF
 			if s.st.mspan.Span != nil {
 				ctx = trace.ContextWithSpan(ctx, s.st.mspan)
 			}
-			key, err = f(withAncestorCacheOpts(ctx, s.st), res, s.st)
+			span, ctx2 := tracing.StartSpan(ctx, "ResultBasedCacheFunc: "+s.st.vtx.Name())
+			key, err = f(withAncestorCacheOpts(ctx2, s.st), res, s.st)
+			tracing.FinishWithError(span, err)
 		}
 		if err != nil {
 			select {
@@ -745,6 +749,15 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 	if err != nil {
 		return nil, err
 	}
+
+	defer func() {
+		if resp != nil && resp.CacheMap != nil {
+			bklog.G(ctx).Debugf("CacheMap: %s %d -> %+v, %v", s.st.vtx.Name(), index, resp.CacheMap, err)
+		} else {
+			bklog.G(ctx).Debugf("CacheMap: %s %d -> %+v, %v", s.st.vtx.Name(), index, resp, err)
+		}
+	}()
+
 	flightControlKey := fmt.Sprintf("cachemap-%d", index)
 	res, err := s.g.Do(ctx, flightControlKey, func(ctx context.Context) (ret interface{}, retErr error) {
 		if s.cacheRes != nil && s.cacheDone || index < len(s.cacheRes) {
@@ -758,15 +771,14 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 			ctx = trace.ContextWithSpan(ctx, s.st.mspan)
 		}
 		ctx = withAncestorCacheOpts(ctx, s.st)
-		if len(s.st.vtx.Inputs()) == 0 {
-			// no cache hit. start evaluating the node
-			span, ctx := tracing.StartSpan(ctx, "cache request: "+s.st.vtx.Name())
-			notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
-			defer func() {
-				tracing.FinishWithError(span, retErr)
-				notifyCompleted(retErr, false)
-			}()
-		}
+
+		span, ctx := tracing.StartSpan(ctx, "CacheMap: "+s.st.vtx.Name())
+		notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
+		defer func() {
+			tracing.FinishWithError(span, retErr)
+			notifyCompleted(retErr, false)
+		}()
+
 		res, done, err := op.CacheMap(ctx, s.st, len(s.cacheRes))
 		complete := true
 		if err != nil {
@@ -836,7 +848,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 		ctx = withAncestorCacheOpts(ctx, s.st)
 
 		// no cache hit. start evaluating the node
-		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name())
+		span, ctx := tracing.StartSpan(ctx, "Exec: "+s.st.vtx.Name())
 		notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
 		defer func() {
 			tracing.FinishWithError(span, retErr)

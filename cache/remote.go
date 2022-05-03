@@ -18,6 +18,7 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/buildkit/util/pull/pullprogress"
+	"github.com/moby/buildkit/util/tracing"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -328,6 +329,10 @@ func (p lazyRefProvider) Unlazy(ctx context.Context) error {
 			ctx, stopProgress = p.dh.Progress.Start(ctx)
 			defer stopProgress(rerr)
 		}
+		span, ctx := tracing.StartSpan(ctx, "UnlazyBlob: "+p.desc.Digest.String())
+		defer func() {
+			tracing.FinishWithError(span, rerr)
+		}()
 
 		// For now, just pull down the whole content and then return a ReaderAt from the local content
 		// store. If efficient partial reads are desired in the future, something more like a "tee"

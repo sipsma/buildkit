@@ -14,6 +14,7 @@ import (
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/tracing"
@@ -281,7 +282,13 @@ func (ci *importer) loadScope(ctx context.Context, scope string) (*v1.CacheChain
 	return cc, nil
 }
 
-func (ci *importer) Resolve(ctx context.Context, _ ocispecs.Descriptor, id string, w worker.Worker) (solver.CacheManager, error) {
+func (ci *importer) Resolve(ctx context.Context, _ ocispecs.Descriptor, id string, w worker.Worker) (_ solver.CacheManager, rerr error) {
+	span, ctx := tracing.StartSpan(ctx, "GHAResolve: "+id)
+	defer func() {
+		tracing.FinishWithError(span, rerr)
+	}()
+	bklog.G(ctx).WithField("id", id).Debug("GHA resolving cache")
+
 	eg, ctx := errgroup.WithContext(ctx)
 	ccs := make([]*v1.CacheChains, len(ci.cache.Scopes()))
 
@@ -322,7 +329,13 @@ type ciProvider struct {
 	entries map[digest.Digest]*actionscache.Entry
 }
 
-func (p *ciProvider) CheckDescriptor(ctx context.Context, desc ocispecs.Descriptor) error {
+func (p *ciProvider) CheckDescriptor(ctx context.Context, desc ocispecs.Descriptor) (rerr error) {
+	span, ctx := tracing.StartSpan(ctx, "GHACheckDescriptor: "+desc.Digest.String())
+	defer func() {
+		tracing.FinishWithError(span, rerr)
+	}()
+	bklog.G(ctx).WithField("desc", desc).Debug("GHA checking desc")
+
 	if desc.Digest != p.desc.Digest {
 		return nil
 	}
@@ -353,7 +366,13 @@ func (p *ciProvider) loadEntry(ctx context.Context, desc ocispecs.Descriptor) (*
 	return ce, nil
 }
 
-func (p *ciProvider) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (content.ReaderAt, error) {
+func (p *ciProvider) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (_ content.ReaderAt, rerr error) {
+	span, ctx := tracing.StartSpan(ctx, "GHAReaderAt: "+desc.Digest.String())
+	defer func() {
+		tracing.FinishWithError(span, rerr)
+	}()
+	bklog.G(ctx).WithField("desc", desc).Debug("GHA readerat")
+
 	ce, err := p.loadEntry(ctx, desc)
 	if err != nil {
 		return nil, err

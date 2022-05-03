@@ -55,7 +55,11 @@ func (c *cacheManager) ID() string {
 	return c.id
 }
 
-func (c *cacheManager) Query(deps []CacheKeyWithSelector, input Index, dgst digest.Digest, output Index) ([]*CacheKey, error) {
+func (c *cacheManager) Query(deps []CacheKeyWithSelector, input Index, dgst digest.Digest, output Index) (returns []*CacheKey, rerr error) {
+	defer func() {
+		bklog.G(context.TODO()).Debugf("cacheManager %s Query(%+v, %+v, %+v, %+v) = %+v, %v", c.ID(), deps, input, dgst, output, returns, rerr)
+	}()
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
