@@ -349,14 +349,18 @@ func (lcm *lazyCacheManager) ID() string {
 	return lcm.id
 }
 func (lcm *lazyCacheManager) Query(inp []solver.CacheKeyWithSelector, inputIndex solver.Index, dgst digest.Digest, outputIndex solver.Index) ([]*solver.CacheKey, error) {
-	lcm.wait()
+	if err := lcm.wait(); err != nil {
+		return nil, err
+	}
 	if lcm.main == nil {
 		return nil, nil
 	}
 	return lcm.main.Query(inp, inputIndex, dgst, outputIndex)
 }
 func (lcm *lazyCacheManager) Records(ck *solver.CacheKey) ([]*solver.CacheRecord, error) {
-	lcm.wait()
+	if err := lcm.wait(); err != nil {
+		return nil, err
+	}
 	if lcm.main == nil {
 		return nil, nil
 	}
