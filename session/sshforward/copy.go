@@ -2,7 +2,9 @@ package sshforward
 
 import (
 	"context"
+	fmt "fmt"
 	"io"
+	"os"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -24,6 +26,12 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStre
 				if err == io.EOF {
 					// indicates client performed CloseSend, but they may still be
 					// reading data, so don't close conn yet
+					if conn, ok := conn.(interface {
+						CloseWrite() error
+					}); ok {
+						fmt.Fprintf(os.Stderr, "closing conn write\n")
+						conn.CloseWrite()
+					}
 					return nil
 				}
 				conn.Close()
