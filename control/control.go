@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -416,6 +417,8 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		ref = reference.TagNameOnly(ref)
 		procs = append(procs, proc.SBOMProcessor(ref.String(), useCache))
 	}
+
+	fmt.Fprintf(os.Stdout, "LOOK AT ATTRS: %+v", req.FrontendAttrs)
 
 	if attrs, ok := attests["provenance"]; ok {
 		procs = append(procs, proc.ProvenanceProcessor(attrs))

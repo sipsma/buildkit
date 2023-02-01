@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 
 	slsa02 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v0.2"
@@ -16,6 +17,7 @@ import (
 
 func ProvenanceProcessor(attrs map[string]string) llbsolver.Processor {
 	return func(ctx context.Context, res *llbsolver.Result, s *llbsolver.Solver, j *solver.Job) (*llbsolver.Result, error) {
+		fmt.Println("FJLDAKSFJKDSAFJDKLSAJFDKSALFJDAKLFJKALSFJSAFDAKFLDASJ")
 		ps, err := exptypes.ParsePlatforms(res.Metadata)
 		if err != nil {
 			return nil, err
@@ -72,6 +74,7 @@ func ProvenanceProcessor(attrs map[string]string) llbsolver.Processor {
 			})
 		}
 
+		fmt.Printf("ATTESTATIONS: %+v\n", res.Attestations)
 		return res, nil
 	}
 }
