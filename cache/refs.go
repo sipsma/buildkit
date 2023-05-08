@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +105,7 @@ func (cr *cacheRecord) ref(triggerLastUsed bool, descHandlers DescHandlers, pg p
 		triggerLastUsed: triggerLastUsed,
 		descHandlers:    descHandlers,
 		progress:        pg,
+		stack:           string(debug.Stack()),
 	}
 	cr.refs[ref] = struct{}{}
 	return ref
@@ -115,6 +117,7 @@ func (cr *cacheRecord) mref(triggerLastUsed bool, descHandlers DescHandlers) *mu
 		cacheRecord:     cr,
 		triggerLastUsed: triggerLastUsed,
 		descHandlers:    descHandlers,
+		stack:           string(debug.Stack()),
 	}
 	cr.refs[ref] = struct{}{}
 	return ref
@@ -466,6 +469,7 @@ type immutableRef struct {
 	descHandlers    DescHandlers
 	// TODO:(sipsma) de-dupe progress with the same field inside descHandlers?
 	progress progress.Controller
+	stack    string
 }
 
 // Order is from parent->child, sr will be at end of slice. Refs should not
@@ -588,6 +592,7 @@ type mutableRef struct {
 	*cacheRecord
 	triggerLastUsed bool
 	descHandlers    DescHandlers
+	stack           string
 }
 
 func (sr *mutableRef) DescHandler(dgst digest.Digest) *DescHandler {

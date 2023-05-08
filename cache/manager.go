@@ -1306,6 +1306,7 @@ type cacheUsageInfo struct {
 	recordType  client.UsageRecordType
 	shared      bool
 	parentChain []digest.Digest
+	stacks      []string
 }
 
 func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo) ([]*client.UsageInfo, error) {
@@ -1339,6 +1340,14 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			doubleRef:   cr.equalImmutable != nil,
 			recordType:  cr.GetRecordType(),
 			parentChain: cr.layerDigestChain(),
+		}
+		for r := range cr.refs {
+			if ir, ok := r.(*immutableRef); ok {
+				c.stacks = append(c.stacks, ir.stack)
+			}
+			if mr, ok := r.(*mutableRef); ok {
+				c.stacks = append(c.stacks, mr.stack)
+			}
 		}
 		if c.recordType == "" {
 			c.recordType = client.UsageRecordTypeRegular
@@ -1406,6 +1415,9 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			UsageCount:  cr.usageCount,
 			RecordType:  cr.recordType,
 			Shared:      cr.shared,
+		}
+		if c.InUse {
+			c.Description = "\n" + strings.Join(cr.stacks, "\n")
 		}
 		if filter.Match(adaptUsageInfo(c)) {
 			du = append(du, c)
