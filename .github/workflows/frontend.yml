@@ -134,7 +134,7 @@ jobs:
     steps:
       -
         name: GitHub Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844  # v0.1.15
+        uses: softprops/action-gh-release@a6c7483a42ee9d5daced968f6c217562cd680f7f  # v0.1.15
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
