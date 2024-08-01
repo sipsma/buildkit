@@ -335,14 +335,16 @@ func (cr *cacheRecord) size(ctx context.Context) (int64, error) {
 			return s, nil
 		}
 		driverID := cr.getSnapshotID()
+		snapshotter := cr.cm.snapshotterFor(cr.cacheMetadata)
 		if cr.equalMutable != nil {
 			driverID = cr.equalMutable.getSnapshotID()
+			snapshotter = cr.cm.snapshotterFor(cr.equalMutable.cacheMetadata)
 		}
 		cr.mu.Unlock()
 		var usage snapshots.Usage
 		if !cr.getBlobOnly() {
 			var err error
-			usage, err = cr.cm.snapshotterFor(cr.cacheMetadata).Usage(ctx, driverID)
+			usage, err = snapshotter.Usage(ctx, driverID)
 			if err != nil {
 				cr.mu.Lock()
 				isDead := cr.isDead()

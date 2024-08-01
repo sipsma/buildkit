@@ -68,7 +68,7 @@ func (cm *cacheManager) GetOrInitVolume(
 	}
 	parentID := ""
 
-	rec, err := func() (*cacheRecord, error) {
+	rec, err := func() (_ *cacheRecord, rerr error) {
 		cm.mu.Lock()
 		defer cm.mu.Unlock()
 
@@ -90,8 +90,9 @@ func (cm *cacheManager) GetOrInitVolume(
 			if err != nil {
 				return nil, fmt.Errorf("failed to create lease: %w", err)
 			}
+			// TODO: this defer should run outside this function too
 			defer func() {
-				if err != nil {
+				if rerr != nil {
 					ctx := context.WithoutCancel(ctx)
 					if err := cm.LeaseManager.Delete(ctx, leases.Lease{
 						ID: l.ID,
@@ -131,6 +132,10 @@ func (cm *cacheManager) GetOrInitVolume(
 			if err := initializeMetadata(rec.cacheMetadata, rec.parentRefs, opts...); err != nil {
 				return nil, err
 			}
+			// this is needed because for some reason snapshotID is an imageRefOption
+			if err := setImageRefMetadata(rec.cacheMetadata, opts...); err != nil {
+				return nil, fmt.Errorf("failed to append image ref metadata to ref %s: %w", id, err)
+			}
 
 			cm.records[id] = rec
 			return rec, nil
@@ -139,6 +144,9 @@ func (cm *cacheManager) GetOrInitVolume(
 			return nil, fmt.Errorf("failed to get volume cache record: %w", err)
 		}
 	}()
+	if err != nil {
+		return nil, err
+	}
 
 	releaseFunc, err := cm.volumeSnapshotter.Acquire(ctx, id, sharingMode)
 	if err != nil {
