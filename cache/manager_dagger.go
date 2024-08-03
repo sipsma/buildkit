@@ -42,7 +42,6 @@ func newVolumeSnapshotter(ctx context.Context, ctdSnapshoter CtdVolumeSnapshotte
 		), leaseManager),
 		base: ctdSnapshoter,
 	}
-
 }
 
 type volumeSnapshotterAdapter struct {
@@ -61,6 +60,7 @@ func (cm *cacheManager) GetOrInitVolume(
 	id string,
 	sharingMode pb.CacheSharingOpt,
 	parent ImmutableRef,
+	humanName string,
 ) (_ MutableRef, rerr error) {
 	// TODO: support parent ref
 	if parent != nil {
@@ -78,41 +78,6 @@ func (cm *cacheManager) GetOrInitVolume(
 			return rec, nil
 
 		case errors.Is(err, errNotFound):
-			// TODO: more optimal to Lease+Prepare outside of manager lock, could put in rec lock?
-
-			l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
-				l.ID = id
-				l.Labels = map[string]string{
-					"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
-				}
-				return nil
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed to create lease: %w", err)
-			}
-			// TODO: this defer should run outside this function too
-			defer func() {
-				if rerr != nil {
-					ctx := context.WithoutCancel(ctx)
-					if err := cm.LeaseManager.Delete(ctx, leases.Lease{
-						ID: l.ID,
-					}); err != nil {
-						bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
-					}
-				}
-			}()
-
-			if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
-				ID:   id,
-				Type: "snapshots/" + cm.volumeSnapshotter.Name(),
-			}); err != nil && !cerrdefs.IsAlreadyExists(err) {
-				return nil, fmt.Errorf("failed to add snapshot %s resource to lease: %w", id, err)
-			}
-
-			if err := cm.volumeSnapshotter.Prepare(ctx, id, parentID); err != nil {
-				return nil, fmt.Errorf("failed to prepare volume: %w", err)
-			}
-
 			md, _ := cm.getMetadata(id)
 
 			rec = &cacheRecord{
@@ -125,7 +90,7 @@ func (cm *cacheManager) GetOrInitVolume(
 
 			opts := []RefOption{
 				WithRecordType(client.UsageRecordTypeCacheMount),
-				WithDescription(fmt.Sprintf("cache mount %s", id)), // TODO: support human readable name?
+				WithDescription(fmt.Sprintf("cache mount %s (%s)", humanName, id)),
 				CachePolicyRetain,
 				withSnapshotID(id),
 			}
@@ -147,6 +112,55 @@ func (cm *cacheManager) GetOrInitVolume(
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO: race condition here if someone grabs the record somehow before the lock below
+
+	rec.mu.Lock()
+
+	_, err = cm.volumeSnapshotter.Stat(ctx, id)
+	exists := err == nil
+
+	if !exists {
+		l, err := cm.LeaseManager.Create(ctx, func(l *leases.Lease) error {
+			l.ID = id
+			l.Labels = map[string]string{
+				"containerd.io/gc.flat": time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			return nil
+		})
+		if err != nil && !cerrdefs.IsAlreadyExists(err) {
+			rec.mu.Unlock()
+			return nil, fmt.Errorf("failed to create lease: %w", err)
+		}
+		if cerrdefs.IsAlreadyExists(err) {
+			l = leases.Lease{ID: id}
+		}
+		// TODO: this defer should run outside this function too
+		defer func() {
+			if rerr != nil {
+				ctx := context.WithoutCancel(ctx)
+				if err := cm.LeaseManager.Delete(ctx, leases.Lease{
+					ID: id,
+				}); err != nil {
+					bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
+				}
+			}
+		}()
+
+		if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
+			ID:   id,
+			Type: "snapshots/" + cm.volumeSnapshotter.Name(),
+		}); err != nil && !cerrdefs.IsAlreadyExists(err) {
+			rec.mu.Unlock()
+			return nil, fmt.Errorf("failed to add snapshot %s resource to lease: %w", id, err)
+		}
+
+		if err := cm.volumeSnapshotter.Prepare(ctx, id, parentID); err != nil && !cerrdefs.IsAlreadyExists(err) {
+			rec.mu.Unlock()
+			return nil, fmt.Errorf("failed to prepare volume: %w", err)
+		}
+	}
+	rec.mu.Unlock()
 
 	releaseFunc, err := cm.volumeSnapshotter.Acquire(ctx, id, sharingMode)
 	if err != nil {

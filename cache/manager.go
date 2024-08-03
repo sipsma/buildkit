@@ -68,7 +68,7 @@ type Accessor interface {
 	Diff(ctx context.Context, lower, upper ImmutableRef, pg progress.Controller, opts ...RefOption) (ImmutableRef, error)
 
 	// Dagger-specific, see manager_dagger.go
-	GetOrInitVolume(ctx context.Context, id string, sharingMode pb.CacheSharingOpt, parent ImmutableRef) (MutableRef, error)
+	GetOrInitVolume(ctx context.Context, id string, sharingMode pb.CacheSharingOpt, parent ImmutableRef, humanName string) (MutableRef, error)
 }
 
 type Controller interface {
