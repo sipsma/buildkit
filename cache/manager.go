@@ -52,7 +52,9 @@ type ManagerOpt struct {
 	MountPoolRoot   string
 
 	// dagger-specific, see manager_dagger.go
-	VolumeSnapshotter CtdVolumeSnapshotter
+	VolumeSnapshotter         CtdVolumeSnapshotter
+	VolumeSourceContentHasher func(context.Context, ImmutableRef, session.Group) (digest.Digest, error)
+	SeenVolumes               *sync.Map
 }
 
 type Accessor interface {
@@ -68,7 +70,7 @@ type Accessor interface {
 	Diff(ctx context.Context, lower, upper ImmutableRef, pg progress.Controller, opts ...RefOption) (ImmutableRef, error)
 
 	// Dagger-specific, see manager_dagger.go
-	GetOrInitVolume(ctx context.Context, id string, sharingMode pb.CacheSharingOpt, parent ImmutableRef, humanName string) (MutableRef, error)
+	GetOrInitVolume(context.Context, string, ImmutableRef, pb.CacheSharingOpt, session.Group) (MutableRef, error)
 }
 
 type Controller interface {
@@ -106,7 +108,9 @@ type cacheManager struct {
 	unlazyG flightcontrol.Group[struct{}]
 
 	// dagger-specific, see manager_dagger.go
-	volumeSnapshotter VolumeSnapshotter
+	volumeSnapshotter         VolumeSnapshotter
+	volumeSourceContentHasher func(context.Context, ImmutableRef, session.Group) (digest.Digest, error)
+	seenVolumes               *sync.Map
 }
 
 func NewManager(opt ManagerOpt) (Manager, error) {
@@ -121,7 +125,9 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 		MetadataStore:   opt.MetadataStore,
 		records:         make(map[string]*cacheRecord),
 
-		volumeSnapshotter: newVolumeSnapshotter(context.TODO(), opt.VolumeSnapshotter, opt.LeaseManager),
+		volumeSnapshotter:         newVolumeSnapshotter(context.TODO(), opt.VolumeSnapshotter, opt.LeaseManager),
+		volumeSourceContentHasher: opt.VolumeSourceContentHasher,
+		seenVolumes:               opt.SeenVolumes,
 	}
 
 	if err := cm.init(context.TODO()); err != nil {

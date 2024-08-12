@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -382,8 +381,7 @@ func (mm *MountManager) MountableCache(ctx context.Context, m *pb.Mount, ref cac
 	if m.CacheOpt == nil {
 		return nil, errors.Errorf("missing cache mount options")
 	}
-	id, humanName, _ := strings.Cut(m.CacheOpt.ID, "-")
-	return mm.cm.GetOrInitVolume(ctx, id, m.CacheOpt.Sharing, ref, humanName)
+	return mm.cm.GetOrInitVolume(ctx, m.CacheOpt.ID, ref, m.CacheOpt.Sharing, g)
 }
 
 func (mm *MountManager) MountableTmpFS(m *pb.Mount) cache.Mountable {

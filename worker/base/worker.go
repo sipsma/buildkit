@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/content"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/cache/contenthash"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -84,6 +86,7 @@ type WorkerOpt struct {
 
 	// dagger-specific
 	VolumeSnapshotter cache.CtdVolumeSnapshotter
+	SeenVolumes       *sync.Map
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -117,6 +120,10 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 
 		// dagger-specific
 		VolumeSnapshotter: opt.VolumeSnapshotter,
+		VolumeSourceContentHasher: func(ctx context.Context, source cache.ImmutableRef, sess session.Group) (digest.Digest, error) {
+			return contenthash.Checksum(ctx, source, "/", contenthash.ChecksumOpts{}, sess)
+		},
+		SeenVolumes: opt.SeenVolumes,
 	})
 	if err != nil {
 		return nil, err
