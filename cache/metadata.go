@@ -101,6 +101,7 @@ func (cm *cacheManager) search(ctx context.Context, idx string, prefixOnly bool)
 			continue
 		}
 		if md.getDeleted() {
+			bklog.G(ctx).Warnf("skipping deleted metadata for storage item %q during search for %q", si.ID(), idx)
 			continue
 		}
 		mds = append(mds, md)
