@@ -154,7 +154,8 @@ func (s *scheduler) dispatch(e *edge) {
 	if e.keysDidChange {
 		if k := e.currentIndexKey(); k != nil {
 			// skip this if not at least 1 key per dep
-			origEdge := e.index.LoadOrStore(k, e)
+			_ = e.index.LoadOrStore(k, e)
+			/* disable edge merging
 			if origEdge != nil {
 				if e.isDep(origEdge) || origEdge.isDep(e) {
 					debugSchedulerSkipMergeDueToDependency(e, origEdge)
@@ -173,6 +174,7 @@ func (s *scheduler) dispatch(e *edge) {
 					}
 				}
 			}
+			*/
 		}
 		e.keysDidChange = false
 	}
