@@ -154,8 +154,7 @@ func (s *scheduler) dispatch(e *edge) {
 	if e.keysDidChange {
 		if k := e.currentIndexKey(); k != nil {
 			// skip this if not at least 1 key per dep
-			_ = e.index.LoadOrStore(k, e)
-			/* disable edge merging
+			origEdge := e.index.LoadOrStore(k, e)
 			if origEdge != nil {
 				if e.isDep(origEdge) || origEdge.isDep(e) {
 					debugSchedulerSkipMergeDueToDependency(e, origEdge)
@@ -174,7 +173,6 @@ func (s *scheduler) dispatch(e *edge) {
 					}
 				}
 			}
-			*/
 		}
 		e.keysDidChange = false
 	}
@@ -289,6 +287,9 @@ func (s *scheduler) newRequestWithFunc(e *edge, f func(context.Context) (any, er
 
 // mergeTo merges the state from one edge to another. source edge is discarded.
 func (s *scheduler) mergeTo(target, src *edge) bool {
+	if target.edge.Vertex.Options().SkipEdgeMerge || src.edge.Vertex.Options().SkipEdgeMerge {
+		return false
+	}
 	if !target.edge.Vertex.Options().IgnoreCache && src.edge.Vertex.Options().IgnoreCache {
 		return false
 	}
